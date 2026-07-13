@@ -267,9 +267,26 @@ pub mod fetch {
 
         /// Fetch every read; result[i] corresponds to reads[i].
         pub fn fetch(&mut self, reads: &[Read]) -> std::io::Result<Vec<Slab>> {
-            let fd = types::Fd(self.file.as_raw_fd());
             let mut out: Vec<Option<Slab>> = Vec::with_capacity(reads.len());
             out.resize_with(reads.len(), || None);
+            self.fetch_each(reads, |i, slab| {
+                out[i] = Some(slab);
+                Ok(())
+            })?;
+            Ok(out.into_iter().map(|s| s.expect("all fetched")).collect())
+        }
+
+        /// Fetch every read, handing each slab to `on_slab(index, slab)` as
+        /// its completion lands - so the caller's processing (e.g. H2D
+        /// upload) overlaps the remaining disk reads.
+        pub fn fetch_each(
+            &mut self,
+            reads: &[Read],
+            mut on_slab: impl FnMut(usize, Slab) -> std::io::Result<()>,
+        ) -> std::io::Result<()> {
+            let fd = types::Fd(self.file.as_raw_fd());
+            let mut pending: Vec<Option<Slab>> = Vec::with_capacity(reads.len());
+            pending.resize_with(reads.len(), || None);
             let mut next = 0usize;
             let mut inflight = 0usize;
 
@@ -285,7 +302,7 @@ pub mod fetch {
                         .offset(aligned_off)
                         .build()
                         .user_data(next as u64);
-                    out[next] = Some(Slab {
+                    pending[next] = Some(Slab {
                         buf,
                         payload_off,
                         payload_len: r.len as usize,
@@ -303,14 +320,17 @@ pub mod fetch {
                     .completion()
                     .map(|c| (c.user_data(), c.result()))
                     .collect();
-                for (_, res) in &completions {
-                    if *res < 0 {
+                for (ud, res) in completions {
+                    if res < 0 {
                         return Err(std::io::Error::from_raw_os_error(-res));
                     }
+                    inflight -= 1;
+                    let idx = ud as usize;
+                    let slab = pending[idx].take().expect("slot occupied");
+                    on_slab(idx, slab)?;
                 }
-                inflight -= completions.len();
             }
-            Ok(out.into_iter().map(|s| s.expect("all fetched")).collect())
+            Ok(())
         }
     }
 }

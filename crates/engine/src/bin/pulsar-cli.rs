@@ -145,12 +145,11 @@ fn run() -> engine::Result {
     println!();
     let dt = t2.elapsed().as_secs_f32();
     eprintln!(
-        "pulsar: {} tokens in {:.2}s ({:.2} tok/s), expert cache {}/{} hits ({:.0}%)\npulsar: ids {generated:?}",
+        "pulsar: {} tokens in {:.2}s ({:.2} tok/s), vram cache {:.0}% hits, host cache {:.0}% of remainder\npulsar: ids {generated:?}",
         generated.len(),
         dt,
         generated.len() as f32 / dt.max(1e-6),
-        st.store.hits,
-        st.store.hits + st.store.misses,
+        100.0 * st.dev_cache.hits as f64 / (st.dev_cache.hits + st.dev_cache.misses).max(1) as f64,
         100.0 * st.store.hits as f64 / (st.store.hits + st.store.misses).max(1) as f64
     );
     Ok(())

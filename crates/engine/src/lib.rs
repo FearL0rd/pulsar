@@ -168,6 +168,100 @@ mod real {
         tick: u64,
     }
 
+    /// Device-side expert slab cache: a uniform-slot VRAM pool holding a
+    /// STABLE hot set. The pool is smaller than one token's slab working
+    /// set, so plain LFU would evict everything every token; instead every
+    /// requested offset gets a global touch count, and a slab is admitted
+    /// only when it is strictly hotter than the coldest resident. Cold
+    /// slabs stream through the staging arena and never enter the pool.
+    pub struct DeviceSlabCache {
+        pool: DeviceBuf,
+        slab_bytes: usize,
+        map: std::collections::HashMap<u64, u32>,
+        /// per slot: (touch count at admission, offset); u64::MAX = free
+        meta: Vec<(u64, u64)>,
+        /// global touch counts, cached or not
+        touch: std::collections::HashMap<u64, u64>,
+        pub hits: u64,
+        pub misses: u64,
+    }
+
+    impl DeviceSlabCache {
+        fn new(budget_bytes: usize, slab_bytes: usize) -> Result<DeviceSlabCache> {
+            let slots = (budget_bytes / slab_bytes.max(1)).max(1);
+            Ok(DeviceSlabCache {
+                pool: DeviceBuf::alloc(slots * slab_bytes)?,
+                slab_bytes,
+                map: std::collections::HashMap::with_capacity(slots),
+                meta: vec![(0, u64::MAX); slots],
+                touch: std::collections::HashMap::new(),
+                hits: 0,
+                misses: 0,
+            })
+        }
+
+        fn slot_ptr(&self, slot: u32) -> *const std::ffi::c_void {
+            self.pool.ptr_at(slot as usize * self.slab_bytes)
+        }
+
+        fn get(&mut self, offset: u64) -> Option<*const std::ffi::c_void> {
+            let t = self.touch.entry(offset).or_insert(0);
+            *t += 1;
+            let freq = *t;
+            match self.map.get(&offset).copied() {
+                Some(slot) => {
+                    self.meta[slot as usize].0 = freq;
+                    self.hits += 1;
+                    Some(self.slot_ptr(slot))
+                }
+                None => {
+                    self.misses += 1;
+                    None
+                }
+            }
+        }
+
+        /// Admit `payload` if it is hotter than the coldest resident (or a
+        /// slot is free). Returns None when the slab is not worthy - the
+        /// caller streams it through staging instead. `in_use` offsets are
+        /// never evicted.
+        fn maybe_insert(
+            &mut self,
+            offset: u64,
+            payload: &[u8],
+            in_use: &[u64],
+        ) -> Result<Option<*const std::ffi::c_void>> {
+            let freq = self.touch.get(&offset).copied().unwrap_or(0);
+            let slot = match self.meta.iter().position(|m| m.1 == u64::MAX) {
+                Some(free) => free as u32,
+                None => {
+                    // ponytail: O(slots) coldest-scan; heap it if slots explode
+                    let Some((victim, vmeta)) = self
+                        .meta
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| m.1 != u64::MAX && !in_use.contains(&m.1))
+                        .min_by_key(|(_, m)| m.0)
+                    else {
+                        return Ok(None);
+                    };
+                    if vmeta.0 >= freq {
+                        return Ok(None); // resident is at least as hot
+                    }
+                    let evict_off = vmeta.1;
+                    let victim = victim as u32;
+                    self.map.remove(&evict_off);
+                    victim
+                }
+            };
+            let base = slot as usize * self.slab_bytes;
+            self.pool.write(base, payload)?;
+            self.meta[slot as usize] = (freq, offset);
+            self.map.insert(offset, slot);
+            Ok(Some(self.slot_ptr(slot)))
+        }
+    }
+
     impl StreamingStore {
         fn open(path: &Path, budget: usize) -> Result<StreamingStore> {
             Ok(StreamingStore {
@@ -181,50 +275,66 @@ mod real {
             })
         }
 
-        /// Make every read resident in the cache and bump its LFU state.
-        fn ensure(&mut self, wants: &[stream::Read]) -> Result {
+        /// Resolve every read: cached payloads go to `place(offset, bytes)`
+        /// immediately, disk misses as each io_uring completion lands - so
+        /// the caller's H2D uploads overlap the remaining reads. Fetched
+        /// slabs enter the LFU cache afterwards.
+        fn ensure_with(
+            &mut self,
+            wants: &[stream::Read],
+            mut place: impl FnMut(u64, &[u8]) -> Result,
+        ) -> Result {
             self.tick += 1;
-            let missing: Vec<stream::Read> = wants
-                .iter()
-                .filter(|r| !self.cache.contains_key(&r.offset))
-                .copied()
-                .collect();
-            self.hits += (wants.len() - missing.len()) as u64;
-            self.misses += missing.len() as u64;
-            if !missing.is_empty() {
-                let slabs = self.fetcher.fetch(&missing)?;
-                let incoming: usize = slabs.iter().map(|s| s.bytes()).sum();
-                // evict lowest (freq, tick) not wanted right now
-                // ponytail: O(n) scan per eviction; heap it if the cache
-                // ever holds >100k entries
-                while self.used + incoming > self.budget && !self.cache.is_empty() {
-                    let victim = self
-                        .cache
-                        .iter()
-                        .filter(|(k, _)| !wants.iter().any(|w| w.offset == **k))
-                        .min_by_key(|(_, e)| (e.freq, e.tick))
-                        .map(|(k, _)| *k);
-                    let Some(k) = victim else { break };
-                    if let Some(e) = self.cache.remove(&k) {
-                        self.used -= e.slab.bytes();
-                    }
-                }
-                for (r, slab) in missing.iter().zip(slabs) {
-                    self.used += slab.bytes();
-                    self.cache.insert(r.offset, CacheEntry { slab, freq: 0, tick: self.tick });
-                }
-            }
+            let mut missing = Vec::new();
             for r in wants {
                 if let Some(e) = self.cache.get_mut(&r.offset) {
                     e.freq += 1;
                     e.tick = self.tick;
+                    self.hits += 1;
+                    place(r.offset, e.slab.payload())?;
+                } else {
+                    self.misses += 1;
+                    missing.push(*r);
                 }
             }
-            Ok(())
-        }
-
-        fn payload(&self, offset: u64) -> &[u8] {
-            self.cache[&offset].slab.payload()
+            if missing.is_empty() {
+                return Ok(());
+            }
+            // evict lowest (freq, tick) not wanted right now
+            // ponytail: O(n) scan per eviction; heap it if the cache ever
+            // holds >100k entries
+            let incoming: usize = missing.iter().map(|r| r.len as usize).sum();
+            while self.used + incoming > self.budget && !self.cache.is_empty() {
+                let victim = self
+                    .cache
+                    .iter()
+                    .filter(|(k, _)| !wants.iter().any(|w| w.offset == **k))
+                    .min_by_key(|(_, e)| (e.freq, e.tick))
+                    .map(|(k, _)| *k);
+                let Some(k) = victim else { break };
+                if let Some(e) = self.cache.remove(&k) {
+                    self.used -= e.slab.bytes();
+                }
+            }
+            let Self { fetcher, cache, used, tick, .. } = self;
+            let mut place_err = None;
+            fetcher.fetch_each(&missing, |i, slab| {
+                if place_err.is_none() {
+                    if let Err(e) = place(missing[i].offset, slab.payload()) {
+                        place_err = Some(e);
+                    }
+                }
+                *used += slab.bytes();
+                cache.insert(
+                    missing[i].offset,
+                    CacheEntry { slab, freq: 1, tick: *tick },
+                );
+                Ok(())
+            })?;
+            match place_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
     }
 
@@ -346,7 +456,8 @@ mod real {
         moe_out: DeviceBuf,
         xq: DeviceBuf,
         midq: DeviceBuf,
-        expert_arena: DeviceBuf,
+        pub dev_cache: DeviceSlabCache,
+        staging: DeviceBuf,
         expert_ptrs: DeviceBuf,
         kcache: Vec<DeviceBuf>,
         vcache: Vec<DeviceBuf>,
@@ -416,7 +527,15 @@ mod real {
                     n_used * s.n_ff_exp as usize / kernels::Q8_K_BLOCK_ELEMS
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
-                expert_arena: DeviceBuf::alloc(n_used * 3 * max_slab)?,
+                dev_cache: DeviceSlabCache::new(
+                    std::env::var("PULSAR_DEV_CACHE_GB")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(3)
+                        << 30,
+                    max_slab,
+                )?,
+                staging: DeviceBuf::alloc(n_used * 3 * max_slab)?,
                 expert_ptrs: DeviceBuf::alloc(n_used * std::mem::size_of::<ExpertPtrs>())?,
                 kcache,
                 vcache,
@@ -483,41 +602,66 @@ mod real {
                             1,
                         )?;
 
-                        // StreamingStore: LFU host cache + one io_uring
-                        // batch for the misses, then upload to the arena.
+                        // Expert resolve: VRAM cache first (no disk, no
+                        // H2D), then host LFU + one io_uring batch for
+                        // whatever is left.
                         kernels::sync()?;
                         let selected = st.router_selected.read_i32(s.n_expert_used as usize)?;
-                        let slab = gate_exps.expert_bytes as usize;
                         debug_assert_eq!(up_exps.expert_bytes, gate_exps.expert_bytes);
                         debug_assert_eq!(down_exps.expert_bytes, gate_exps.expert_bytes);
-                        let mut wants = Vec::with_capacity(3 * s.n_expert_used as usize);
+                        let mut offsets = Vec::with_capacity(3 * s.n_expert_used as usize);
                         for &e in &selected {
                             if e < 0 || e as u32 >= s.n_expert {
                                 continue;
                             }
                             for t in [gate_exps, up_exps, down_exps] {
-                                wants.push(stream::Read {
+                                offsets.push(stream::Read {
                                     offset: t.abs_offset + e as u64 * t.expert_bytes,
                                     len: t.expert_bytes,
                                 });
                             }
                         }
-                        st.store.ensure(&wants)?;
+                        let in_use: Vec<u64> = offsets.iter().map(|r| r.offset).collect();
+                        let mut resolved = std::collections::HashMap::new();
+                        let mut wants = Vec::new();
+                        for r in &offsets {
+                            match st.dev_cache.get(r.offset) {
+                                Some(p) => {
+                                    resolved.insert(r.offset, p);
+                                }
+                                None => wants.push(*r),
+                            }
+                        }
+                        let slab = gate_exps.expert_bytes as usize;
+                        let mut staged = 0usize;
+                        let dev_cache = &mut st.dev_cache;
+                        let staging = &mut st.staging;
+                        st.store.ensure_with(&wants, |off, payload| {
+                            let p = match dev_cache.maybe_insert(off, payload, &in_use)? {
+                                Some(p) => p,
+                                None => {
+                                    let base = staged * slab;
+                                    staged += 1;
+                                    staging.write(base, payload)?;
+                                    staging.ptr_at(base)
+                                }
+                            };
+                            resolved.insert(off, p);
+                            Ok(())
+                        })?;
                         let mut ptrs = Vec::with_capacity(s.n_expert_used as usize);
-                        for (slot, &e) in selected.iter().enumerate() {
+                        for &e in &selected {
                             if e < 0 || e as u32 >= s.n_expert {
                                 ptrs.push(ExpertPtrs::NULL);
                                 continue;
                             }
-                            let base = slot * 3 * slab;
-                            for (j, t) in [gate_exps, up_exps, down_exps].iter().enumerate() {
-                                let off = t.abs_offset + e as u64 * t.expert_bytes;
-                                st.expert_arena.write(base + j * slab, st.store.payload(off))?;
-                            }
+                            let p = |t: &ExpertTensor| {
+                                resolved[&(t.abs_offset + e as u64 * t.expert_bytes)]
+                            };
                             ptrs.push(ExpertPtrs {
-                                gate: st.expert_arena.ptr_at(base),
-                                up: st.expert_arena.ptr_at(base + slab),
-                                down: st.expert_arena.ptr_at(base + 2 * slab),
+                                gate: p(gate_exps),
+                                up: p(up_exps),
+                                down: p(down_exps),
                             });
                         }
                         st.expert_ptrs.write(0, kernels::as_bytes(&ptrs))?;
