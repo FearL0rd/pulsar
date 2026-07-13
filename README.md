@@ -22,9 +22,11 @@ Runs **Hy3 295B** (hy-v3) and **GLM-5.2 743B** (glm-dsa, MLA) on a single
 | long-prompt prefill | **7.9 tok/s** | 0.44 |
 | warm start | 16GB of hot experts in **~4s** | – |
 
-GLM-5.2 (196.6 GiB gguf, ~12GB of attention weights auto-placed in pinned
-host RAM, experts streamed): 0.32 tok/s, teacher-forced parity 10/12 vs
-the reference (both misses at <0.07-logit ties).
+GLM-5.2 (196.6 GiB gguf; the hottest attention tensors take a VRAM
+budget, the rest sit in pinned host RAM, experts streamed): **0.41 tok/s**
+(`PULSAR_ATTN_VRAM_GB=6` on a 16GB card at ctx 2048; NeutronStar: 0.40).
+Teacher-forced parity 10/12 vs the reference - both misses at <0.07-logit
+ties.
 
 Correctness is certified against ds4, not assumed: teacher-forced along
 ds4's greedy path, 15/16 per-position argmax agreement (the one miss is a

@@ -584,21 +584,27 @@ mod real {
         Ok(DeviceBuf::from_bytes(&read_tensor_bytes(file, g, name)?)?)
     }
 
-    /// Big attention weights: pinned host memory (zero-copy PCIe reads)
-    /// when they exceed what VRAM can spare. Default: on for Mla (GLM-class
-    /// attn is ~12GB q8, never fits next to the rest on a 16GB card), off
-    /// for Gqa. PULSAR_ATTN_HOST=1/0 overrides.
-    fn upload_attn(file: &File, g: &Gguf, s: &Shape, name: &str) -> Result<DeviceBuf> {
-        let pinned = match std::env::var("PULSAR_ATTN_HOST").ok().as_deref() {
-            Some("0") => false,
-            Some(_) => true,
-            None => s.family == Family::Mla,
-        };
+    /// Big attention weights: VRAM while `vram_budget` lasts, then pinned
+    /// host memory (zero-copy PCIe reads). Gqa attn always fits, so its
+    /// budget is unlimited; Mla (GLM-class, ~12GB attn q8) spends a
+    /// PULSAR_ATTN_VRAM_GB budget (default 5) on the tensors the caller
+    /// routes here - zero-copy reads measure ~6GB/s vs VRAM's ~288GB/s, so
+    /// every budgeted byte is ~50x cheaper to read each token.
+    /// PULSAR_ATTN_HOST=1 forces everything pinned.
+    fn upload_attn(
+        file: &File,
+        g: &Gguf,
+        name: &str,
+        vram_budget: &mut i64,
+    ) -> Result<DeviceBuf> {
         let bytes = read_tensor_bytes(file, g, name)?;
-        let mut buf = if pinned {
-            DeviceBuf::alloc_pinned(bytes.len())?
-        } else {
+        let force_host = std::env::var("PULSAR_ATTN_HOST").ok().as_deref() == Some("1");
+        let use_vram = !force_host && *vram_budget >= bytes.len() as i64;
+        let mut buf = if use_vram {
+            *vram_budget -= bytes.len() as i64;
             DeviceBuf::alloc(bytes.len())?
+        } else {
+            DeviceBuf::alloc_pinned(bytes.len())?
         };
         buf.write(0, &bytes)?;
         Ok(buf)
@@ -612,6 +618,23 @@ mod real {
             let token_embd = upload(&file, &gguf, "token_embd.weight")?;
             let output_norm = upload(&file, &gguf, "output_norm.weight")?;
             let output = upload(&file, &gguf, "output.weight")?;
+
+            // Mla: spend a VRAM budget on the two big per-layer attn
+            // tensors (attn_output ~107MB, q_b ~36MB on GLM-5.2) - they are
+            // 80%+ of the per-token pinned-host read traffic. Gqa attn is
+            // small enough to always live in VRAM.
+            let mut attn_vram_budget: i64 = match shape.family {
+                Family::Gqa => i64::MAX,
+                Family::Mla => {
+                    (std::env::var("PULSAR_ATTN_VRAM_GB")
+                        .ok()
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(5))
+                        << 30
+                }
+            };
+            // small Mla attn tensors always go pinned (not worth budget)
+            let mut no_budget: i64 = 0;
 
             let mut layers = Vec::with_capacity(shape.n_exec_layer as usize);
             for il in 0..shape.n_exec_layer {
@@ -648,26 +671,26 @@ mod real {
                 };
                 let attn = match shape.family {
                     Family::Gqa => Attn::Gqa {
-                        attn_q: upload_attn(&file, &gguf, &shape, &t("attn_q.weight"))?,
-                        attn_k: upload_attn(&file, &gguf, &shape, &t("attn_k.weight"))?,
-                        attn_v: upload_attn(&file, &gguf, &shape, &t("attn_v.weight"))?,
+                        attn_q: upload_attn(&file, &gguf, &t("attn_q.weight"), &mut attn_vram_budget)?,
+                        attn_k: upload_attn(&file, &gguf, &t("attn_k.weight"), &mut attn_vram_budget)?,
+                        attn_v: upload_attn(&file, &gguf, &t("attn_v.weight"), &mut attn_vram_budget)?,
                         q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
                         k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
                     },
                     Family::Mla => Attn::Mla {
-                        q_a: upload_attn(&file, &gguf, &shape, &t("attn_q_a.weight"))?,
+                        q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"), &mut no_budget)?,
                         q_a_norm: upload(&file, &gguf, &t("attn_q_a_norm.weight"))?,
-                        q_b: upload_attn(&file, &gguf, &shape, &t("attn_q_b.weight"))?,
-                        kv_a_mqa: upload_attn(&file, &gguf, &shape, &t("attn_kv_a_mqa.weight"))?,
+                        q_b: upload_attn(&file, &gguf, &t("attn_q_b.weight"), &mut attn_vram_budget)?,
+                        kv_a_mqa: upload_attn(&file, &gguf, &t("attn_kv_a_mqa.weight"), &mut no_budget)?,
                         kv_a_norm: upload(&file, &gguf, &t("attn_kv_a_norm.weight"))?,
-                        k_b: upload_attn(&file, &gguf, &shape, &t("attn_k_b.weight"))?,
-                        v_b: upload_attn(&file, &gguf, &shape, &t("attn_v_b.weight"))?,
+                        k_b: upload_attn(&file, &gguf, &t("attn_k_b.weight"), &mut no_budget)?,
+                        v_b: upload_attn(&file, &gguf, &t("attn_v_b.weight"), &mut no_budget)?,
                     },
                 };
                 layers.push(LayerW {
                     attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
                     attn,
-                    attn_output: upload_attn(&file, &gguf, &shape, &t("attn_output.weight"))?,
+                    attn_output: upload_attn(&file, &gguf, &t("attn_output.weight"), &mut attn_vram_budget)?,
                     ffn_norm: upload(&file, &gguf, &t("ffn_norm.weight"))?,
                     ffn,
                 });
@@ -740,7 +763,7 @@ mod real {
             let gb = std::env::var("PULSAR_CACHE_GB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(if m.shape.family == Family::Mla { 5 } else { 12 });
+                .unwrap_or(if m.shape.family == Family::Mla { 7 } else { 12 });
             Self::with_cache(m, ctx, gb << 30)
         }
 
@@ -898,7 +921,7 @@ mod real {
                     std::env::var("PULSAR_DEV_CACHE_GB")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(3)
+                        .unwrap_or(if s.family == Family::Mla { 1 } else { 3 })
                         << 30,
                     max_slab,
                 )?,
