@@ -143,6 +143,7 @@ fn run() -> engine::Result {
         pos += 1;
     }
     println!();
+    st.save_warm(&model)?;
     let dt = t2.elapsed().as_secs_f32();
     eprintln!(
         "pulsar: {} tokens in {:.2}s ({:.2} tok/s), vram cache {:.0}% hits, host cache {:.0}% of remainder\npulsar: ids {generated:?}",

@@ -182,8 +182,8 @@ mod real {
         map: std::collections::HashMap<u64, u32>,
         /// per slot: (touch count at admission, offset); u64::MAX = free
         meta: Vec<(u64, u64)>,
-        /// global touch counts, cached or not
-        touch: std::collections::HashMap<u64, u64>,
+        /// global (touch count, slab len) per requested offset, cached or not
+        touch: std::collections::HashMap<u64, (u64, u64)>,
         pub hits: u64,
         pub misses: u64,
     }
@@ -206,10 +206,10 @@ mod real {
             self.pool.ptr_at(slot as usize * self.slab_bytes)
         }
 
-        fn get(&mut self, offset: u64) -> Option<*const std::ffi::c_void> {
-            let t = self.touch.entry(offset).or_insert(0);
-            *t += 1;
-            let freq = *t;
+        fn get(&mut self, offset: u64, len: u64) -> Option<*const std::ffi::c_void> {
+            let t = self.touch.entry(offset).or_insert((0, len));
+            t.0 += 1;
+            let freq = t.0;
             match self.map.get(&offset).copied() {
                 Some(slot) => {
                     self.meta[slot as usize].0 = freq;
@@ -233,7 +233,7 @@ mod real {
             payload: &[u8],
             in_use: &[u64],
         ) -> Result<Option<*const std::ffi::c_void>> {
-            let freq = self.touch.get(&offset).copied().unwrap_or(0);
+            let freq = self.touch.get(&offset).map(|t| t.0).unwrap_or(0);
             let slot = match self.meta.iter().position(|m| m.1 == u64::MAX) {
                 Some(free) => free as u32,
                 None => {
@@ -338,6 +338,39 @@ mod real {
                 None => Ok(()),
             }
         }
+
+        /// Fetch without caching - warm-start uses this to route slabs
+        /// straight to the device tier.
+        fn fetch_direct(
+            &mut self,
+            reads: &[stream::Read],
+            mut place: impl FnMut(u64, &[u8]) -> Result,
+        ) -> Result {
+            let mut place_err = None;
+            self.fetcher.fetch_each(reads, |i, slab| {
+                if place_err.is_none() {
+                    if let Err(e) = place(reads[i].offset, slab.payload()) {
+                        place_err = Some(e);
+                    }
+                }
+                Ok(())
+            })?;
+            match place_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        }
+
+        fn reset_stats(&mut self) {
+            self.hits = 0;
+            self.misses = 0;
+        }
+    }
+
+    fn warm_path(model: &Path) -> std::path::PathBuf {
+        let mut p = model.as_os_str().to_owned();
+        p.push(".warm");
+        p.into()
     }
 
     /// How many header bytes to read before parsing; grows on Truncated.
@@ -476,6 +509,71 @@ mod real {
             Self::with_cache(m, ctx, gb << 30)
         }
 
+        /// Persist the slab popularity census so the next run starts warm.
+        pub fn save_warm(&self, m: &Model) -> Result {
+            let mut entries: Vec<(u64, u64, u64)> = self
+                .dev_cache
+                .touch
+                .iter()
+                .map(|(&off, &(count, len))| (count, off, len))
+                .collect();
+            entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let mut bytes = Vec::with_capacity(entries.len() * 24);
+            for (count, off, len) in &entries {
+                bytes.extend_from_slice(&off.to_le_bytes());
+                bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(&count.to_le_bytes());
+            }
+            std::fs::write(warm_path(&m.path), bytes)?;
+            Ok(())
+        }
+
+        /// Load the popularity census: hottest slabs into VRAM, the next
+        /// tier into the host cache, touch counts seeded for admission.
+        fn load_warm(&mut self, m: &Model) -> Result<usize> {
+            let Ok(bytes) = std::fs::read(warm_path(&m.path)) else {
+                return Ok(0);
+            };
+            let mut entries = Vec::with_capacity(bytes.len() / 24);
+            for c in bytes.chunks_exact(24) {
+                let off = u64::from_le_bytes(c[0..8].try_into().unwrap());
+                let len = u64::from_le_bytes(c[8..16].try_into().unwrap());
+                let count = u64::from_le_bytes(c[16..24].try_into().unwrap());
+                entries.push((off, len, count));
+            }
+            for &(off, len, count) in &entries {
+                self.dev_cache.touch.insert(off, (count, len));
+            }
+            let dev_slots = self.dev_cache.meta.len();
+            let dev_tier: Vec<stream::Read> = entries
+                .iter()
+                .take(dev_slots)
+                .map(|&(offset, len, _)| stream::Read { offset, len })
+                .collect();
+            let host_budget = self.store.budget as u64;
+            let mut host_bytes = 0u64;
+            let host_tier: Vec<stream::Read> = entries
+                .iter()
+                .skip(dev_slots)
+                .take_while(|&&(_, len, _)| {
+                    host_bytes += len;
+                    host_bytes <= host_budget
+                })
+                .map(|&(offset, len, _)| stream::Read { offset, len })
+                .collect();
+            let n = dev_tier.len() + host_tier.len();
+            let dev_cache = &mut self.dev_cache;
+            self.store.fetch_direct(&dev_tier, |off, payload| {
+                dev_cache.maybe_insert(off, payload, &[])?;
+                Ok(())
+            })?;
+            self.store.ensure_with(&host_tier, |_, _| Ok(()))?;
+            self.store.reset_stats();
+            self.dev_cache.hits = 0;
+            self.dev_cache.misses = 0;
+            Ok(n)
+        }
+
         pub fn with_cache(m: &Model, ctx: u32, cache_bytes: usize) -> Result<State> {
             let s = m.shape;
             let f32s = |n: u32| DeviceBuf::alloc(n as usize * 4);
@@ -501,7 +599,7 @@ mod real {
                 vcache.push(DeviceBuf::alloc(kv_bytes)?);
             }
 
-            Ok(State {
+            let mut st = State {
                 ctx,
                 tok: DeviceBuf::alloc(4)?,
                 cur: f32s(s.n_embd)?,
@@ -543,7 +641,16 @@ mod real {
                 vcache,
                 logits: f32s(s.n_vocab)?,
                 store: StreamingStore::open(&m.path, cache_bytes)?,
-            })
+            };
+            let t0 = std::time::Instant::now();
+            let warmed = st.load_warm(m)?;
+            if warmed > 0 {
+                eprintln!(
+                    "pulsar: warm start: {warmed} slabs in {:.1}s",
+                    t0.elapsed().as_secs_f32()
+                );
+            }
+            Ok(st)
         }
     }
 
@@ -627,7 +734,7 @@ mod real {
                         let mut resolved = std::collections::HashMap::new();
                         let mut wants = Vec::new();
                         for r in &offsets {
-                            match st.dev_cache.get(r.offset) {
+                            match st.dev_cache.get(r.offset, r.len) {
                                 Some(p) => {
                                     resolved.insert(r.offset, p);
                                 }
