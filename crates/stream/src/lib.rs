@@ -95,6 +95,14 @@ pub mod uring {
     unsafe impl Send for Aligned {}
 
     impl Aligned {
+        pub fn ptr(&self) -> *mut u8 {
+            self.ptr
+        }
+
+        pub fn cap(&self) -> usize {
+            self.cap
+        }
+
         pub fn new(cap: usize, align: usize) -> Option<Self> {
             let layout = std::alloc::Layout::from_size_align(cap, align).ok()?;
             let ptr = unsafe { std::alloc::alloc(layout) };
@@ -207,6 +215,103 @@ pub mod uring {
         }
         stats.secs = t0.elapsed().as_secs_f64();
         Ok(stats)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub mod fetch {
+    //! Reusable batch fetcher over the same ring/O_DIRECT machinery as the
+    //! bench: submit a batch of slab reads, get owned payloads back.
+
+    use super::uring::Aligned;
+    use super::Read;
+    use io_uring::{opcode, types, IoUring};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const ALIGN: u64 = 4096;
+
+    /// One fetched slab: an aligned bracket plus the payload window.
+    pub struct Slab {
+        buf: Aligned,
+        payload_off: usize,
+        payload_len: usize,
+    }
+
+    impl Slab {
+        pub fn payload(&self) -> &[u8] {
+            unsafe {
+                std::slice::from_raw_parts(self.buf.ptr().add(self.payload_off), self.payload_len)
+            }
+        }
+
+        pub fn bytes(&self) -> usize {
+            self.buf.cap()
+        }
+    }
+
+    pub struct Fetcher {
+        ring: IoUring,
+        file: std::fs::File,
+        qd: usize,
+    }
+
+    impl Fetcher {
+        pub fn open(path: &std::path::Path, qd: usize) -> std::io::Result<Fetcher> {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)?;
+            Ok(Fetcher { ring: IoUring::new(qd as u32 * 2)?, file, qd })
+        }
+
+        /// Fetch every read; result[i] corresponds to reads[i].
+        pub fn fetch(&mut self, reads: &[Read]) -> std::io::Result<Vec<Slab>> {
+            let fd = types::Fd(self.file.as_raw_fd());
+            let mut out: Vec<Option<Slab>> = Vec::with_capacity(reads.len());
+            out.resize_with(reads.len(), || None);
+            let mut next = 0usize;
+            let mut inflight = 0usize;
+
+            loop {
+                while inflight < self.qd && next < reads.len() {
+                    let r = reads[next];
+                    let aligned_off = r.offset & !(ALIGN - 1);
+                    let payload_off = (r.offset - aligned_off) as usize;
+                    let disk_len = (payload_off as u64 + r.len).next_multiple_of(ALIGN);
+                    let buf = Aligned::new(disk_len as usize, ALIGN as usize)
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+                    let sqe = opcode::Read::new(fd, buf.ptr(), disk_len as u32)
+                        .offset(aligned_off)
+                        .build()
+                        .user_data(next as u64);
+                    out[next] = Some(Slab {
+                        buf,
+                        payload_off,
+                        payload_len: r.len as usize,
+                    });
+                    unsafe { self.ring.submission().push(&sqe).expect("sq room") };
+                    inflight += 1;
+                    next += 1;
+                }
+                if inflight == 0 {
+                    break;
+                }
+                self.ring.submit_and_wait(1)?;
+                let completions: Vec<(u64, i32)> = self
+                    .ring
+                    .completion()
+                    .map(|c| (c.user_data(), c.result()))
+                    .collect();
+                for (_, res) in &completions {
+                    if *res < 0 {
+                        return Err(std::io::Error::from_raw_os_error(-res));
+                    }
+                }
+                inflight -= completions.len();
+            }
+            Ok(out.into_iter().map(|s| s.expect("all fetched")).collect())
+        }
     }
 }
 

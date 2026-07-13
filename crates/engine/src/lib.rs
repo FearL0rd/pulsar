@@ -140,13 +140,92 @@ mod real {
     }
 
     pub struct Model {
-        file: File,
+        path: std::path::PathBuf,
         pub shape: Shape,
         pub gguf: Gguf,
         token_embd: DeviceBuf,
         output_norm: DeviceBuf,
         output: DeviceBuf,
         layers: Vec<LayerW>,
+    }
+
+    /// v1 StreamingStore (DESIGN-expert-store.md): io_uring batch fetch of
+    /// cache misses + LFU host cache of expert slabs, keyed by absolute
+    /// file offset (unique per layer/tensor/expert).
+    pub struct StreamingStore {
+        fetcher: stream::fetch::Fetcher,
+        cache: std::collections::HashMap<u64, CacheEntry>,
+        used: usize,
+        budget: usize,
+        tick: u64,
+        pub hits: u64,
+        pub misses: u64,
+    }
+
+    struct CacheEntry {
+        slab: stream::fetch::Slab,
+        freq: u64,
+        tick: u64,
+    }
+
+    impl StreamingStore {
+        fn open(path: &Path, budget: usize) -> Result<StreamingStore> {
+            Ok(StreamingStore {
+                fetcher: stream::fetch::Fetcher::open(path, 32)?,
+                cache: std::collections::HashMap::new(),
+                used: 0,
+                budget,
+                tick: 0,
+                hits: 0,
+                misses: 0,
+            })
+        }
+
+        /// Make every read resident in the cache and bump its LFU state.
+        fn ensure(&mut self, wants: &[stream::Read]) -> Result {
+            self.tick += 1;
+            let missing: Vec<stream::Read> = wants
+                .iter()
+                .filter(|r| !self.cache.contains_key(&r.offset))
+                .copied()
+                .collect();
+            self.hits += (wants.len() - missing.len()) as u64;
+            self.misses += missing.len() as u64;
+            if !missing.is_empty() {
+                let slabs = self.fetcher.fetch(&missing)?;
+                let incoming: usize = slabs.iter().map(|s| s.bytes()).sum();
+                // evict lowest (freq, tick) not wanted right now
+                // ponytail: O(n) scan per eviction; heap it if the cache
+                // ever holds >100k entries
+                while self.used + incoming > self.budget && !self.cache.is_empty() {
+                    let victim = self
+                        .cache
+                        .iter()
+                        .filter(|(k, _)| !wants.iter().any(|w| w.offset == **k))
+                        .min_by_key(|(_, e)| (e.freq, e.tick))
+                        .map(|(k, _)| *k);
+                    let Some(k) = victim else { break };
+                    if let Some(e) = self.cache.remove(&k) {
+                        self.used -= e.slab.bytes();
+                    }
+                }
+                for (r, slab) in missing.iter().zip(slabs) {
+                    self.used += slab.bytes();
+                    self.cache.insert(r.offset, CacheEntry { slab, freq: 0, tick: self.tick });
+                }
+            }
+            for r in wants {
+                if let Some(e) = self.cache.get_mut(&r.offset) {
+                    e.freq += 1;
+                    e.tick = self.tick;
+                }
+            }
+            Ok(())
+        }
+
+        fn payload(&self, offset: u64) -> &[u8] {
+            self.cache[&offset].slab.payload()
+        }
     }
 
     /// How many header bytes to read before parsing; grows on Truncated.
@@ -182,6 +261,7 @@ mod real {
     impl Model {
         pub fn load(path: &Path) -> Result<Model> {
             let (file, gguf) = parse_header(path)?;
+            let _ = &file;
             if gguf.architecture() != Some("hy-v3") {
                 return Err(format!("not a hy-v3 gguf: {:?}", gguf.architecture()).into());
             }
@@ -229,7 +309,15 @@ mod real {
                     ffn,
                 });
             }
-            Ok(Model { file, shape, gguf, token_embd, output_norm, output, layers })
+            Ok(Model {
+                path: path.to_path_buf(),
+                shape,
+                gguf,
+                token_embd,
+                output_norm,
+                output,
+                layers,
+            })
         }
     }
 
@@ -263,11 +351,19 @@ mod real {
         kcache: Vec<DeviceBuf>,
         vcache: Vec<DeviceBuf>,
         logits: DeviceBuf,
-        slab_host: Vec<u8>,
+        pub store: StreamingStore,
     }
 
     impl State {
         pub fn new(m: &Model, ctx: u32) -> Result<State> {
+            let gb = std::env::var("PULSAR_CACHE_GB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(12);
+            Self::with_cache(m, ctx, gb << 30)
+        }
+
+        pub fn with_cache(m: &Model, ctx: u32, cache_bytes: usize) -> Result<State> {
             let s = m.shape;
             let f32s = |n: u32| DeviceBuf::alloc(n as usize * 4);
             let n_used = s.n_expert_used as usize;
@@ -284,12 +380,12 @@ mod real {
                 .max()
                 .unwrap_or(0) as usize;
 
-            let cache_bytes = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
+            let kv_bytes = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
             let mut kcache = Vec::new();
             let mut vcache = Vec::new();
             for _ in 0..s.n_exec_layer {
-                kcache.push(DeviceBuf::alloc(cache_bytes)?);
-                vcache.push(DeviceBuf::alloc(cache_bytes)?);
+                kcache.push(DeviceBuf::alloc(kv_bytes)?);
+                vcache.push(DeviceBuf::alloc(kv_bytes)?);
             }
 
             Ok(State {
@@ -325,7 +421,7 @@ mod real {
                 kcache,
                 vcache,
                 logits: f32s(s.n_vocab)?,
-                slab_host: vec![0u8; max_slab],
+                store: StreamingStore::open(&m.path, cache_bytes)?,
             })
         }
     }
@@ -387,14 +483,26 @@ mod real {
                             1,
                         )?;
 
-                        // v1 expert fetch: blocking pread + upload per slab.
-                        // ponytail: ~4.9MB x n_used per layer per token off
-                        // NVMe; the StreamingStore replaces exactly this block.
+                        // StreamingStore: LFU host cache + one io_uring
+                        // batch for the misses, then upload to the arena.
                         kernels::sync()?;
                         let selected = st.router_selected.read_i32(s.n_expert_used as usize)?;
                         let slab = gate_exps.expert_bytes as usize;
                         debug_assert_eq!(up_exps.expert_bytes, gate_exps.expert_bytes);
                         debug_assert_eq!(down_exps.expert_bytes, gate_exps.expert_bytes);
+                        let mut wants = Vec::with_capacity(3 * s.n_expert_used as usize);
+                        for &e in &selected {
+                            if e < 0 || e as u32 >= s.n_expert {
+                                continue;
+                            }
+                            for t in [gate_exps, up_exps, down_exps] {
+                                wants.push(stream::Read {
+                                    offset: t.abs_offset + e as u64 * t.expert_bytes,
+                                    len: t.expert_bytes,
+                                });
+                            }
+                        }
+                        st.store.ensure(&wants)?;
                         let mut ptrs = Vec::with_capacity(s.n_expert_used as usize);
                         for (slot, &e) in selected.iter().enumerate() {
                             if e < 0 || e as u32 >= s.n_expert {
@@ -403,9 +511,8 @@ mod real {
                             }
                             let base = slot * 3 * slab;
                             for (j, t) in [gate_exps, up_exps, down_exps].iter().enumerate() {
-                                let host = &mut st.slab_host[..slab];
-                                self.file.read_exact_at(host, t.abs_offset + e as u64 * t.expert_bytes)?;
-                                st.expert_arena.write(base + j * slab, host)?;
+                                let off = t.abs_offset + e as u64 * t.expert_bytes;
+                                st.expert_arena.write(base + j * slab, st.store.payload(off))?;
                             }
                             ptrs.push(ExpertPtrs {
                                 gate: st.expert_arena.ptr_at(base),

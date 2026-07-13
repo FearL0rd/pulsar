@@ -758,7 +758,7 @@ __device__ static float dev_dot_q2_K_q8_K_block(const block_q2_K *x, const block
     const float dmin = y->d * f16_to_f32(x->dmin);
     int isum = 0;
     int is = 0;
-    for (int k = 0; k < PULSAR_QK_K / 128; k++) {
+    for (int k = 0; k < (int)(PULSAR_QK_K / 128); k++) {
         int shift = 0;
         for (int j = 0; j < 4; j++) {
             int d = sc[is++] & 0x0f;
@@ -1029,7 +1029,7 @@ static float host_dot_q2_K_block(const char *row, const block_q8_K *xq, uint32_t
     int is = 0;
     const uint8_t *q2 = xb->qs;
     const int8_t *q8 = y->qs;
-    for (int k = 0; k < PULSAR_QK_K / 128; k++) {
+    for (int k = 0; k < (int)(PULSAR_QK_K / 128); k++) {
         int shift = 0;
         for (int j = 0; j < 4; j++) {
             for (int half = 0; half < 2; half++) {
