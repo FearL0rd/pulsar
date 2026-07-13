@@ -86,11 +86,10 @@ static float f16_to_f32_host(uint16_t h) {
     return f;
 }
 
-/* ---- pulsar-native Q8_0 matmul ----------------------------------------
- * GGML q8_0 block: 32 int8 quants + one f16 scale (34 bytes). Weights are
- * row-major q8_0; activations are f32. One thread block per (row, token),
- * 256 threads reduce across in_dim. Correctness-first: tuning happens at
- * parity time, against measurements. */
+/* ---- Q8_0 matmul, ds4 dp4a path ----------------------------------------
+ * Activations are quantized to q8_0 first (quantize_q8_0_f32_kernel), then
+ * the dot runs int8 x int8 via dp4a - exactly ds4's math, so decode logits
+ * match the reference engine. Kernels are verbatim from ds4_cuda.cu. */
 
 typedef struct __align__(2) {
     uint16_t scale_f16;
@@ -101,36 +100,138 @@ __device__ static float f16_to_f32(uint16_t h) {
     return __half2float(__ushort_as_half(h));
 }
 
-__global__ static void q8_0_matmul_kernel(
-        float *out,                /* [n_tok][out_dim] */
-        const q8_0_block *w,       /* [out_dim][in_dim/32] */
-        const float *x,            /* [n_tok][in_dim] */
-        uint32_t in_dim,
-        uint32_t out_dim,
-        uint32_t n_tok) {
-    const uint32_t row = blockIdx.x;
-    const uint32_t tok = blockIdx.y;
-    if (row >= out_dim || tok >= n_tok) return;
-    const uint32_t blocks = in_dim / 32u;
-    const q8_0_block *wr = w + (uint64_t)row * blocks;
-    const float *xt = x + (uint64_t)tok * in_dim;
-    float acc = 0.0f;
-    for (uint32_t b = threadIdx.x; b < blocks; b += blockDim.x) {
-        const q8_0_block *blk = &wr[b];
-        float s = f16_to_f32(blk->scale_f16);
-        float dot = 0.0f;
-        const float *xb = xt + (uint64_t)b * 32u;
-        for (int i = 0; i < 32; i++) dot += (float)blk->q[i] * xb[i];
-        acc += s * dot;
+__device__ static float warp_sum_f32(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, offset);
     }
-    __shared__ float red[256];
-    red[threadIdx.x] = acc;
+    return v;
+}
+
+__device__ __forceinline__ static int32_t load_i8x4_i32_aligned(const int8_t *p) {
+    return *(const int32_t *)p;
+}
+
+__device__ __forceinline__ static int32_t load_i8x4_i32_unaligned(const int8_t *p) {
+    const uint8_t *u = (const uint8_t *)p;
+    return (int32_t)((uint32_t)u[0] |
+                     ((uint32_t)u[1] << 8) |
+                     ((uint32_t)u[2] << 16) |
+                     ((uint32_t)u[3] << 24));
+}
+
+__device__ __forceinline__ static int32_t dot_i8x32_dp4a(const int8_t *a, const int8_t *b) {
+    int32_t dot = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < 32u; i += 4u) {
+        dot = __dp4a(load_i8x4_i32_unaligned(a + i), load_i8x4_i32_aligned(b + i), dot);
+    }
+    return dot;
+}
+
+__global__ static void quantize_q8_0_f32_kernel(
+        int8_t *xq,
+        float *xscale,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t blocks) {
+    uint64_t b = blockIdx.x;
+    uint64_t tok = blockIdx.y;
+    if (b >= blocks) return;
+    uint64_t i0 = b * 32;
+    uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+    const float *xr = x + tok * in_dim + i0;
+
+    float a = 0.0f;
+    if (threadIdx.x < bn) a = fabsf(xr[threadIdx.x]);
+    __shared__ float vals[32];
+    vals[threadIdx.x] = a;
     __syncthreads();
-    for (uint32_t s = blockDim.x / 2u; s != 0; s >>= 1u) {
-        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    for (uint32_t stride = 16; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
         __syncthreads();
     }
-    if (threadIdx.x == 0) out[(uint64_t)tok * out_dim + row] = red[0];
+    const float d = vals[0] / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
+    int8_t *dst = xq + (tok * blocks + b) * 32;
+    if (threadIdx.x < bn) {
+        int v = (int)lrintf(xr[threadIdx.x] * id);
+        v = v > 127 ? 127 : (v < -128 ? -128 : v);
+        dst[threadIdx.x] = (int8_t)v;
+    } else {
+        dst[threadIdx.x] = 0;
+    }
+}
+
+__global__ static void matmul_q8_0_preq_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        uint64_t blocks) {
+    uint64_t row = (uint64_t)blockIdx.x;
+    uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    const int8_t *xqr = xq + tok * blocks * 32;
+    const float *xsr = xscale + tok * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = threadIdx.x; b < blocks; b += blockDim.x) {
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        int dot = dot_i8x32_dp4a(qs, xqr + b * 32);
+        acc += __half2float(*scale_h) * xsr[b] * (float)dot;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
+__global__ static void matmul_q8_0_preq_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        int dot = dot_i8x32_dp4a(qs, xq + b * 32);
+        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+/* grow-only device scratch for activation prequant.
+ * ponytail: single global, single-stream engine; pool it per-stream if
+ * pulsar ever runs concurrent graphs. */
+static void *g_preq_scratch;
+static uint64_t g_preq_scratch_cap;
+
+static void *preq_scratch(uint64_t bytes) {
+    if (bytes <= g_preq_scratch_cap) return g_preq_scratch;
+    if (g_preq_scratch) (void)cudaFree(g_preq_scratch);
+    g_preq_scratch = NULL;
+    g_preq_scratch_cap = 0;
+    if (!cuda_ok(cudaMalloc(&g_preq_scratch, bytes), "preq scratch alloc")) return NULL;
+    g_preq_scratch_cap = bytes;
+    return g_preq_scratch;
 }
 
 extern "C" int pulsar_q8_0_matmul(
@@ -141,10 +242,28 @@ extern "C" int pulsar_q8_0_matmul(
         uint32_t out_dim,
         uint32_t n_tok) {
     if (in_dim == 0 || in_dim % 32u != 0 || out_dim == 0 || n_tok == 0) return 0;
-    dim3 grid(out_dim, n_tok, 1);
-    q8_0_matmul_kernel<<<grid, 256>>>(
-            (float *)out_dev, (const q8_0_block *)w_dev,
-            (const float *)x_dev, in_dim, out_dim, n_tok);
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t xq_bytes = (uint64_t)n_tok * blocks * 32u;
+    const uint64_t scale_off = (xq_bytes + 15u) & ~15ull;
+    void *tmp = preq_scratch(scale_off + (uint64_t)n_tok * blocks * sizeof(float));
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_off);
+
+    dim3 qgrid((unsigned)blocks, n_tok, 1);
+    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x_dev, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8_0 prequant launch")) return 0;
+
+    if (n_tok == 1) {
+        matmul_q8_0_preq_warp8_kernel<<<(out_dim + 7u) / 8u, 256>>>(
+                (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
+                in_dim, out_dim, blocks);
+    } else {
+        dim3 grid(out_dim, n_tok, 1);
+        matmul_q8_0_preq_kernel<<<grid, 256>>>(
+                (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
+                in_dim, out_dim, n_tok, blocks);
+    }
     return cuda_ok(cudaGetLastError(), "q8_0 matmul launch");
 }
 
@@ -209,14 +328,39 @@ extern "C" int pulsar_q8_0_matmul_selftest(void) {
             }
         }
     }
-    /* reference matmul on the dequantized weights */
+    /* reference: mirror the GPU path exactly - quantize activations to
+     * q8_0 per 32-block, integer dot, scale product */
+    int8_t *xq = (int8_t *)malloc((uint64_t)n_tok * in_dim);
+    float *xd = (float *)malloc((uint64_t)n_tok * blocks * sizeof(float));
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t b = 0; b < blocks; b++) {
+            const float *xb = x + (uint64_t)t * in_dim + b * 32u;
+            float amax = 0.0f;
+            for (int i = 0; i < 32; i++) amax = fmaxf(amax, fabsf(xb[i]));
+            const float d = amax / 127.0f;
+            const float id = d != 0.0f ? 1.0f / d : 0.0f;
+            xd[(uint64_t)t * blocks + b] = d;
+            for (int i = 0; i < 32; i++) {
+                int v = (int)lrintf(xb[i] * id);
+                v = v > 127 ? 127 : (v < -128 ? -128 : v);
+                xq[(uint64_t)t * in_dim + b * 32u + i] = (int8_t)v;
+            }
+        }
+    }
     for (uint32_t t = 0; t < n_tok; t++)
         for (uint32_t r = 0; r < out_dim; r++) {
-            double acc = 0.0;
-            for (uint32_t i = 0; i < in_dim; i++)
-                acc += (double)wf[(uint64_t)r * in_dim + i] * x[(uint64_t)t * in_dim + i];
-            ref[(uint64_t)t * out_dim + r] = (float)acc;
+            float acc = 0.0f;
+            for (uint32_t b = 0; b < blocks; b++) {
+                const q8_0_block *blk = &w[(uint64_t)r * blocks + b];
+                int32_t dot = 0;
+                for (int i = 0; i < 32; i++)
+                    dot += (int32_t)blk->q[i] * (int32_t)xq[(uint64_t)t * in_dim + b * 32u + i];
+                acc += f16_to_f32_host(blk->scale_f16) * xd[(uint64_t)t * blocks + b] * (float)dot;
+            }
+            ref[(uint64_t)t * out_dim + r] = acc;
         }
+    free(xq);
+    free(xd);
 
     void *w_dev = NULL, *x_dev = NULL, *out_dev = NULL;
     const uint64_t w_bytes = (uint64_t)out_dim * blocks * sizeof(*w);
@@ -472,40 +616,175 @@ typedef struct {
 
 #include "iq2_tables.inc"
 
-struct deq_q2_K {
-    __device__ __forceinline__ static float value(const char *blocks, uint32_t k) {
-        const block_q2_K *xb = (const block_q2_K *)blocks + (k / PULSAR_QK_K);
-        const uint32_t idx = k & (PULSAR_QK_K - 1u);
-        const uint32_t group = idx / 16u;
-        const uint32_t l = idx & 15u;
-        const uint32_t q_base = 32u * (group / 8u) + 16u * (group & 1u);
-        const uint32_t shift = ((group / 2u) & 3u) * 2u;
-        const uint32_t q = ((uint32_t)xb->qs[q_base + l] >> shift) & 0x03u;
-        const uint32_t sc = (uint32_t)xb->scales[group];
-        return f16_to_f32(xb->d) * (float)(sc & 0x0Fu) * (float)q -
-               f16_to_f32(xb->dmin) * (float)(sc >> 4u);
+/* Activations for expert dots are quantized to q8_K (ggml layout: f32
+ * scale, 256 int8, 16 block sums), then the dots run integer dp4a -
+ * ds4's exact math. Device functions verbatim from ds4_cuda.cu. */
+
+typedef struct {
+    float d;
+    int8_t qs[PULSAR_QK_K];
+    int16_t bsums[PULSAR_QK_K / 16];
+} block_q8_K;
+
+__global__ static void q8_K_quantize_kernel(block_q8_K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
+    uint32_t b = blockIdx.x;
+    uint32_t row = blockIdx.y;
+    if (row >= n_rows || b >= in_dim / PULSAR_QK_K) return;
+    const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * PULSAR_QK_K;
+    block_q8_K *yb = out + (uint64_t)row * (in_dim / PULSAR_QK_K) + b;
+    __shared__ float abs_part[256];
+    __shared__ float val_part[256];
+    __shared__ float maxv_s;
+    __shared__ float iscale_s;
+    uint32_t tid = threadIdx.x;
+    float v = tid < PULSAR_QK_K ? xr[tid] : 0.0f;
+    abs_part[tid] = tid < PULSAR_QK_K ? fabsf(v) : 0.0f;
+    val_part[tid] = v;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+            abs_part[tid] = abs_part[tid + stride];
+            val_part[tid] = val_part[tid + stride];
+        }
+        __syncthreads();
+    }
+    float amax = abs_part[0];
+    if (amax == 0.0f) {
+        if (tid == 0) yb->d = 0.0f;
+        if (tid < PULSAR_QK_K) yb->qs[tid] = 0;
+        if (tid < PULSAR_QK_K / 16) yb->bsums[tid] = 0;
+        return;
+    }
+    if (tid == 0) {
+        maxv_s = val_part[0];
+        iscale_s = -127.0f / maxv_s;
+    }
+    __syncthreads();
+    if (tid < PULSAR_QK_K) {
+        int qv = (int)lrintf(iscale_s * xr[tid]);
+        if (qv > 127) qv = 127;
+        if (qv < -128) qv = -128;
+        yb->qs[tid] = (int8_t)qv;
+    }
+    __syncthreads();
+    if (tid < PULSAR_QK_K / 16) {
+        int sum = 0;
+        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
+        yb->bsums[tid] = (int16_t)sum;
+    }
+    if (tid == 0) yb->d = 1.0f / iscale_s;
+}
+
+extern "C" int pulsar_quantize_q8_K(
+        void *out_dev, const void *x_dev, uint32_t in_dim, uint32_t n_rows) {
+    if (in_dim == 0 || in_dim % PULSAR_QK_K != 0 || n_rows == 0) return 0;
+    dim3 grid(in_dim / PULSAR_QK_K, n_rows, 1);
+    q8_K_quantize_kernel<<<grid, 256>>>(
+            (block_q8_K *)out_dev, (const float *)x_dev, in_dim, n_rows);
+    return cuda_ok(cudaGetLastError(), "q8_K quantize launch");
+}
+
+__device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v) {
+    const uint32_t p = __popc(v) & 1u;
+    const uint32_t s = v ^ (p << 7u);
+    return s * 0x01010101u;
+}
+
+__device__ __forceinline__ static void dev_iq2_i8x8_lut(
+        const uint64_t *grid,
+        const uint8_t *signs,
+        uint8_t grid_idx,
+        uint32_t sign_idx,
+        int32_t *w0,
+        int32_t *w1) {
+    const uint32_t s = dev_unpack_iq2_signs(signs[sign_idx]);
+    const int32_t sm0 = __vcmpne4(s & 0x08040201u, 0);
+    const int32_t sm1 = __vcmpne4(s & 0x80402010u, 0);
+    const uint64_t g = grid[grid_idx];
+    *w0 = __vsub4((int32_t)(uint32_t)g ^ sm0, sm0);
+    *w1 = __vsub4((int32_t)(uint32_t)(g >> 32) ^ sm1, sm1);
+}
+
+__device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
+        const block_iq2_xxs *x,
+        const block_q8_K *y,
+        const uint64_t *grid,
+        const uint8_t *signs) {
+    const float xd = f16_to_f32(x->d);
+    const uint16_t *q2 = x->qs;
+    const int8_t *q8 = y->qs;
+    int32_t bsum = 0;
+    for (int ib32 = 0; ib32 < PULSAR_QK_K / 32; ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
+        int32_t w[8];
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        int32_t sumi = 0;
+        sumi = __dp4a(w[0], *(const int32_t *)(q8 + ib32 * 32u + 0),  sumi);
+        sumi = __dp4a(w[1], *(const int32_t *)(q8 + ib32 * 32u + 4),  sumi);
+        sumi = __dp4a(w[2], *(const int32_t *)(q8 + ib32 * 32u + 8),  sumi);
+        sumi = __dp4a(w[3], *(const int32_t *)(q8 + ib32 * 32u + 12), sumi);
+        sumi = __dp4a(w[4], *(const int32_t *)(q8 + ib32 * 32u + 16), sumi);
+        sumi = __dp4a(w[5], *(const int32_t *)(q8 + ib32 * 32u + 20), sumi);
+        sumi = __dp4a(w[6], *(const int32_t *)(q8 + ib32 * 32u + 24), sumi);
+        sumi = __dp4a(w[7], *(const int32_t *)(q8 + ib32 * 32u + 28), sumi);
+        bsum += sumi * ls;
+    }
+    return 0.125f * xd * y->d * (float)bsum;
+}
+
+__device__ __forceinline__ static int32_t dev_dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
+    int32_t sum = 0;
+    #pragma unroll
+    for (uint32_t i = 0; i < 16; i += 4) {
+        const int32_t v = (*(const int32_t *)(q2 + i) >> shift) & 0x03030303;
+        sum = __dp4a(v, *(const int32_t *)(q8 + i), sum);
+    }
+    return sum;
+}
+
+__device__ static float dev_dot_q2_K_q8_K_block(const block_q2_K *x, const block_q8_K *y) {
+    const uint8_t *q2 = x->qs;
+    const int8_t *q8 = y->qs;
+    const uint8_t *sc = x->scales;
+    int summs = 0;
+    for (int j = 0; j < 16; j++) summs += y->bsums[j] * (sc[j] >> 4);
+    const float dall = y->d * f16_to_f32(x->d);
+    const float dmin = y->d * f16_to_f32(x->dmin);
+    int isum = 0;
+    int is = 0;
+    for (int k = 0; k < PULSAR_QK_K / 128; k++) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            int d = sc[is++] & 0x0f;
+            isum += d * dev_dot_q2_16(q2, q8, shift);
+            d = sc[is++] & 0x0f;
+            isum += d * dev_dot_q2_16(q2 + 16, q8 + 16, shift);
+            shift += 2;
+            q8 += 32;
+        }
+        q2 += 32;
+    }
+    return dall * (float)isum - dmin * (float)summs;
+}
+
+/* per-block dot functors for the templated MoE kernels */
+struct dot_iq2_xxs {
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
+        return dev_dot_iq2_xxs_q8_K_block_lut(
+                (const block_iq2_xxs *)row + b, xq + b,
+                cuda_iq2xxs_grid, cuda_ksigns_iq2xs);
     }
 };
 
-struct deq_iq2_xxs {
-    __device__ __forceinline__ static float value(const char *blocks, uint32_t k) {
-        const block_iq2_xxs *xb = (const block_iq2_xxs *)blocks + (k >> 8);
-        const uint32_t within = k & 255u;
-        const uint32_t ib32 = within >> 5;
-        const uint32_t kk = within & 31u;
-        const uint32_t l = kk >> 3;
-        const uint32_t j = kk & 7u;
-        const uint16_t *q2 = xb->qs + 4u * ib32;
-        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-        const uint32_t ls = 2u * (aux1 >> 28) + 1u;
-        const uint32_t grid_idx = (aux0 >> (8u * l)) & 0xffu;
-        const uint32_t sign_idx = (aux1 >> (7u * l)) & 127u;
-        const uint64_t g = cuda_iq2xxs_grid[grid_idx];
-        const int32_t gj = (int32_t)(uint32_t)(uint8_t)(g >> (8u * j));
-        const uint8_t signs = cuda_ksigns_iq2xs[sign_idx];
-        const float sign = (signs & (1u << j)) ? -1.0f : 1.0f;
-        return 0.125f * f16_to_f32(xb->d) * (float)ls * (float)gj * sign;
+struct dot_q2_K {
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
+        return dev_dot_q2_K_q8_K_block((const block_q2_K *)row + b, xq + b);
     }
 };
 
@@ -515,13 +794,13 @@ typedef struct {
     const void *down;
 } pulsar_expert_ptrs;
 
-template <typename DEQ>
+template <typename DOT>
 __global__ static void moe_pair_swiglu_kernel(
         float *mid,                     /* [n_tok][n_used][mid_dim] */
         const pulsar_expert_ptrs *ptrs, /* [n_tok][n_used] */
         const float *weights,           /* [n_tok][n_used] */
-        const float *x,                 /* [n_tok][in_dim] */
-        uint32_t in_dim,
+        const block_q8_K *xq,           /* [n_tok][in_dim/256] */
+        uint32_t in_blocks,
         uint32_t mid_dim,
         uint32_t n_used,
         uint32_t n_tok,
@@ -542,14 +821,13 @@ __global__ static void moe_pair_swiglu_kernel(
 
     const char *gate_row = (const char *)p.gate + (uint64_t)row * row_bytes;
     const char *up_row = (const char *)p.up + (uint64_t)row * row_bytes;
-    const float *token_x = x + (uint64_t)token * in_dim;
+    const block_q8_K *token_xq = xq + (uint64_t)token * in_blocks;
 
     float acc_gate = 0.0f;
     float acc_up = 0.0f;
-    for (uint32_t k = lane; k < in_dim; k += 32u) {
-        const float xv = token_x[k];
-        acc_gate += DEQ::value(gate_row, k) * xv;
-        acc_up += DEQ::value(up_row, k) * xv;
+    for (uint32_t b = lane; b < in_blocks; b += 32u) {
+        acc_gate += DOT::block(gate_row, token_xq, b);
+        acc_up += DOT::block(up_row, token_xq, b);
     }
     #pragma unroll
     for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
@@ -563,12 +841,12 @@ __global__ static void moe_pair_swiglu_kernel(
     }
 }
 
-template <typename DEQ>
+template <typename DOT>
 __global__ static void moe_down_kernel(
         float *out,                     /* [n_tok][out_dim] */
         const pulsar_expert_ptrs *ptrs, /* [n_tok][n_used] */
-        const float *mid,               /* [n_tok][n_used][mid_dim] */
-        uint32_t mid_dim,
+        const block_q8_K *midq,         /* [n_tok][n_used][mid_dim/256] */
+        uint32_t mid_blocks,
         uint32_t out_dim,
         uint32_t n_used,
         uint32_t n_tok,
@@ -584,9 +862,9 @@ __global__ static void moe_down_kernel(
         const pulsar_expert_ptrs p = ptrs[slot_base + slot];
         if (!p.down) continue;
         const char *down_row = (const char *)p.down + (uint64_t)row * row_bytes;
-        const float *slot_mid = mid + (slot_base + slot) * mid_dim;
-        for (uint32_t k = lane; k < mid_dim; k += 32u) {
-            acc += DEQ::value(down_row, k) * slot_mid[k];
+        const block_q8_K *slot_midq = midq + (slot_base + slot) * mid_blocks;
+        for (uint32_t b = lane; b < mid_blocks; b += 32u) {
+            acc += DOT::block(down_row, slot_midq, b);
         }
     }
     #pragma unroll
@@ -605,7 +883,7 @@ extern "C" int pulsar_moe_pair_swiglu(
         void *mid_dev,
         const void *ptrs_dev,
         const void *weights_dev,
-        const void *x_dev,
+        const void *xq_dev,        /* q8_K [n_tok][in_dim/256] */
         uint32_t in_dim,
         uint32_t mid_dim,
         uint32_t n_used,
@@ -616,20 +894,21 @@ extern "C" int pulsar_moe_pair_swiglu(
         n_used == 0 || n_tok == 0 || row_bytes == 0) {
         return 0;
     }
+    const uint32_t in_blocks = in_dim / PULSAR_QK_K;
     dim3 block(32, 4, 1);
     dim3 grid((mid_dim + 3u) / 4u, n_used, n_tok);
     switch (quant) {
     case PULSAR_QUANT_Q2_K:
-        moe_pair_swiglu_kernel<deq_q2_K><<<grid, block>>>(
+        moe_pair_swiglu_kernel<dot_q2_K><<<grid, block>>>(
                 (float *)mid_dev, (const pulsar_expert_ptrs *)ptrs_dev,
-                (const float *)weights_dev, (const float *)x_dev,
-                in_dim, mid_dim, n_used, n_tok, row_bytes);
+                (const float *)weights_dev, (const block_q8_K *)xq_dev,
+                in_blocks, mid_dim, n_used, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_IQ2_XXS:
-        moe_pair_swiglu_kernel<deq_iq2_xxs><<<grid, block>>>(
+        moe_pair_swiglu_kernel<dot_iq2_xxs><<<grid, block>>>(
                 (float *)mid_dev, (const pulsar_expert_ptrs *)ptrs_dev,
-                (const float *)weights_dev, (const float *)x_dev,
-                in_dim, mid_dim, n_used, n_tok, row_bytes);
+                (const float *)weights_dev, (const block_q8_K *)xq_dev,
+                in_blocks, mid_dim, n_used, n_tok, row_bytes);
         break;
     default:
         return 0;
@@ -640,7 +919,7 @@ extern "C" int pulsar_moe_pair_swiglu(
 extern "C" int pulsar_moe_down(
         void *out_dev,
         const void *ptrs_dev,
-        const void *mid_dev,
+        const void *midq_dev,      /* q8_K [n_tok][n_used][mid_dim/256] */
         uint32_t mid_dim,
         uint32_t out_dim,
         uint32_t n_used,
@@ -651,20 +930,21 @@ extern "C" int pulsar_moe_down(
         n_used == 0 || n_tok == 0 || row_bytes == 0) {
         return 0;
     }
+    const uint32_t mid_blocks = mid_dim / PULSAR_QK_K;
     dim3 block(32, 4, 1);
     dim3 grid((out_dim + 3u) / 4u, n_tok, 1);
     switch (quant) {
     case PULSAR_QUANT_Q2_K:
-        moe_down_kernel<deq_q2_K><<<grid, block>>>(
+        moe_down_kernel<dot_q2_K><<<grid, block>>>(
                 (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
-                (const float *)mid_dev, mid_dim, out_dim, n_used, n_tok,
-                row_bytes);
+                (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
+                n_tok, row_bytes);
         break;
     case PULSAR_QUANT_IQ2_XXS:
-        moe_down_kernel<deq_iq2_xxs><<<grid, block>>>(
+        moe_down_kernel<dot_iq2_xxs><<<grid, block>>>(
                 (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
-                (const float *)mid_dev, mid_dim, out_dim, n_used, n_tok,
-                row_bytes);
+                (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
+                n_tok, row_bytes);
         break;
     default:
         return 0;
@@ -678,42 +958,94 @@ static uint8_t test_randbyte(void) {
     return (uint8_t)lrintf((gqa_test_randf() * 0.5f + 0.5f) * 255.0f);
 }
 
-/* host mirrors of the device dequant functors; tables fetched from the
- * device so both sides read identical constants */
+/* host mirrors of the device quantizer and integer block dots; tables
+ * fetched from the device so both sides read identical constants */
 static uint8_t h_ksigns[128];
 static uint64_t h_grid[256];
 
-static float host_deq_q2_K(const char *blocks, uint32_t k) {
-    const block_q2_K *xb = (const block_q2_K *)blocks + (k / PULSAR_QK_K);
-    const uint32_t idx = k & (PULSAR_QK_K - 1u);
-    const uint32_t group = idx / 16u;
-    const uint32_t l = idx & 15u;
-    const uint32_t q_base = 32u * (group / 8u) + 16u * (group & 1u);
-    const uint32_t shift = ((group / 2u) & 3u) * 2u;
-    const uint32_t q = ((uint32_t)xb->qs[q_base + l] >> shift) & 0x03u;
-    const uint32_t sc = (uint32_t)xb->scales[group];
-    return f16_to_f32_host(xb->d) * (float)(sc & 0x0Fu) * (float)q -
-           f16_to_f32_host(xb->dmin) * (float)(sc >> 4u);
+/* mirror of q8_K_quantize_kernel, incl. the first-max tiebreak */
+static void host_quantize_q8_K(block_q8_K *out, const float *x,
+                               uint32_t in_dim, uint32_t n_rows) {
+    for (uint32_t row = 0; row < n_rows; row++) {
+        for (uint32_t b = 0; b < in_dim / PULSAR_QK_K; b++) {
+            const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * PULSAR_QK_K;
+            block_q8_K *yb = out + (uint64_t)row * (in_dim / PULSAR_QK_K) + b;
+            float amax = 0.0f, maxv = 0.0f;
+            for (uint32_t i = 0; i < PULSAR_QK_K; i++) {
+                const float a = fabsf(xr[i]);
+                if (a > amax) { amax = a; maxv = xr[i]; }
+            }
+            if (amax == 0.0f) {
+                memset(yb, 0, sizeof(*yb));
+                continue;
+            }
+            const float iscale = -127.0f / maxv;
+            for (uint32_t i = 0; i < PULSAR_QK_K; i++) {
+                int qv = (int)lrintf(iscale * xr[i]);
+                if (qv > 127) qv = 127;
+                if (qv < -128) qv = -128;
+                yb->qs[i] = (int8_t)qv;
+            }
+            for (uint32_t j = 0; j < PULSAR_QK_K / 16; j++) {
+                int sum = 0;
+                for (int i = 0; i < 16; i++) sum += yb->qs[j * 16 + i];
+                yb->bsums[j] = (int16_t)sum;
+            }
+            yb->d = 1.0f / iscale;
+        }
+    }
 }
 
-static float host_deq_iq2_xxs(const char *blocks, uint32_t k) {
-    const block_iq2_xxs *xb = (const block_iq2_xxs *)blocks + (k >> 8);
-    const uint32_t within = k & 255u;
-    const uint32_t ib32 = within >> 5;
-    const uint32_t kk = within & 31u;
-    const uint32_t l = kk >> 3;
-    const uint32_t j = kk & 7u;
-    const uint16_t *q2 = xb->qs + 4u * ib32;
-    const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-    const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-    const uint32_t ls = 2u * (aux1 >> 28) + 1u;
-    const uint32_t grid_idx = (aux0 >> (8u * l)) & 0xffu;
-    const uint32_t sign_idx = (aux1 >> (7u * l)) & 127u;
-    const uint64_t g = h_grid[grid_idx];
-    const int32_t gj = (int32_t)(uint32_t)(uint8_t)(g >> (8u * j));
-    const uint8_t signs = h_ksigns[sign_idx];
-    const float sign = (signs & (1u << j)) ? -1.0f : 1.0f;
-    return 0.125f * f16_to_f32_host(xb->d) * (float)ls * (float)gj * sign;
+static float host_dot_iq2_xxs_block(const char *row, const block_q8_K *xq, uint32_t b) {
+    const block_iq2_xxs *xb = (const block_iq2_xxs *)row + b;
+    const block_q8_K *y = xq + b;
+    int64_t bsum = 0;
+    for (uint32_t ib32 = 0; ib32 < PULSAR_QK_K / 32; ib32++) {
+        const uint16_t *q2 = xb->qs + 4u * ib32;
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
+        int32_t sumi = 0;
+        for (uint32_t kk = 0; kk < 32; kk++) {
+            const uint32_t l = kk >> 3, j = kk & 7u;
+            const uint8_t grid_idx = (uint8_t)((aux0 >> (8u * l)) & 0xffu);
+            const uint32_t sign_idx = (aux1 >> (7u * l)) & 127u;
+            int32_t w = (int32_t)(uint8_t)(h_grid[grid_idx] >> (8u * j));
+            if (h_ksigns[sign_idx] & (1u << j)) w = -w;
+            sumi += w * (int32_t)y->qs[ib32 * 32 + kk];
+        }
+        bsum += (int64_t)sumi * ls;
+    }
+    return 0.125f * f16_to_f32_host(xb->d) * y->d * (float)bsum;
+}
+
+static float host_dot_q2_K_block(const char *row, const block_q8_K *xq, uint32_t b) {
+    const block_q2_K *xb = (const block_q2_K *)row + b;
+    const block_q8_K *y = xq + b;
+    const uint8_t *sc = xb->scales;
+    int summs = 0;
+    for (int j = 0; j < 16; j++) summs += y->bsums[j] * (sc[j] >> 4);
+    int isum = 0;
+    int is = 0;
+    const uint8_t *q2 = xb->qs;
+    const int8_t *q8 = y->qs;
+    for (int k = 0; k < PULSAR_QK_K / 128; k++) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            for (int half = 0; half < 2; half++) {
+                const int d = sc[is++] & 0x0f;
+                int sum16 = 0;
+                for (int i = 0; i < 16; i++)
+                    sum16 += ((q2[half * 16 + i] >> shift) & 3) * (int)q8[half * 16 + i];
+                isum += d * sum16;
+            }
+            shift += 2;
+            q8 += 32;
+        }
+        q2 += 32;
+    }
+    return y->d * f16_to_f32_host(xb->d) * (float)isum -
+           y->d * f16_to_f32_host(xb->dmin) * (float)summs;
 }
 
 static void fill_slab(char *slab, uint32_t n_rows, uint32_t n_el,
@@ -736,17 +1068,69 @@ static void fill_slab(char *slab, uint32_t n_rows, uint32_t n_el,
     }
 }
 
+/* GPU q8_K quantizer vs the host mirror. Not bit-exact: both pulsar and
+ * ds4 build with --use_fast_math, so device division is approximate; allow
+ * +-1 on quants at rounding boundaries and last-ulp scale drift, and check
+ * bsums are self-consistent with the GPU quants. */
+static int q8_K_quantize_selftest(void) {
+    const uint32_t in_dim = 512, n_rows = 5;
+    const uint32_t blocks = in_dim / PULSAR_QK_K;
+    float *x = (float *)malloc((uint64_t)n_rows * in_dim * sizeof(float));
+    block_q8_K *ref = (block_q8_K *)malloc((uint64_t)n_rows * blocks * sizeof(block_q8_K));
+    block_q8_K *gpu = (block_q8_K *)malloc((uint64_t)n_rows * blocks * sizeof(block_q8_K));
+    for (uint64_t i = 0; i < (uint64_t)n_rows * in_dim; i++) x[i] = gqa_test_randf() * 3.0f;
+    host_quantize_q8_K(ref, x, in_dim, n_rows);
+
+    void *x_dev = NULL, *q_dev = NULL;
+    const uint64_t q_bytes = (uint64_t)n_rows * blocks * sizeof(block_q8_K);
+    int ok = cuda_ok(cudaMalloc(&x_dev, (uint64_t)n_rows * in_dim * 4), "x alloc") &&
+             cuda_ok(cudaMalloc(&q_dev, q_bytes), "q alloc") &&
+             cuda_ok(cudaMemcpy(x_dev, x, (uint64_t)n_rows * in_dim * 4, cudaMemcpyHostToDevice), "x h2d") &&
+             pulsar_quantize_q8_K(q_dev, x_dev, in_dim, n_rows) &&
+             cuda_ok(cudaDeviceSynchronize(), "sync") &&
+             cuda_ok(cudaMemcpy(gpu, q_dev, q_bytes, cudaMemcpyDeviceToHost), "q d2h");
+    uint64_t q_off = 0;
+    float d_maxrel = 0.0f;
+    if (ok) {
+        for (uint32_t bi = 0; bi < n_rows * blocks && ok; bi++) {
+            const block_q8_K *r = &ref[bi], *g = &gpu[bi];
+            const float dr = fabsf(g->d - r->d) / fmaxf(fabsf(r->d), 1e-30f);
+            if (dr > d_maxrel) d_maxrel = dr;
+            ok = dr <= 4e-7f;
+            for (uint32_t i = 0; i < PULSAR_QK_K && ok; i++) {
+                const int diff = abs((int)g->qs[i] - (int)r->qs[i]);
+                if (diff > 0) q_off++;
+                ok = diff <= 1;
+            }
+            for (uint32_t j = 0; j < PULSAR_QK_K / 16 && ok; j++) {
+                int sum = 0;
+                for (int i = 0; i < 16; i++) sum += g->qs[j * 16 + i];
+                ok = g->bsums[j] == (int16_t)sum;
+            }
+        }
+    }
+    fprintf(stderr, "q8_K-quantize-selftest: %s (quants off-by-one %llu/%u, d max rel %.2e)\n",
+            ok ? "PASS" : "FAIL", (unsigned long long)q_off,
+            n_rows * blocks * PULSAR_QK_K, (double)d_maxrel);
+    if (x_dev) cudaFree(x_dev);
+    if (q_dev) cudaFree(q_dev);
+    free(x); free(ref); free(gpu);
+    return ok;
+}
+
 static int moe_selftest_one(uint32_t quant, const char *name) {
     const uint32_t in_dim = 512, mid_dim = 256, out_dim = 320;
     const uint32_t n_expert = 8, n_used = 4, n_tok = 3;
-    const uint64_t pair_row_bytes = (uint64_t)(in_dim / PULSAR_QK_K) *
+    const uint32_t in_blocks = in_dim / PULSAR_QK_K;
+    const uint32_t mid_blocks = mid_dim / PULSAR_QK_K;
+    const uint64_t pair_row_bytes = (uint64_t)in_blocks *
         (quant == PULSAR_QUANT_Q2_K ? sizeof(block_q2_K) : sizeof(block_iq2_xxs));
-    const uint64_t down_row_bytes = (uint64_t)(mid_dim / PULSAR_QK_K) *
+    const uint64_t down_row_bytes = (uint64_t)mid_blocks *
         (quant == PULSAR_QUANT_Q2_K ? sizeof(block_q2_K) : sizeof(block_iq2_xxs));
     const uint64_t gate_slab_bytes = (uint64_t)n_expert * mid_dim * pair_row_bytes;
     const uint64_t down_slab_bytes = (uint64_t)n_expert * out_dim * down_row_bytes;
-    float (*deq)(const char *, uint32_t) =
-        quant == PULSAR_QUANT_Q2_K ? host_deq_q2_K : host_deq_iq2_xxs;
+    float (*dot)(const char *, const block_q8_K *, uint32_t) =
+        quant == PULSAR_QUANT_Q2_K ? host_dot_q2_K_block : host_dot_iq2_xxs_block;
 
     char *gate = (char *)malloc(gate_slab_bytes);
     char *up = (char *)malloc(gate_slab_bytes);
@@ -754,6 +1138,9 @@ static int moe_selftest_one(uint32_t quant, const char *name) {
     float *x = (float *)malloc((uint64_t)n_tok * in_dim * sizeof(float));
     float *w = (float *)malloc((uint64_t)n_tok * n_used * sizeof(float));
     int32_t *sel = (int32_t *)malloc((uint64_t)n_tok * n_used * sizeof(int32_t));
+    block_q8_K *xq = (block_q8_K *)malloc((uint64_t)n_tok * in_blocks * sizeof(block_q8_K));
+    float *mid_host = (float *)malloc((uint64_t)n_tok * n_used * mid_dim * sizeof(float));
+    block_q8_K *midq = (block_q8_K *)malloc((uint64_t)n_tok * n_used * mid_blocks * sizeof(block_q8_K));
     float *mid_ref = (float *)calloc((uint64_t)n_tok * n_used * mid_dim, sizeof(float));
     float *out_ref = (float *)calloc((uint64_t)n_tok * out_dim, sizeof(float));
     float *mid_gpu = (float *)malloc((uint64_t)n_tok * n_used * mid_dim * sizeof(float));
@@ -763,6 +1150,8 @@ static int moe_selftest_one(uint32_t quant, const char *name) {
     fill_slab(up, n_expert * mid_dim, in_dim, pair_row_bytes, quant);
     fill_slab(down, n_expert * out_dim, mid_dim, down_row_bytes, quant);
     for (uint64_t i = 0; i < (uint64_t)n_tok * in_dim; i++) x[i] = gqa_test_randf();
+    for (uint64_t i = 0; i < (uint64_t)n_tok * n_used * mid_dim; i++)
+        mid_host[i] = gqa_test_randf();
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t s = 0; s < n_used; s++) {
             sel[t * n_used + s] = (int32_t)(test_randbyte() % n_expert);
@@ -771,14 +1160,22 @@ static int moe_selftest_one(uint32_t quant, const char *name) {
     }
     sel[1 * n_used + 2] = -1; /* one unrouted slot: NULL ptrs, zero output */
 
+    /* both sides consume the same host-quantized activations (the GPU
+     * quantizer is proven bit-exact separately) */
+    host_quantize_q8_K(xq, x, in_dim, n_tok);
+    host_quantize_q8_K(midq, mid_host, mid_dim, n_tok * n_used);
+
     void *gate_dev = NULL, *up_dev = NULL, *down_dev = NULL;
-    void *x_dev = NULL, *w_dev = NULL, *ptrs_dev = NULL;
+    void *xq_dev = NULL, *midq_dev = NULL, *w_dev = NULL, *ptrs_dev = NULL;
     void *mid_dev = NULL, *out_dev = NULL;
     pulsar_expert_ptrs ptrs[n_tok * n_used];
+    const uint64_t xq_bytes = (uint64_t)n_tok * in_blocks * sizeof(block_q8_K);
+    const uint64_t midq_bytes = (uint64_t)n_tok * n_used * mid_blocks * sizeof(block_q8_K);
     int ok = cuda_ok(cudaMalloc(&gate_dev, gate_slab_bytes), "gate alloc") &&
              cuda_ok(cudaMalloc(&up_dev, gate_slab_bytes), "up alloc") &&
              cuda_ok(cudaMalloc(&down_dev, down_slab_bytes), "down alloc") &&
-             cuda_ok(cudaMalloc(&x_dev, (uint64_t)n_tok * in_dim * sizeof(float)), "x alloc") &&
+             cuda_ok(cudaMalloc(&xq_dev, xq_bytes), "xq alloc") &&
+             cuda_ok(cudaMalloc(&midq_dev, midq_bytes), "midq alloc") &&
              cuda_ok(cudaMalloc(&w_dev, (uint64_t)n_tok * n_used * sizeof(float)), "w alloc") &&
              cuda_ok(cudaMalloc(&ptrs_dev, sizeof(ptrs)), "ptrs alloc") &&
              cuda_ok(cudaMalloc(&mid_dev, (uint64_t)n_tok * n_used * mid_dim * sizeof(float)), "mid alloc") &&
@@ -786,7 +1183,8 @@ static int moe_selftest_one(uint32_t quant, const char *name) {
              cuda_ok(cudaMemcpy(gate_dev, gate, gate_slab_bytes, cudaMemcpyHostToDevice), "gate h2d") &&
              cuda_ok(cudaMemcpy(up_dev, up, gate_slab_bytes, cudaMemcpyHostToDevice), "up h2d") &&
              cuda_ok(cudaMemcpy(down_dev, down, down_slab_bytes, cudaMemcpyHostToDevice), "down h2d") &&
-             cuda_ok(cudaMemcpy(x_dev, x, (uint64_t)n_tok * in_dim * sizeof(float), cudaMemcpyHostToDevice), "x h2d") &&
+             cuda_ok(cudaMemcpy(xq_dev, xq, xq_bytes, cudaMemcpyHostToDevice), "xq h2d") &&
+             cuda_ok(cudaMemcpy(midq_dev, midq, midq_bytes, cudaMemcpyHostToDevice), "midq h2d") &&
              cuda_ok(cudaMemcpy(w_dev, w, (uint64_t)n_tok * n_used * sizeof(float), cudaMemcpyHostToDevice), "w h2d");
 
     for (uint32_t i = 0; i < n_tok * n_used; i++) {
@@ -800,48 +1198,46 @@ static int moe_selftest_one(uint32_t quant, const char *name) {
         ptrs[i].down = (char *)down_dev + (uint64_t)e * out_dim * down_row_bytes;
     }
     ok = ok && cuda_ok(cudaMemcpy(ptrs_dev, ptrs, sizeof(ptrs), cudaMemcpyHostToDevice), "ptrs h2d") &&
-         pulsar_moe_pair_swiglu(mid_dev, ptrs_dev, w_dev, x_dev,
+         pulsar_moe_pair_swiglu(mid_dev, ptrs_dev, w_dev, xq_dev,
                                 in_dim, mid_dim, n_used, n_tok,
                                 pair_row_bytes, quant) &&
-         pulsar_moe_down(out_dev, ptrs_dev, mid_dev, mid_dim, out_dim,
+         pulsar_moe_down(out_dev, ptrs_dev, midq_dev, mid_dim, out_dim,
                          n_used, n_tok, down_row_bytes, quant) &&
          cuda_ok(cudaDeviceSynchronize(), "sync") &&
          cuda_ok(cudaMemcpy(mid_gpu, mid_dev, (uint64_t)n_tok * n_used * mid_dim * sizeof(float), cudaMemcpyDeviceToHost), "mid d2h") &&
          cuda_ok(cudaMemcpy(out_gpu, out_dev, (uint64_t)n_tok * out_dim * sizeof(float), cudaMemcpyDeviceToHost), "out d2h");
 
-    /* host reference */
+    /* host reference: same integer block dots, f32 accumulation */
     for (uint32_t t = 0; t < n_tok && ok; t++) {
         for (uint32_t s = 0; s < n_used; s++) {
             const int32_t e = sel[t * n_used + s];
             if (e < 0) continue;
             const char *gs = gate + (uint64_t)e * mid_dim * pair_row_bytes;
             const char *us = up + (uint64_t)e * mid_dim * pair_row_bytes;
+            const block_q8_K *txq = xq + (uint64_t)t * in_blocks;
             for (uint32_t r = 0; r < mid_dim; r++) {
-                double ag = 0.0, au = 0.0;
-                const char *gr = gs + (uint64_t)r * pair_row_bytes;
-                const char *ur = us + (uint64_t)r * pair_row_bytes;
-                for (uint32_t k = 0; k < in_dim; k++) {
-                    const double xv = x[(uint64_t)t * in_dim + k];
-                    ag += (double)deq(gr, k) * xv;
-                    au += (double)deq(ur, k) * xv;
+                float ag = 0.0f, au = 0.0f;
+                for (uint32_t b = 0; b < in_blocks; b++) {
+                    ag += dot(gs + (uint64_t)r * pair_row_bytes, txq, b);
+                    au += dot(us + (uint64_t)r * pair_row_bytes, txq, b);
                 }
-                const double sw = ag / (1.0 + exp(-ag));
+                const float sw = ag / (1.0f + expf(-ag));
                 mid_ref[((uint64_t)t * n_used + s) * mid_dim + r] =
-                    (float)(sw * au * w[t * n_used + s]);
+                    sw * au * w[t * n_used + s];
             }
         }
         for (uint32_t r = 0; r < out_dim; r++) {
-            double acc = 0.0;
+            float acc = 0.0f;
             for (uint32_t s = 0; s < n_used; s++) {
                 const int32_t e = sel[t * n_used + s];
                 if (e < 0) continue;
                 const char *dr = down + (uint64_t)e * out_dim * down_row_bytes +
                                  (uint64_t)r * down_row_bytes;
-                const float *sm = mid_ref + ((uint64_t)t * n_used + s) * mid_dim;
-                for (uint32_t k = 0; k < mid_dim; k++)
-                    acc += (double)deq(dr, k) * sm[k];
+                const block_q8_K *smq = midq + ((uint64_t)t * n_used + s) * mid_blocks;
+                for (uint32_t b = 0; b < mid_blocks; b++)
+                    acc += dot(dr, smq, b);
             }
-            out_ref[(uint64_t)t * out_dim + r] = (float)acc;
+            out_ref[(uint64_t)t * out_dim + r] = acc;
         }
     }
 
@@ -860,7 +1256,7 @@ static int moe_selftest_one(uint32_t quant, const char *name) {
             if (a > out_maxref) out_maxref = a;
         }
         ok = mid_maxd <= 1e-3f * (mid_maxref > 1.0f ? mid_maxref : 1.0f) &&
-             out_maxd <= 2e-3f * (out_maxref > 1.0f ? out_maxref : 1.0f);
+             out_maxd <= 1e-3f * (out_maxref > 1.0f ? out_maxref : 1.0f);
     }
     fprintf(stderr, "moe-selftest %s: %s (mid max diff %.2e, out max diff %.2e, max |out ref| %.2e)\n",
             name, ok ? "PASS" : "FAIL", (double)mid_maxd, (double)out_maxd,
@@ -868,12 +1264,14 @@ static int moe_selftest_one(uint32_t quant, const char *name) {
     if (gate_dev) cudaFree(gate_dev);
     if (up_dev) cudaFree(up_dev);
     if (down_dev) cudaFree(down_dev);
-    if (x_dev) cudaFree(x_dev);
+    if (xq_dev) cudaFree(xq_dev);
+    if (midq_dev) cudaFree(midq_dev);
     if (w_dev) cudaFree(w_dev);
     if (ptrs_dev) cudaFree(ptrs_dev);
     if (mid_dev) cudaFree(mid_dev);
     if (out_dev) cudaFree(out_dev);
     free(gate); free(up); free(down); free(x); free(w); free(sel);
+    free(xq); free(mid_host); free(midq);
     free(mid_ref); free(out_ref); free(mid_gpu); free(out_gpu);
     return ok;
 }
@@ -885,7 +1283,8 @@ extern "C" int pulsar_moe_selftest(void) {
                                       sizeof(h_grid)), "grid fetch")) {
         return 0;
     }
-    return moe_selftest_one(PULSAR_QUANT_Q2_K, "q2_K") &&
+    return q8_K_quantize_selftest() &&
+           moe_selftest_one(PULSAR_QUANT_Q2_K, "q2_K") &&
            moe_selftest_one(PULSAR_QUANT_IQ2_XXS, "iq2_xxs");
 }
 

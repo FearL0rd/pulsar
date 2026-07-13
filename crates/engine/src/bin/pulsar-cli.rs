@@ -29,6 +29,7 @@ fn run() -> engine::Result {
     let mut ctx = 2048u32;
     let mut bos = true;
     let mut dump_logits = None;
+    let mut teacher_force = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -41,6 +42,7 @@ fn run() -> engine::Result {
             "--ctx" => ctx = need("--ctx")?.parse()?,
             "--no-bos" => bos = false,
             "--dump-logits" => dump_logits = Some(need("--dump-logits")?),
+            "--teacher-force" => teacher_force = true,
             other => return Err(format!("unknown arg {other}").into()),
         }
     }
@@ -76,6 +78,23 @@ fn run() -> engine::Result {
     eprintln!("pulsar: prompt ids {prompt_ids:?}");
 
     let mut st = engine::State::new(&model, ctx)?;
+
+    if teacher_force {
+        // Per-position top-5 (id, logit) along the given token sequence,
+        // one JSON line per position, for cross-engine agreement checks.
+        for (i, &id) in prompt_ids.iter().enumerate() {
+            let l = model.forward_token(&mut st, id, i as u32, true)?.unwrap();
+            let mut top: Vec<u32> = (0..l.len() as u32).collect();
+            top.sort_by(|&a, &b| l[b as usize].total_cmp(&l[a as usize]));
+            let entries: Vec<String> = top[..5]
+                .iter()
+                .map(|&t| format!("[{},{}]", t, l[t as usize]))
+                .collect();
+            println!("{{\"pos\":{},\"after\":{},\"top\":[{}]}}", i, id, entries.join(","));
+        }
+        return Ok(());
+    }
+
     let t1 = std::time::Instant::now();
     let mut logits = None;
     for (i, &id) in prompt_ids.iter().enumerate() {

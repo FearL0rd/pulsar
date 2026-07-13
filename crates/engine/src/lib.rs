@@ -256,6 +256,8 @@ mod real {
         router_weights: DeviceBuf,
         moe_mid: DeviceBuf,
         moe_out: DeviceBuf,
+        xq: DeviceBuf,
+        midq: DeviceBuf,
         expert_arena: DeviceBuf,
         expert_ptrs: DeviceBuf,
         kcache: Vec<DeviceBuf>,
@@ -311,6 +313,13 @@ mod real {
                 router_weights: f32s(s.n_expert_used)?,
                 moe_mid: f32s(s.n_expert_used * s.n_ff_exp)?,
                 moe_out: f32s(s.n_embd)?,
+                xq: DeviceBuf::alloc(
+                    s.n_embd as usize / kernels::Q8_K_BLOCK_ELEMS * kernels::Q8_K_BLOCK_BYTES,
+                )?,
+                midq: DeviceBuf::alloc(
+                    n_used * s.n_ff_exp as usize / kernels::Q8_K_BLOCK_ELEMS
+                        * kernels::Q8_K_BLOCK_BYTES,
+                )?,
                 expert_arena: DeviceBuf::alloc(n_used * 3 * max_slab)?,
                 expert_ptrs: DeviceBuf::alloc(n_used * std::mem::size_of::<ExpertPtrs>())?,
                 kcache,
@@ -412,13 +421,16 @@ mod real {
                         kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, s.n_ff_exp, 0.0, 1.0)?;
                         kernels::matmul_q8_0(&mut st.shared_out, shexp_down, &st.ffn_mid, s.n_ff_exp, s.n_embd, 1)?;
 
-                        // routed experts
+                        // routed experts: activations quantized to q8_K,
+                        // integer dp4a dots (ds4's exact math)
+                        kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, 1)?;
                         kernels::moe_pair_swiglu(
-                            &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.normed,
+                            &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
                             s.n_embd, s.n_ff_exp, s.n_expert_used, 1, gate_exps.row_bytes, gate_exps.quant,
                         )?;
+                        kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, s.n_expert_used)?;
                         kernels::moe_down(
-                            &mut st.moe_out, &st.expert_ptrs, &st.moe_mid,
+                            &mut st.moe_out, &st.expert_ptrs, &st.midq,
                             s.n_ff_exp, s.n_embd, s.n_expert_used, 1, down_exps.row_bytes, down_exps.quant,
                         )?;
 
