@@ -248,4 +248,203 @@ extern "C" int pulsar_q8_0_matmul_selftest(void) {
 }
 
 
+/* ---- sigmoid router + top-k select ------------------------------------
+ * Warp-per-token select, derived from ds4's glm_router_select_kernel (the
+ * Hy3 router mirrors GLM: probs = sigmoid(logits), selection score =
+ * prob + bias, route weights = selected probs normalized * scale).
+ * pulsar contract: bias is an explicit device pointer, not a model-map
+ * offset. n_expert <= 256, k_used <= n_expert. */
+
+__device__ __forceinline__ static float router_sigmoid(float x) {
+    if (x >= 0.0f) {
+        const float e = expf(-x);
+        return 1.0f / (1.0f + e);
+    }
+    const float e = expf(x);
+    return e / (1.0f + e);
+}
+
+__device__ __forceinline__ static bool router_better(
+        float av, uint32_t ai, float bv, uint32_t bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+
+__global__ static void router_select_kernel(
+        int32_t *selected,         /* [n_tok][k_used] */
+        float *weights,            /* [n_tok][k_used] */
+        const float *logits,       /* [n_tok][n_expert] */
+        const float *bias,         /* [n_expert] */
+        uint32_t n_expert,
+        uint32_t k_used,
+        float weight_scale,
+        uint32_t n_tok) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t token = blockIdx.x * blockDim.y + threadIdx.y;
+    if (token >= n_tok || lane >= 32u) return;
+
+    const float *log = logits + (uint64_t)token * n_expert;
+    int32_t *sel = selected + (uint64_t)token * k_used;
+    float *w = weights + (uint64_t)token * k_used;
+
+    float local_prob[8];
+    float local_score[8];
+    #pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) {
+        const uint32_t e = lane + j * 32u;
+        if (e < n_expert) {
+            const float p = router_sigmoid(log[e]);
+            local_prob[j] = p;
+            local_score[j] = p + bias[e];
+        } else {
+            local_prob[j] = 0.0f;
+            local_score[j] = -INFINITY;
+        }
+    }
+    __syncwarp();
+
+    float sum = 0.0f;
+    for (uint32_t k = 0; k < k_used; k++) {
+        float best_score = -INFINITY;
+        float best_prob = 0.0f;
+        uint32_t best_idx = UINT32_MAX;
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t e = lane + j * 32u;
+            if (router_better(local_score[j], e, best_score, best_idx)) {
+                best_score = local_score[j];
+                best_prob = local_prob[j];
+                best_idx = e;
+            }
+        }
+        #pragma unroll
+        for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+            const float other_score = __shfl_xor_sync(0xffffffffu, best_score, mask);
+            const float other_prob = __shfl_xor_sync(0xffffffffu, best_prob, mask);
+            const uint32_t other_idx = __shfl_xor_sync(0xffffffffu, best_idx, mask);
+            if (router_better(other_score, other_idx, best_score, best_idx)) {
+                best_score = other_score;
+                best_prob = other_prob;
+                best_idx = other_idx;
+            }
+        }
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            if (lane + j * 32u == best_idx) local_score[j] = -INFINITY;
+        }
+        if (lane == 0) {
+            sel[k] = (int32_t)best_idx;
+            w[k] = best_prob;
+        }
+        sum += best_prob;
+    }
+
+    if (lane == 0) {
+        sum = fmaxf(sum, 6.103515625e-5f);
+        for (uint32_t k = 0; k < k_used; k++) w[k] = w[k] / sum * weight_scale;
+    }
+}
+
+extern "C" int pulsar_router_select(
+        void *selected_dev,        /* int32 [n_tok][k_used] */
+        void *weights_dev,         /* f32   [n_tok][k_used] */
+        const void *logits_dev,    /* f32   [n_tok][n_expert] */
+        const void *bias_dev,      /* f32   [n_expert] */
+        uint32_t n_expert,
+        uint32_t k_used,
+        float weight_scale,
+        uint32_t n_tok) {
+    if (n_expert == 0 || n_expert > 256u || k_used == 0 || k_used > n_expert ||
+        n_tok == 0) {
+        return 0;
+    }
+    dim3 block(32, 4, 1);
+    router_select_kernel<<<(n_tok + 3u) / 4u, block>>>(
+            (int32_t *)selected_dev, (float *)weights_dev,
+            (const float *)logits_dev, (const float *)bias_dev,
+            n_expert, k_used, weight_scale, n_tok);
+    return cuda_ok(cudaGetLastError(), "router select launch");
+}
+
+/* CPU-reference selftest across Hy3-like and GLM-like shapes. */
+static int router_selftest_one(uint32_t n_expert, uint32_t k_used,
+                               float scale, uint32_t n_tok) {
+    float *logits = (float *)malloc((uint64_t)n_tok * n_expert * sizeof(float));
+    float *bias = (float *)malloc((uint64_t)n_expert * sizeof(float));
+    int32_t *sel_ref = (int32_t *)malloc((uint64_t)n_tok * k_used * sizeof(int32_t));
+    float *w_ref = (float *)malloc((uint64_t)n_tok * k_used * sizeof(float));
+    int32_t *sel_gpu = (int32_t *)malloc((uint64_t)n_tok * k_used * sizeof(int32_t));
+    float *w_gpu = (float *)malloc((uint64_t)n_tok * k_used * sizeof(float));
+
+    for (uint64_t i = 0; i < (uint64_t)n_tok * n_expert; i++)
+        logits[i] = gqa_test_randf() * 4.0f;
+    for (uint32_t e = 0; e < n_expert; e++) bias[e] = gqa_test_randf();
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float *log = logits + (uint64_t)t * n_expert;
+        float prob[256], score[256];
+        for (uint32_t e = 0; e < n_expert; e++) {
+            prob[e] = 1.0f / (1.0f + expf(-log[e]));
+            score[e] = prob[e] + bias[e];
+        }
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < k_used; k++) {
+            uint32_t best = UINT32_MAX;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                if (best == UINT32_MAX || score[e] > score[best]) best = e;
+            }
+            sel_ref[(uint64_t)t * k_used + k] = (int32_t)best;
+            w_ref[(uint64_t)t * k_used + k] = prob[best];
+            sum += prob[best];
+            score[best] = -INFINITY;
+        }
+        sum = fmaxf(sum, 6.103515625e-5f);
+        for (uint32_t k = 0; k < k_used; k++)
+            w_ref[(uint64_t)t * k_used + k] =
+                w_ref[(uint64_t)t * k_used + k] / sum * scale;
+    }
+
+    void *log_dev = NULL, *bias_dev = NULL, *sel_dev = NULL, *w_dev = NULL;
+    const uint64_t log_bytes = (uint64_t)n_tok * n_expert * sizeof(float);
+    const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+    const uint64_t sel_bytes = (uint64_t)n_tok * k_used * sizeof(int32_t);
+    const uint64_t w_bytes = (uint64_t)n_tok * k_used * sizeof(float);
+    int ok = cuda_ok(cudaMalloc(&log_dev, log_bytes), "logits alloc") &&
+             cuda_ok(cudaMalloc(&bias_dev, bias_bytes), "bias alloc") &&
+             cuda_ok(cudaMalloc(&sel_dev, sel_bytes), "sel alloc") &&
+             cuda_ok(cudaMalloc(&w_dev, w_bytes), "w alloc") &&
+             cuda_ok(cudaMemcpy(log_dev, logits, log_bytes, cudaMemcpyHostToDevice), "logits h2d") &&
+             cuda_ok(cudaMemcpy(bias_dev, bias, bias_bytes, cudaMemcpyHostToDevice), "bias h2d") &&
+             pulsar_router_select(sel_dev, w_dev, log_dev, bias_dev,
+                                  n_expert, k_used, scale, n_tok) &&
+             cuda_ok(cudaDeviceSynchronize(), "sync") &&
+             cuda_ok(cudaMemcpy(sel_gpu, sel_dev, sel_bytes, cudaMemcpyDeviceToHost), "sel d2h") &&
+             cuda_ok(cudaMemcpy(w_gpu, w_dev, w_bytes, cudaMemcpyDeviceToHost), "w d2h");
+    float maxd = 0.0f;
+    uint32_t idx_mismatch = 0;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_tok * k_used; i++) {
+            if (sel_gpu[i] != sel_ref[i]) idx_mismatch++;
+            float d = fabsf(w_gpu[i] - w_ref[i]);
+            if (d > maxd) maxd = d;
+        }
+        ok = idx_mismatch == 0 && maxd <= 1e-5f;
+    }
+    fprintf(stderr,
+            "router-selftest n_expert=%u k=%u: %s (idx mismatches %u, max w diff %.2e)\n",
+            n_expert, k_used, ok ? "PASS" : "FAIL", idx_mismatch, (double)maxd);
+    if (log_dev) cudaFree(log_dev);
+    if (bias_dev) cudaFree(bias_dev);
+    if (sel_dev) cudaFree(sel_dev);
+    if (w_dev) cudaFree(w_dev);
+    free(logits); free(bias); free(sel_ref); free(w_ref); free(sel_gpu); free(w_gpu);
+    return ok;
+}
+
+extern "C" int pulsar_router_selftest(void) {
+    /* Hy3-like (64 experts, top-8), GLM-like (256, top-8), odd token count */
+    return router_selftest_one(64, 8, 2.5f, 7) &&
+           router_selftest_one(256, 8, 1.0f, 5) &&
+           router_selftest_one(96, 6, 1.5f, 1);
+}
+
 extern "C" int pulsar_gqa_selftest(void) { return ds4_gpu_gqa_selftest(); }

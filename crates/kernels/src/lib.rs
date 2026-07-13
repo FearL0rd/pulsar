@@ -6,6 +6,7 @@ mod ffi {
     extern "C" {
         pub fn pulsar_gqa_selftest() -> i32;
         pub fn pulsar_q8_0_matmul_selftest() -> i32;
+        pub fn pulsar_router_selftest() -> i32;
     }
 }
 
@@ -23,6 +24,13 @@ pub fn q8_0_matmul_selftest() -> bool {
     unsafe { ffi::pulsar_q8_0_matmul_selftest() != 0 }
 }
 
+/// Run the sigmoid router + top-k select self-test (GPU vs CPU reference
+/// across Hy3-like and GLM-like shapes). Requires a CUDA device.
+#[cfg(target_os = "linux")]
+pub fn router_selftest() -> bool {
+    unsafe { ffi::pulsar_router_selftest() != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     /// GPU-required; run explicitly: cargo test -p kernels -- --ignored
@@ -38,5 +46,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn q8_0_matmul_matches_cpu_reference() {
         assert!(super::q8_0_matmul_selftest());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    #[cfg(target_os = "linux")]
+    fn router_select_matches_cpu_reference() {
+        assert!(super::router_selftest());
     }
 }
