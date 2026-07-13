@@ -135,14 +135,17 @@ mod real {
                 rope_orig_ctx: 0,
             };
             if family == Family::Mla {
-                // GLM-5.2 MLA split, ds4's DS4_SHAPE_GLM52 (metadata keys
-                // for the nope/rope split are not standardized; the gguf
-                // values that do exist are preferred).
+                // GLM-5.2 MLA split from the gguf's own keys (verified
+                // against the production glm-dsa file + DS4_SHAPE_GLM52):
+                // per-head qk = key_length_mla (256) = nope (192) + rope
+                // dims (64); value_length_mla (256) is the MLA value width
+                // - attention.value_length (512) is NOT it.
                 s.n_lora_q = u("attention.q_lora_rank").unwrap_or(2048);
                 s.n_kv_lora = u("attention.kv_lora_rank").unwrap_or(512);
                 s.qk_rope = u("rope.dimension_count").unwrap_or(64);
-                s.qk_nope = 192;
-                s.value_mla = u("attention.value_length").unwrap_or(256);
+                let qk_mla = u("attention.key_length_mla").unwrap_or(256);
+                s.qk_nope = qk_mla - s.qk_rope;
+                s.value_mla = u("attention.value_length_mla").unwrap_or(256);
                 s.rope_orig_ctx = u("rope.scaling.original_context_length").unwrap_or(1_048_576);
             }
             Ok(s)
@@ -581,11 +584,18 @@ mod real {
         Ok(DeviceBuf::from_bytes(&read_tensor_bytes(file, g, name)?)?)
     }
 
-    /// Big attention weights: pinned host memory when PULSAR_ATTN_HOST=1
-    /// (zero-copy PCIe reads - GLM-class backbones exceed VRAM), else VRAM.
-    fn upload_attn(file: &File, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+    /// Big attention weights: pinned host memory (zero-copy PCIe reads)
+    /// when they exceed what VRAM can spare. Default: on for Mla (GLM-class
+    /// attn is ~12GB q8, never fits next to the rest on a 16GB card), off
+    /// for Gqa. PULSAR_ATTN_HOST=1/0 overrides.
+    fn upload_attn(file: &File, g: &Gguf, s: &Shape, name: &str) -> Result<DeviceBuf> {
+        let pinned = match std::env::var("PULSAR_ATTN_HOST").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => s.family == Family::Mla,
+        };
         let bytes = read_tensor_bytes(file, g, name)?;
-        let mut buf = if std::env::var_os("PULSAR_ATTN_HOST").is_some() {
+        let mut buf = if pinned {
             DeviceBuf::alloc_pinned(bytes.len())?
         } else {
             DeviceBuf::alloc(bytes.len())?
@@ -618,9 +628,16 @@ mod real {
                         let ti = gguf.tensor(&name).ok_or_else(|| meta_err(&name))?;
                         ExpertTensor::new(&gguf, ti, shape.n_expert)
                     };
+                    // router bias name varies by converter: bare on the
+                    // antirez Hy3/GLM files, ".bias" on others
+                    let probs_b_name = if gguf.tensor(&t("exp_probs_b")).is_some() {
+                        t("exp_probs_b")
+                    } else {
+                        t("exp_probs_b.bias")
+                    };
                     Ffn::Moe {
                         gate_inp: upload(&file, &gguf, &t("ffn_gate_inp.weight"))?,
-                        probs_b: upload(&file, &gguf, &t("exp_probs_b"))?,
+                        probs_b: upload(&file, &gguf, &probs_b_name)?,
                         shexp_gate: upload(&file, &gguf, &t("ffn_gate_shexp.weight"))?,
                         shexp_up: upload(&file, &gguf, &t("ffn_up_shexp.weight"))?,
                         shexp_down: upload(&file, &gguf, &t("ffn_down_shexp.weight"))?,
@@ -631,26 +648,26 @@ mod real {
                 };
                 let attn = match shape.family {
                     Family::Gqa => Attn::Gqa {
-                        attn_q: upload_attn(&file, &gguf, &t("attn_q.weight"))?,
-                        attn_k: upload_attn(&file, &gguf, &t("attn_k.weight"))?,
-                        attn_v: upload_attn(&file, &gguf, &t("attn_v.weight"))?,
+                        attn_q: upload_attn(&file, &gguf, &shape, &t("attn_q.weight"))?,
+                        attn_k: upload_attn(&file, &gguf, &shape, &t("attn_k.weight"))?,
+                        attn_v: upload_attn(&file, &gguf, &shape, &t("attn_v.weight"))?,
                         q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
                         k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
                     },
                     Family::Mla => Attn::Mla {
-                        q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"))?,
+                        q_a: upload_attn(&file, &gguf, &shape, &t("attn_q_a.weight"))?,
                         q_a_norm: upload(&file, &gguf, &t("attn_q_a_norm.weight"))?,
-                        q_b: upload_attn(&file, &gguf, &t("attn_q_b.weight"))?,
-                        kv_a_mqa: upload_attn(&file, &gguf, &t("attn_kv_a_mqa.weight"))?,
+                        q_b: upload_attn(&file, &gguf, &shape, &t("attn_q_b.weight"))?,
+                        kv_a_mqa: upload_attn(&file, &gguf, &shape, &t("attn_kv_a_mqa.weight"))?,
                         kv_a_norm: upload(&file, &gguf, &t("attn_kv_a_norm.weight"))?,
-                        k_b: upload_attn(&file, &gguf, &t("attn_k_b.weight"))?,
-                        v_b: upload_attn(&file, &gguf, &t("attn_v_b.weight"))?,
+                        k_b: upload_attn(&file, &gguf, &shape, &t("attn_k_b.weight"))?,
+                        v_b: upload_attn(&file, &gguf, &shape, &t("attn_v_b.weight"))?,
                     },
                 };
                 layers.push(LayerW {
                     attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
                     attn,
-                    attn_output: upload_attn(&file, &gguf, &t("attn_output.weight"))?,
+                    attn_output: upload_attn(&file, &gguf, &shape, &t("attn_output.weight"))?,
                     ffn_norm: upload(&file, &gguf, &t("ffn_norm.weight"))?,
                     ffn,
                 });
@@ -718,10 +735,12 @@ mod real {
 
     impl State {
         pub fn new(m: &Model, ctx: u32) -> Result<State> {
+            // Mla keeps ~12GB of pinned attn weights in RAM; leave the
+            // host expert cache smaller so the two fit in 30GB together
             let gb = std::env::var("PULSAR_CACHE_GB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(12);
+                .unwrap_or(if m.shape.family == Family::Mla { 5 } else { 12 });
             Self::with_cache(m, ctx, gb << 30)
         }
 
