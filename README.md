@@ -29,7 +29,7 @@ attribution.
 - `crates/stream` - the expert streaming core: io_uring fetch engine,
   LFU host cache with persistent warm state, cross-layer speculative
   prefetch. The design is the measured-and-proven NeutronStar pipeline,
-  with ownership made explicit.
+  with ownership made explicit. Fetch engine DONE and benched.
 - `crates/kernels` - FFI to the CUDA kernel library (build-time nvcc).
 - `crates/engine` - model graphs (GQA+MoE first: hy-v3, then
   deepseek/GLM-family MLA), scheduler, multi-GPU expert residency.
@@ -38,8 +38,15 @@ attribution.
 ## Milestones
 
 1. GGUF reader against production headers. (done)
-2. Disk path parity: Rust io_uring expert fetcher benched against the C
-   implementation on the same NVMe, no GPU required.
+2. Disk path parity. (done) Rust io_uring fetcher vs a minimal C
+   liburing reference, byte-identical plans (3000 random expert slabs,
+   4.55 GiB, from the production Hy3 gguf), O_DIRECT, QD 64, matching
+   checksums: C 4.83 GB/s, Rust 4.82 GB/s on a Gen4 NVMe. The language
+   costs nothing on the path that is this engine's entire thesis. Bonus
+   finding: the raw fetch pattern saturates the drive at ~4.8 GB/s while
+   the C engine's in-decode effective feed measures 2.5-2.9 GB/s, so
+   ~2 GB/s is currently lost to engine-side serialization - that gap is
+   pulsar's headroom.
 3. Single-GPU Hy3 decode parity on the 4060 Ti via FFI kernels.
 4. Multi-GPU expert residency on 2x RTX 5060 Ti (the reason this engine
    exists: ~48GB VRAM of resident experts, PCIe P2P where unlockable).

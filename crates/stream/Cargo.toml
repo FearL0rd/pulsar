@@ -1,0 +1,13 @@
+[package]
+name = "stream"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Expert streaming core: io_uring fetch engine (Linux)."
+
+[dependencies]
+gguf = { path = "../gguf" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
