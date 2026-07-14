@@ -227,6 +227,16 @@ mod real {
         ffn: Ffn,
     }
 
+    /// The nextn/MTP draft block: predicts token t+2 from (hidden of
+    /// t, embedding of t+1) through one extra transformer layer.
+    struct MtpLayer {
+        layer: LayerW,
+        eh_proj: DeviceBuf, // q8_0 [n_embd][2*n_embd]
+        enorm: DeviceBuf,
+        hnorm: DeviceBuf,
+        head_norm: DeviceBuf,
+    }
+
     pub struct Model {
         path: std::path::PathBuf,
         pub shape: Shape,
@@ -240,6 +250,7 @@ mod real {
         /// every token, so residency is the one job a bandwidth-crippled
         /// PCIe link can still do: only activations cross per layer.
         pub attn_dev: Option<i32>,
+        mtp: Option<MtpLayer>,
     }
 
     /// v1 StreamingStore (DESIGN-expert-store.md): io_uring batch fetch of
@@ -834,8 +845,10 @@ mod real {
             // except on a dedicated attn GPU, where everything is resident
             let mut no_budget: i64 = if attn_dev.is_some() { i64::MAX } else { 0 };
 
-            let mut layers = Vec::with_capacity(shape.n_exec_layer as usize);
-            for il in 0..shape.n_exec_layer {
+            let load_layer = |il: u32,
+                              attn_vram_budget: &mut i64,
+                              no_budget: &mut i64|
+             -> Result<LayerW> {
                 let t = |suffix: &str| format!("blk.{il}.{suffix}");
                 let ffn = if il < shape.n_leading_dense {
                     Ffn::Dense {
@@ -872,34 +885,64 @@ mod real {
                 }
                 let attn = match shape.family {
                     Family::Gqa => Attn::Gqa {
-                        attn_q: upload_attn(&file, &gguf, &t("attn_q.weight"), &mut attn_vram_budget)?,
-                        attn_k: upload_attn(&file, &gguf, &t("attn_k.weight"), &mut attn_vram_budget)?,
-                        attn_v: upload_attn(&file, &gguf, &t("attn_v.weight"), &mut attn_vram_budget)?,
+                        attn_q: upload_attn(&file, &gguf, &t("attn_q.weight"), &mut *attn_vram_budget)?,
+                        attn_k: upload_attn(&file, &gguf, &t("attn_k.weight"), &mut *attn_vram_budget)?,
+                        attn_v: upload_attn(&file, &gguf, &t("attn_v.weight"), &mut *attn_vram_budget)?,
                         q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
                         k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
                     },
                     Family::Mla => Attn::Mla {
-                        q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"), &mut no_budget)?,
+                        q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"), &mut *no_budget)?,
                         q_a_norm: upload(&file, &gguf, &t("attn_q_a_norm.weight"))?,
-                        q_b: upload_attn(&file, &gguf, &t("attn_q_b.weight"), &mut attn_vram_budget)?,
-                        kv_a_mqa: upload_attn(&file, &gguf, &t("attn_kv_a_mqa.weight"), &mut no_budget)?,
+                        q_b: upload_attn(&file, &gguf, &t("attn_q_b.weight"), &mut *attn_vram_budget)?,
+                        kv_a_mqa: upload_attn(&file, &gguf, &t("attn_kv_a_mqa.weight"), &mut *no_budget)?,
                         kv_a_norm: upload(&file, &gguf, &t("attn_kv_a_norm.weight"))?,
-                        k_b: upload_attn(&file, &gguf, &t("attn_k_b.weight"), &mut no_budget)?,
-                        v_b: upload_attn(&file, &gguf, &t("attn_v_b.weight"), &mut no_budget)?,
+                        k_b: upload_attn(&file, &gguf, &t("attn_k_b.weight"), &mut *no_budget)?,
+                        v_b: upload_attn(&file, &gguf, &t("attn_v_b.weight"), &mut *no_budget)?,
                     },
                 };
-                let attn_output = upload_attn(&file, &gguf, &t("attn_output.weight"), &mut attn_vram_budget)?;
+                let attn_output = upload_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?;
                 if attn_dev.is_some() {
                     kernels::set_device(primary)?;
                 }
-                layers.push(LayerW {
+                Ok(LayerW {
                     attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
                     attn,
                     attn_output,
                     ffn_norm: upload(&file, &gguf, &t("ffn_norm.weight"))?,
                     ffn,
-                });
+                })
+            };
+
+            let mut layers = Vec::with_capacity(shape.n_exec_layer as usize);
+            for il in 0..shape.n_exec_layer {
+                layers.push(load_layer(il, &mut attn_vram_budget, &mut no_budget)?);
             }
+
+            // MTP/nextn layer (PULSAR_MTP=1 opt-in): one extra transformer
+            // block fed by eh_proj([enorm(embed(token)); hnorm(hidden)]),
+            // sharing the base output head through shared_head_norm.
+            let il = shape.n_exec_layer;
+            let nextn = |suffix: &str| format!("blk.{il}.nextn.{suffix}.weight");
+            let mtp = if std::env::var("PULSAR_MTP").ok().as_deref() == Some("1") {
+                if gguf.tensor(&nextn("eh_proj")).is_none() {
+                    eprintln!("pulsar: PULSAR_MTP=1 but the gguf has no nextn block - ignoring");
+                    None
+                } else {
+                    let m = MtpLayer {
+                        layer: load_layer(il, &mut attn_vram_budget, &mut no_budget)?,
+                        eh_proj: upload(&file, &gguf, &nextn("eh_proj"))?,
+                        enorm: upload(&file, &gguf, &nextn("enorm"))?,
+                        hnorm: upload(&file, &gguf, &nextn("hnorm"))?,
+                        head_norm: upload(&file, &gguf, &nextn("shared_head_norm"))?,
+                    };
+                    eprintln!("pulsar: MTP draft layer loaded (speculative decode)");
+                    Some(m)
+                }
+            } else {
+                None
+            };
+
             Ok(Model {
                 path: path.to_path_buf(),
                 shape,
@@ -909,6 +952,7 @@ mod real {
                 output,
                 layers,
                 attn_dev,
+                mtp,
             })
         }
     }
@@ -1064,6 +1108,15 @@ mod real {
         // buffer their partial outputs are gathered into
         pub tiers: Vec<ExpertTier>,
         tier_ret: DeviceBuf,
+        // MTP scratch (1-float dummies without PULSAR_MTP=1): the draft
+        // block's input pipeline + the last real token's hidden state
+        mtp_e_raw: DeviceBuf,
+        mtp_e: DeviceBuf,
+        mtp_h: DeviceBuf,
+        mtp_x: DeviceBuf,
+        mtp_hidden: DeviceBuf,
+        pub mtp_drafted: u64,
+        pub mtp_accepted: u64,
     }
 
     impl State {
@@ -1161,9 +1214,13 @@ mod real {
             let f32s = |n: u32| DeviceBuf::alloc(n as usize * 4);
             let n_used = s.n_expert_used as usize;
             // uniform slab size across gate/up/down on this model; assert at fetch
+            // include the MTP layer: its experts can use a DIFFERENT quant
+            // (blk.80 is Q2_K on the Hy3 recipe, bigger slabs than IQ2_XXS)
+            // - undersized slots make its slabs overflow into neighbors
             let max_slab = m
                 .layers
                 .iter()
+                .chain(m.mtp.iter().map(|mt| &mt.layer))
                 .filter_map(|l| match &l.ffn {
                     Ffn::Moe { gate_exps, up_exps, down_exps, .. } => {
                         Some(gate_exps.expert_bytes.max(up_exps.expert_bytes).max(down_exps.expert_bytes))
@@ -1204,9 +1261,19 @@ mod real {
             }
             let mut kcache = Vec::new();
             let mut vcache = Vec::new();
-            for _ in 0..s.n_exec_layer {
-                kcache.push(DeviceBuf::alloc(k_bytes)?);
-                vcache.push(DeviceBuf::alloc(v_bytes)?);
+            let n_kv_slots = s.n_exec_layer as usize + usize::from(m.mtp.is_some());
+            for i in 0..n_kv_slots {
+                let mut k = DeviceBuf::alloc(k_bytes)?;
+                let mut v = DeviceBuf::alloc(v_bytes)?;
+                if i == s.n_exec_layer as usize {
+                    // MTP slot: position 0 is never written (no hidden
+                    // before the first token) yet attention reads it -
+                    // zero beats uninitialized VRAM
+                    k.write(0, &vec![0u8; k_bytes])?;
+                    v.write(0, &vec![0u8; v_bytes])?;
+                }
+                kcache.push(k);
+                vcache.push(v);
             }
             let q = f32s(mb * s.n_head * s.head_dim.max(s.qk_dim()))?;
             let heads = f32s(mb * s.heads_dim().max(s.n_head * s.head_dim))?;
@@ -1229,7 +1296,7 @@ mod real {
                 ctx,
                 max_batch: mb,
                 tok: DeviceBuf::alloc(mb as usize * 4)?,
-                last_row: f32s(s.n_embd)?,
+                last_row: f32s(2 * s.n_embd)?, // 2 rows: spec verify reads draft + successor
                 cur: f32s(mb * s.n_embd)?,
                 normed: f32s(mb * s.n_embd)?,
                 q,
@@ -1278,7 +1345,7 @@ mod real {
                 )?,
                 kcache,
                 vcache,
-                logits: f32s(s.n_vocab)?,
+                logits: f32s(2 * s.n_vocab)?,
                 store: StreamingStore::open(&m.path, cache_bytes)?,
                 prefetcher: Prefetcher::spawn(&m.path)?,
                 pred_logits: f32s(s.n_expert)?,
@@ -1304,6 +1371,20 @@ mod real {
                 attn_out_a,
                 tier_ret: if tiers.is_empty() { f32s(1)? } else { f32s(mb * s.n_embd)? },
                 tiers,
+                mtp_e_raw: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
+                mtp_e: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
+                mtp_h: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
+                mtp_x: f32s(if m.mtp.is_some() { mb * 2 * s.n_embd } else { 1 })?,
+                mtp_hidden: {
+                    let mut b = f32s(if m.mtp.is_some() { s.n_embd } else { 1 })?;
+                    // read before first write (position 0 has no prior
+                    // hidden); zero beats uninitialized VRAM
+                    let z = vec![0u8; b.bytes()];
+                    b.write(0, &z)?;
+                    b
+                },
+                mtp_drafted: 0,
+                mtp_accepted: 0,
             };
             let t0 = std::time::Instant::now();
             let warmed = st.load_warm(m)?;
@@ -1340,6 +1421,19 @@ mod real {
             pos0: u32,
             want_logits: bool,
         ) -> Result<Option<Vec<f32>>> {
+            self.forward_rows(st, tokens, pos0, if want_logits { 1 } else { 0 })
+        }
+
+        /// Like forward_batch, but returns logits for the LAST `rows`
+        /// positions (flattened rows x n_vocab); 0 rows = no logits.
+        /// Speculative verification needs the draft row and its successor.
+        pub fn forward_rows(
+            &self,
+            st: &mut State,
+            tokens: &[u32],
+            pos0: u32,
+            rows: u32,
+        ) -> Result<Option<Vec<f32>>> {
             let s = self.shape;
             let n_tok = tokens.len() as u32;
             if n_tok == 0 || n_tok > st.max_batch {
@@ -1363,7 +1457,39 @@ mod real {
                         stages[(il + 1) % 2].kick(nl, il + 1)?;
                     }
                 }
+                self.eval_layer(st, il, l, n_tok, pos0, primary)?;
+            }
 
+            if rows == 0 {
+                return Ok(None);
+            }
+            let k = rows.min(n_tok);
+            let t_tail = std::time::Instant::now();
+            let row = s.n_embd as usize * 4;
+            kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (n_tok - k) as usize * row, k as usize * row)?;
+            kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, eps)?;
+            kernels::matmul_q8_0(&mut st.logits, &self.output, &st.normed, s.n_embd, s.n_vocab, k)?;
+            kernels::sync()?;
+            let out = st.logits.read_f32(k as usize * s.n_vocab as usize)?;
+            st.prof.tail += t_tail.elapsed();
+            Ok(Some(out))
+        }
+
+        /// One transformer layer over st.cur (residual stream in/out).
+        /// `il` doubles as the KV-cache index; the MTP layer passes
+        /// `self.layers.len()` (its own extra slot).
+        fn eval_layer(
+            &self,
+            st: &mut State,
+            il: usize,
+            l: &LayerW,
+            n_tok: u32,
+            pos0: u32,
+            primary: i32,
+        ) -> Result {
+            let s = self.shape;
+            let eps = s.rms_eps;
+            {
                 // attention
                 kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, n_tok, eps)?;
                 let mut attn_output_w: &DeviceBuf = &l.attn_output;
@@ -1541,7 +1667,9 @@ mod real {
                         // to the background fetcher so the disk runs under
                         // this layer's GPU compute (ds4's ping-pong
                         // full-layer load, via the host-cache channel).
-                        if n_tok > 1 && std::env::var_os("PULSAR_NO_PREFETCH").is_none() {
+                        // real prefill chunks only: a 2-row spec-verify
+                        // batch must not ship whole layers to the fetcher
+                        if n_tok > 8 && std::env::var_os("PULSAR_NO_PREFETCH").is_none() {
                             if let Some(Ffn::Moe {
                                 gate_exps: ng, up_exps: nu, down_exps: nd, ..
                             }) = self.layers.get(il + 1).map(|nl| &nl.ffn)
@@ -1735,19 +1863,7 @@ mod real {
                     }
                 }
             }
-
-            if !want_logits {
-                return Ok(None);
-            }
-            let t_tail = std::time::Instant::now();
-            let row = s.n_embd as usize * 4;
-            kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (n_tok as usize - 1) * row, row)?;
-            kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, 1, eps)?;
-            kernels::matmul_q8_0(&mut st.logits, &self.output, &st.normed, s.n_embd, s.n_vocab, 1)?;
-            kernels::sync()?;
-            let out = st.logits.read_f32(s.n_vocab as usize)?;
-            st.prof.tail += t_tail.elapsed();
-            Ok(Some(out))
+            Ok(())
         }
     }
 
@@ -1756,6 +1872,76 @@ mod real {
     /// forwarded into the KV cache (including the stop token, so the
     /// context stays template-shaped for a next turn). Returns the
     /// position after everything forwarded.
+    impl Model {
+        /// Build the MTP block's input rows for a prefill chunk and run it,
+        /// so its KV covers the prompt (row for position p embeds token_p
+        /// with hidden_{p-1}; st.mtp_hidden stitches chunk boundaries).
+        /// Must run right after the chunk's forward while st.cur still
+        /// holds its hidden states. Clobbers st.cur.
+        fn mtp_prefill_fill(&self, st: &mut State, n_tok: u32, pos0: u32) -> Result {
+            let Some(mtp) = &self.mtp else { return Ok(()) };
+            let s = self.shape;
+            let primary = kernels::get_device();
+            let row = s.n_embd as usize * 4;
+            // hidden inputs: [old mtp_hidden, cur rows 0..n-1]
+            kernels::copy_d2d(&mut st.mtp_e_raw, 0, &st.mtp_hidden, 0, row)?;
+            if n_tok > 1 {
+                kernels::copy_d2d(&mut st.mtp_e_raw, row, &st.cur, 0, (n_tok as usize - 1) * row)?;
+            }
+            kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.cur, (n_tok as usize - 1) * row, row)?;
+            kernels::rms_norm(&mut st.mtp_h, &st.mtp_e_raw, &mtp.hnorm, s.n_embd, n_tok, s.rms_eps)?;
+            // token embeddings (st.tok still holds the chunk)
+            kernels::embed_q8_0(&mut st.mtp_e_raw, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, n_tok)?;
+            kernels::rms_norm(&mut st.mtp_e, &st.mtp_e_raw, &mtp.enorm, s.n_embd, n_tok, s.rms_eps)?;
+            for i in 0..n_tok as usize {
+                kernels::copy_d2d(&mut st.mtp_x, i * 2 * row, &st.mtp_e, i * row, row)?;
+                kernels::copy_d2d(&mut st.mtp_x, i * 2 * row + row, &st.mtp_h, i * row, row)?;
+            }
+            kernels::matmul_q8_0(&mut st.cur, &mtp.eh_proj, &st.mtp_x, 2 * s.n_embd, s.n_embd, n_tok)?;
+            self.eval_layer(st, self.layers.len(), &mtp.layer, n_tok, pos0, primary)
+        }
+
+        /// Cache-fill MTP pass: same as mtp_draft minus the output head
+        /// (used on accept to keep the block's KV contiguous - the draft
+        /// itself is not needed, so skip the lm-head matmul + readback).
+        fn mtp_fill(&self, st: &mut State, token: u32, pos: u32) -> Result {
+            self.mtp_body(st, token, pos)
+        }
+
+        /// One MTP pass: embed `token` at `pos` against st.mtp_hidden,
+        /// append the block's KV, return the greedy draft for pos+1.
+        /// Clobbers st.cur.
+        fn mtp_draft(&self, st: &mut State, token: u32, pos: u32) -> Result<u32> {
+            self.mtp_body(st, token, pos)?;
+            let mtp = self.mtp.as_ref().ok_or("mtp_draft without an MTP layer")?;
+            let s = self.shape;
+            kernels::rms_norm(&mut st.normed, &st.cur, &mtp.head_norm, s.n_embd, 1, s.rms_eps)?;
+            kernels::matmul_q8_0(&mut st.logits, &self.output, &st.normed, s.n_embd, s.n_vocab, 1)?;
+            kernels::sync()?;
+            let logits = st.logits.read_f32(s.n_vocab as usize)?;
+            if std::env::var_os("PULSAR_MTP_DEBUG").is_some() {
+                let bad = logits.iter().filter(|v| !v.is_finite()).count();
+                eprintln!("mtp-draft pos={pos}: logits nan={bad}, draft={}", argmax(&logits));
+            }
+            Ok(argmax(&logits))
+        }
+
+        fn mtp_body(&self, st: &mut State, token: u32, pos: u32) -> Result {
+            let mtp = self.mtp.as_ref().ok_or("mtp_draft without an MTP layer")?;
+            let s = self.shape;
+            let primary = kernels::get_device();
+            let row = s.n_embd as usize * 4;
+            st.tok.write(0, kernels::as_bytes(&[token as i32]))?;
+            kernels::embed_q8_0(&mut st.mtp_e_raw, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, 1)?;
+            kernels::rms_norm(&mut st.mtp_e, &st.mtp_e_raw, &mtp.enorm, s.n_embd, 1, s.rms_eps)?;
+            kernels::rms_norm(&mut st.mtp_h, &st.mtp_hidden, &mtp.hnorm, s.n_embd, 1, s.rms_eps)?;
+            kernels::copy_d2d(&mut st.mtp_x, 0, &st.mtp_e, 0, row)?;
+            kernels::copy_d2d(&mut st.mtp_x, row, &st.mtp_h, 0, row)?;
+            kernels::matmul_q8_0(&mut st.cur, &mtp.eh_proj, &st.mtp_x, 2 * s.n_embd, s.n_embd, 1)?;
+            self.eval_layer(st, self.layers.len(), &mtp.layer, 1, pos, primary)
+        }
+    }
+
     pub fn generate(
         model: &Model,
         st: &mut State,
@@ -1766,12 +1952,78 @@ mod real {
         stop: impl Fn(u32) -> bool,
         mut on_token: impl FnMut(u32),
     ) -> Result<u32> {
+        // MTP speculative decode is greedy-only: acceptance compares the
+        // draft against the verified argmax, which IS greedy sampling.
+        let spec = model.mtp.is_some() && sampler.is_greedy();
         let mut pos = pos0;
         let mut logits = None;
         for chunk in prompt.chunks(st.max_batch() as usize) {
             logits = model.forward_batch(st, chunk, pos, true)?;
+            if spec {
+                model.mtp_prefill_fill(st, chunk.len() as u32, pos)?;
+            }
             pos += chunk.len() as u32;
         }
+
+        if spec {
+            let v = model.shape.n_vocab as usize;
+            let row = model.shape.n_embd as usize * 4;
+            let mut emitted = 0usize;
+            let mut next = argmax(logits.as_deref().ok_or("no logits")?);
+            while emitted < max_tokens {
+                if stop(next) || pos + 2 >= st.ctx() {
+                    model.forward_batch(st, &[next], pos, false)?;
+                    pos += 1;
+                    break;
+                }
+                on_token(next);
+                emitted += 1;
+                // draft from the MTP block, then verify [next, draft] in
+                // ONE forward: the per-layer union expert fetch makes the
+                // second row nearly free. Greedy acceptance keeps the
+                // output stream identical to plain greedy decode.
+                let d = model.mtp_draft(st, next, pos)?;
+                st.mtp_drafted += 1;
+                let both = model
+                    .forward_rows(st, &[next, d], pos, 2)?
+                    .ok_or("no verify logits")?;
+                let t_true = argmax(&both[..v]);
+                if std::env::var_os("PULSAR_MTP_DEBUG").is_some() {
+                    let nan0 = both[..v].iter().filter(|x| !x.is_finite()).count();
+                    let nan1 = both[v..].iter().filter(|x| !x.is_finite()).count();
+                    eprintln!(
+                        "mtp: pos={pos} next={next} d={d} t_true={t_true} accept={} nan0={nan0} nan1={nan1}",
+                        t_true == d
+                    );
+                }
+                // last_row holds the verify rows' raw hiddens and is not
+                // touched by mtp_draft - the stash that survives the fill
+                if t_true == d {
+                    st.mtp_accepted += 1;
+                    // fill the MTP cache row for d (embed d with h(next)),
+                    // then point the next draft at h(d)
+                    kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.last_row, 0, row)?;
+                    model.mtp_fill(st, d, pos + 1)?;
+                    kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.last_row, row, row)?;
+                    pos += 2;
+                    if stop(d) {
+                        break; // forwarded, not emitted - same as non-spec
+                    }
+                    if emitted >= max_tokens {
+                        break;
+                    }
+                    on_token(d);
+                    emitted += 1;
+                    next = argmax(&both[v..]);
+                } else {
+                    kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.last_row, 0, row)?;
+                    pos += 1;
+                    next = t_true;
+                }
+            }
+            return Ok(pos);
+        }
+
         for _ in 0..max_tokens {
             let next = sampler.sample(logits.as_ref().ok_or("no logits")?);
             if stop(next) || pos + 1 >= st.ctx() {
@@ -1809,6 +2061,10 @@ mod real {
     impl Sampler {
         pub fn new(temp: f32, top_p: f32, min_p: f32, seed: u64) -> Sampler {
             Sampler { temp, top_p, min_p, state: seed | 1 }
+        }
+
+        pub fn is_greedy(&self) -> bool {
+            self.temp <= 0.0
         }
 
         fn randf(&mut self) -> f32 {

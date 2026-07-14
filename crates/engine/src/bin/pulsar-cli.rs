@@ -292,6 +292,49 @@ fn run() -> engine::Result {
         return Ok(());
     }
 
+    // MTP speculative decode routes through engine::generate (the spec
+    // loop lives there); greedy-only, so the one-shot default applies
+    if std::env::var("PULSAR_MTP").ok().as_deref() == Some("1") && dump_logits.is_none() {
+        let mut generated: Vec<u32> = Vec::new();
+        let mut t_first: Option<std::time::Instant> = None;
+        let mut sampler = engine::Sampler::new(0.0, 1.0, 0.0, 1);
+        let eos = tok.eos_id;
+        let out = std::io::stdout();
+        engine::generate(
+            &model,
+            &mut st,
+            &prompt_ids,
+            0,
+            &mut sampler,
+            n_predict,
+            |t| Some(t) == eos,
+            |t| {
+                t_first.get_or_insert_with(std::time::Instant::now);
+                generated.push(t);
+                use std::io::Write;
+                let mut o = out.lock();
+                o.write_all(&tok.decode(&[t])).ok();
+                o.flush().ok();
+            },
+        )?;
+        println!();
+        if std::env::var_os("PULSAR_PROFILE").is_some() {
+            eprintln!("pulsar: profile: {}", st.prof.report());
+        }
+        st.save_warm(&model)?;
+        let dt = t_first.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
+        eprintln!(
+            "pulsar: {} tokens in {:.2}s ({:.2} tok/s), mtp {}/{} drafts accepted ({:.0}%)\npulsar: ids {generated:?}",
+            generated.len(),
+            dt,
+            generated.len() as f32 / dt.max(1e-6),
+            st.mtp_accepted,
+            st.mtp_drafted,
+            100.0 * st.mtp_accepted as f64 / st.mtp_drafted.max(1) as f64
+        );
+        return Ok(());
+    }
+
     let t1 = std::time::Instant::now();
     let mut logits = None;
     let mut pos0 = 0u32;
@@ -349,11 +392,20 @@ fn run() -> engine::Result {
     let dt = t2.elapsed().as_secs_f32();
     let tier_note = {
         let hits: u64 = st.tiers.iter().map(|t| t.hits).sum();
-        if hits > 0 {
+        let mut s = if hits > 0 {
             format!(", tier {hits} resident slots")
         } else {
             String::new()
+        };
+        if st.mtp_drafted > 0 {
+            s += &format!(
+                ", mtp {}/{} drafts accepted ({:.0}%)",
+                st.mtp_accepted,
+                st.mtp_drafted,
+                100.0 * st.mtp_accepted as f64 / st.mtp_drafted as f64
+            );
         }
+        s
     };
     eprintln!(
         "pulsar: {} tokens in {:.2}s ({:.2} tok/s), vram cache {:.0}% hits, host cache {:.0}% of remainder{tier_note}\npulsar: ids {generated:?}",
