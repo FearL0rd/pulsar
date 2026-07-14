@@ -66,6 +66,9 @@ mod real {
         pub n_idx_head: u32,
         pub n_idx_dim: u32,
         pub n_idx_topk: u32,
+        // YaRN (deepseek2/Kimi: factor 32, log_mult 0.1; GLM ships 1.0/off)
+        pub rope_scale_factor: f32,
+        pub rope_yarn_log_mult: f32,
     }
 
     impl Shape {
@@ -82,15 +85,31 @@ mod real {
         }
 
         fn rope_cfg(&self) -> kernels::RopeCfg {
-            // GLM-5.2 ships yarn off (scale 1.0); parameters ride along.
-            kernels::RopeCfg {
-                n_ctx_orig: self.rope_orig_ctx,
-                freq_base: self.rope_freq_base,
-                freq_scale: 1.0,
-                ext_factor: 0.0,
-                attn_factor: 1.0,
-                beta_fast: 0.0,
-                beta_slow: 0.0,
+            // GLM-5.2 ships yarn off (scale 1.0); deepseek2/Kimi runs real
+            // YaRN: freq_scale = 1/factor, attn scaled by the log-mult
+            // mscale (llama.cpp deepseek2 convention). NEEDS teacher-forced
+            // parity validation on the first Kimi run.
+            if self.rope_scale_factor > 1.0 {
+                let mscale = 1.0 + self.rope_yarn_log_mult * self.rope_scale_factor.ln();
+                kernels::RopeCfg {
+                    n_ctx_orig: self.rope_orig_ctx,
+                    freq_base: self.rope_freq_base,
+                    freq_scale: 1.0 / self.rope_scale_factor,
+                    ext_factor: 1.0,
+                    attn_factor: mscale,
+                    beta_fast: 32.0,
+                    beta_slow: 1.0,
+                }
+            } else {
+                kernels::RopeCfg {
+                    n_ctx_orig: self.rope_orig_ctx,
+                    freq_base: self.rope_freq_base,
+                    freq_scale: 1.0,
+                    ext_factor: 0.0,
+                    attn_factor: 1.0,
+                    beta_fast: 0.0,
+                    beta_slow: 0.0,
+                }
             }
         }
     }
@@ -109,6 +128,8 @@ mod real {
                 // write "hy_v3". Same model either way.
                 Some("hy-v3") | Some("hy_v3") => Family::Gqa,
                 Some("glm-dsa") | Some("glm_dsa") => Family::Mla,
+                // DeepSeek-V3 family (Kimi K2 etc.): plain MLA, no indexer
+                Some("deepseek2") => Family::Mla,
                 other => return Err(format!("unsupported architecture {other:?}").into()),
             };
             let n_layer = u("block_count")?;
@@ -151,6 +172,8 @@ mod real {
                 n_idx_head: 0,
                 n_idx_dim: 0,
                 n_idx_topk: 0,
+                rope_scale_factor: 1.0,
+                rope_yarn_log_mult: 0.0,
             };
             if family == Family::Mla {
                 // GLM-5.2 MLA split from the gguf's own keys (verified
@@ -168,6 +191,8 @@ mod real {
                 s.n_idx_head = u("attention.indexer.head_count").unwrap_or(0);
                 s.n_idx_dim = u("attention.indexer.key_length").unwrap_or(0);
                 s.n_idx_topk = u("attention.indexer.top_k").unwrap_or(0);
+                s.rope_scale_factor = f("rope.scaling.factor").unwrap_or(1.0);
+                s.rope_yarn_log_mult = f("rope.scaling.yarn_log_multiplier").unwrap_or(0.0);
             }
             Ok(s)
         }
@@ -189,6 +214,7 @@ mod real {
                 TensorType::Q4K => kernels::QUANT_Q4_K,
                 TensorType::Q5K => kernels::QUANT_Q5_K,
                 TensorType::Q6K => kernels::QUANT_Q6_K,
+                TensorType::Q3K => kernels::QUANT_Q3_K,
                 other => return Err(format!("{}: unsupported expert type {other:?}", t.name).into()),
             };
             let row_elems = t.dims[0];
@@ -814,6 +840,7 @@ mod real {
                     TensorType::Q4K => Some(kernels::QUANT_Q4_K),
                     TensorType::Q5K => Some(kernels::QUANT_Q5_K),
                     TensorType::Q6K => Some(kernels::QUANT_Q6_K),
+                    TensorType::Q3K => Some(kernels::QUANT_Q3_K),
                     _ => None,
                 };
                 quant.map(|q| (t.ty.row_bytes(t.dims[0]).unwrap(), q))

@@ -623,6 +623,13 @@ typedef struct {
 /* K-quants (ggml layouts, verbatim): unlock the AngelSlim official Hy3
  * ggufs whose experts are q4_K/q5_K/q6_K. */
 typedef struct {
+    uint8_t hmask[PULSAR_QK_K / 8]; /* high bit of each 3-bit quant */
+    uint8_t qs[PULSAR_QK_K / 4];    /* low 2 bits */
+    uint8_t scales[12];             /* 16x 6-bit scales */
+    uint16_t d;
+} block_q3_K;
+
+typedef struct {
     uint16_t d;
     uint16_t dmin;
     uint8_t scales[12]; /* 8x (scale, min), 6 bits each */
@@ -818,6 +825,52 @@ __device__ static float dev_dot_q2_K_q8_K_block(const block_q2_K *x, const block
 /* K-quant dots vs q8_K activations. Integer accumulation via dp4a, float
  * scaling at the end - same shape as the ggml scalar references, so the
  * host mirrors in the selftests match to float rounding. */
+
+/* q3_K: 16 6-bit scales (packed 12 bytes, value-32 signed), quants =
+ * low 2 bits + hmask high bit, centered: q = lo2 - (hbit ? 0 : 4). */
+__host__ __device__ static inline void k3_unpack_scales(const uint8_t *scales, int8_t *sc) {
+    for (int j = 0; j < 16; j++) {
+        uint8_t s;
+        if (j < 8) {
+            s = (scales[j] & 0x0fu) | (((scales[8 + j % 4] >> (2 * (j / 4))) & 3u) << 4);
+        } else {
+            s = (scales[j - 8] >> 4) | (((scales[8 + j % 4] >> (2 * (j / 4))) & 3u) << 4);
+        }
+        sc[j] = (int8_t)(s - 32);
+    }
+}
+
+__device__ static float dev_dot_q3_K_q8_K_block(const block_q3_K *x, const block_q8_K *y) {
+    const float d = f16_to_f32(x->d) * y->d;
+    int8_t sc[16];
+    k3_unpack_scales(x->scales, sc);
+    const uint8_t *q3 = x->qs;
+    const uint8_t *hm = x->hmask;
+    const int8_t *q8 = y->qs;
+    int isum = 0;
+    uint32_t hbit = 1u;
+    int is = 0;
+    for (int k = 0; k < 2; k++) { /* 128 values per chunk */
+        int shift = 0;
+        for (int j = 0; j < 4; j++) { /* 4 x 32 per chunk */
+            for (int half = 0; half < 2; half++) {
+                int s16 = 0;
+                for (int i = 0; i < 16; i++) {
+                    const int l = half * 16 + i;
+                    int q = (q3[l] >> shift) & 3;
+                    if ((hm[l] & hbit) == 0u) q -= 4;
+                    s16 += q * (int)q8[l];
+                }
+                isum += (int)sc[is++] * s16;
+            }
+            shift += 2;
+            q8 += 32;
+            hbit <<= 1u; /* hmask bit index runs 0..7 across BOTH chunks */
+        }
+        q3 += 32;
+    }
+    return d * (float)isum;
+}
 __device__ static float dev_dot_q4_K_q8_K_block(const block_q4_K *x, const block_q8_K *y) {
     const float d = f16_to_f32(x->d) * y->d;
     const float dmin = f16_to_f32(x->dmin) * y->d;
@@ -927,6 +980,12 @@ struct dot_iq2_xxs {
 struct dot_q2_K {
     __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
         return dev_dot_q2_K_q8_K_block((const block_q2_K *)row + b, xq + b);
+    }
+};
+
+struct dot_q3_K {
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
+        return dev_dot_q3_K_q8_K_block((const block_q3_K *)row + b, xq + b);
     }
 };
 
@@ -1040,6 +1099,7 @@ enum {
     PULSAR_QUANT_Q4_K = 2,
     PULSAR_QUANT_Q5_K = 3,
     PULSAR_QUANT_Q6_K = 4,
+    PULSAR_QUANT_Q3_K = 5,
 };
 
 /* Dense matmul over a K-quant weight matrix vs q8_K activations - the
@@ -1102,6 +1162,9 @@ extern "C" int pulsar_matmul_kq(
     case PULSAR_QUANT_Q6_K:
         matmul_kq_kernel<dot_q6_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
+    case PULSAR_QUANT_Q3_K:
+        matmul_kq_kernel<dot_q3_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        break;
     default:
         return 0;
     }
@@ -1157,6 +1220,12 @@ extern "C" int pulsar_moe_pair_swiglu(
                 (const float *)weights_dev, (const block_q8_K *)xq_dev,
                 in_blocks, mid_dim, n_used, n_tok, row_bytes);
         break;
+    case PULSAR_QUANT_Q3_K:
+        moe_pair_swiglu_kernel<dot_q3_K><<<grid, block>>>(
+                (float *)mid_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const float *)weights_dev, (const block_q8_K *)xq_dev,
+                in_blocks, mid_dim, n_used, n_tok, row_bytes);
+        break;
     default:
         return 0;
     }
@@ -1207,6 +1276,12 @@ extern "C" int pulsar_moe_down(
         break;
     case PULSAR_QUANT_Q6_K:
         moe_down_kernel<dot_q6_K><<<grid, block>>>(
+                (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
+                n_tok, row_bytes);
+        break;
+    case PULSAR_QUANT_Q3_K:
+        moe_down_kernel<dot_q3_K><<<grid, block>>>(
                 (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
                 (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
                 n_tok, row_bytes);
@@ -1315,6 +1390,39 @@ static float host_dot_q2_K_block(const char *row, const block_q8_K *xq, uint32_t
 
 /* host mirrors of the K-quant device dots: identical integer accumulation
  * order, scalar instead of dp4a */
+static float host_dot_q3_K_block(const char *row, const block_q8_K *xq, uint32_t bi) {
+    const block_q3_K *x = (const block_q3_K *)row + bi;
+    const block_q8_K *y = xq + bi;
+    int8_t sc[16];
+    k3_unpack_scales(x->scales, sc);
+    const uint8_t *q3 = x->qs;
+    const uint8_t *hm = x->hmask;
+    const int8_t *q8 = y->qs;
+    int isum = 0;
+    uint32_t hbit = 1u;
+    int is = 0;
+    for (int k = 0; k < 2; k++) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            for (int half = 0; half < 2; half++) {
+                int s16 = 0;
+                for (int i = 0; i < 16; i++) {
+                    const int l = half * 16 + i;
+                    int q = (q3[l] >> shift) & 3;
+                    if ((hm[l] & hbit) == 0u) q -= 4;
+                    s16 += q * (int)q8[l];
+                }
+                isum += (int)sc[is++] * s16;
+            }
+            shift += 2;
+            q8 += 32;
+            hbit <<= 1u;
+        }
+        q3 += 32;
+    }
+    return f16_to_f32_host(x->d) * y->d * (float)isum;
+}
+
 static float host_dot_q4_K_block(const char *row, const block_q8_K *xq, uint32_t bi) {
     const block_q4_K *x = (const block_q4_K *)row + bi;
     const block_q8_K *y = xq + bi;
@@ -1415,6 +1523,11 @@ static void fill_slab(char *slab, uint32_t n_rows, uint32_t n_el,
                 q->dmin = dm;
                 break;
             }
+            case PULSAR_QUANT_Q3_K: {
+                block_q3_K *q = (block_q3_K *)row + blk;
+                q->d = dv;
+                break;
+            }
             case PULSAR_QUANT_Q4_K: {
                 block_q4_K *q = (block_q4_K *)row + blk;
                 q->d = dv;
@@ -1501,6 +1614,7 @@ static int moe_selftest_one(uint32_t quant, const char *name) {
     float (*dot)(const char *, const block_q8_K *, uint32_t);
     switch (quant) {
     case PULSAR_QUANT_Q2_K:   block_bytes = sizeof(block_q2_K);    dot = host_dot_q2_K_block;    break;
+    case PULSAR_QUANT_Q3_K:   block_bytes = sizeof(block_q3_K);    dot = host_dot_q3_K_block;    break;
     case PULSAR_QUANT_Q4_K:   block_bytes = sizeof(block_q4_K);    dot = host_dot_q4_K_block;    break;
     case PULSAR_QUANT_Q5_K:   block_bytes = sizeof(block_q5_K);    dot = host_dot_q5_K_block;    break;
     case PULSAR_QUANT_Q6_K:   block_bytes = sizeof(block_q6_K);    dot = host_dot_q6_K_block;    break;
@@ -1667,7 +1781,8 @@ extern "C" int pulsar_moe_selftest(void) {
            moe_selftest_one(PULSAR_QUANT_IQ2_XXS, "iq2_xxs") &&
            moe_selftest_one(PULSAR_QUANT_Q4_K, "q4_K") &&
            moe_selftest_one(PULSAR_QUANT_Q5_K, "q5_K") &&
-           moe_selftest_one(PULSAR_QUANT_Q6_K, "q6_K");
+           moe_selftest_one(PULSAR_QUANT_Q6_K, "q6_K") &&
+           moe_selftest_one(PULSAR_QUANT_Q3_K, "q3_K");
 }
 
 /* ---- forward-graph glue: rms-norm, f32 matmul, swiglu, add, embed ------
