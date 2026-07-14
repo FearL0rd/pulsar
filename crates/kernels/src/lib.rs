@@ -272,6 +272,25 @@ mod real {
         Ok(best)
     }
 
+    /// True on unified-memory systems (GB10/DGX Spark, Jetson: GPU and CPU
+    /// share one physical pool), where pinned host memory reads at full
+    /// device speed and H2D staging is pure waste. Uses the `integrated`
+    /// attribute - NOT pageableMemoryAccess, which HMM also reports on
+    /// discrete x86 boxes where zero-copy would be a 50x regression.
+    /// PULSAR_UNIFIED=1/0 overrides detection either way.
+    pub fn unified_memory() -> bool {
+        match std::env::var("PULSAR_UNIFIED").ok().as_deref() {
+            Some("1") => return true,
+            Some("0") => return false,
+            _ => {}
+        }
+        ensure_device();
+        const ATTR_INTEGRATED: i32 = 18;
+        let mut v = 0;
+        unsafe { cudaDeviceGetAttribute(&mut v, ATTR_INTEGRATED, get_device()) };
+        v == 1
+    }
+
     /// (free, total) VRAM in bytes on `dev`. Restores the current device.
     pub fn mem_info(dev: i32) -> Result<(usize, usize)> {
         let cur = get_device();

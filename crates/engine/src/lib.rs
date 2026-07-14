@@ -1204,6 +1204,12 @@ mod real {
         pub mtp_accepted: u64,
         /// q8_K activation scratch for a K-quant lm-head (1 f32 otherwise)
         head_xq: DeviceBuf,
+        /// Unified-memory box (GB10/Spark, Jetson): host-cache slabs are
+        /// device-speed, so expert resolve hands their pinned pointers to
+        /// the kernels directly - no VRAM cache, no staging copies. Safe
+        /// because each layer's resolve runs after a full device sync, so
+        /// an evicted slab can never have in-flight readers.
+        unified: bool,
     }
 
     impl State {
@@ -1430,17 +1436,23 @@ mod real {
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 dev_cache: DeviceSlabCache::new(
-                    std::env::var("PULSAR_DEV_CACHE_GB")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        // with attn on its own GPU the primary has ~15GB
-                        // free; 8GB measured best (32% hits), 10 OOMs
-                        .unwrap_or(match (s.family, m.attn_dev) {
-                            (Family::Mla, Some(_)) => 8,
-                            (Family::Mla, None) => 1,
-                            (Family::Gqa, _) => 3,
-                        })
-                        << 30,
+                    if kernels::unified_memory() {
+                        // zero-copy resolve: a separate VRAM pool would
+                        // just duplicate the same physical memory
+                        1
+                    } else {
+                        std::env::var("PULSAR_DEV_CACHE_GB")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            // with attn on its own GPU the primary has ~15GB
+                            // free; 8GB measured best (32% hits), 10 OOMs
+                            .unwrap_or(match (s.family, m.attn_dev) {
+                                (Family::Mla, Some(_)) => 8,
+                                (Family::Mla, None) => 1,
+                                (Family::Gqa, _) => 3,
+                            })
+                            << 30
+                    },
                     max_slab,
                 )?,
                 // grow-only: decode stages <=n_used*3 slabs; a batched
@@ -1500,6 +1512,13 @@ mod real {
                     )?
                 } else {
                     f32s(1)?
+                },
+                unified: {
+                    let u = kernels::unified_memory();
+                    if u {
+                        eprintln!("pulsar: unified memory detected - zero-copy expert resolve");
+                    }
+                    u
                 },
             };
             let t0 = std::time::Instant::now();
@@ -1886,6 +1905,11 @@ mod real {
                                     continue;
                                 }
                             }
+                            if st.unified {
+                                // zero-copy: the host cache IS device memory
+                                wants.push(*r);
+                                continue;
+                            }
                             match st.dev_cache.get(r.offset, r.len) {
                                 Some(p) => {
                                     resolved.insert(r.offset, p);
@@ -1901,10 +1925,18 @@ mod real {
                             st.staging = DeviceBuf::alloc(wants.len() * slab)?;
                         }
                         let mut staged = 0usize;
+                        let unified = st.unified;
                         let dev_cache = &mut st.dev_cache;
                         let staging = &mut st.staging;
                         let mut h2d = std::time::Duration::ZERO;
                         st.store.ensure_with(&wants, |off, payload| {
+                            if unified {
+                                // pinned host slab is device-visible at
+                                // full speed; hand the pointer straight
+                                // to the kernels (UVA: host ptr == dev ptr)
+                                resolved.insert(off, payload.as_ptr() as *const std::ffi::c_void);
+                                return Ok(());
+                            }
                             let t = std::time::Instant::now();
                             let p = match dev_cache.maybe_insert(off, payload, &in_use)? {
                                 Some(p) => p,
