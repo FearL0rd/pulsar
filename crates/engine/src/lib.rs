@@ -1123,11 +1123,29 @@ mod real {
         pub fn new(m: &Model, ctx: u32) -> Result<State> {
             // Mla keeps ~12GB of pinned attn weights in RAM; leave the
             // host expert cache smaller so the two fit in 30GB together.
-            // With an attn GPU that RAM is free again - spend it on experts.
+            // With an attn GPU that RAM is free again - spend it on
+            // experts, but derive the ceiling from MEASURED free RAM: a
+            // fixed 22GB default memory-pressure-hung a 30GB box (twice,
+            // power button both times). Pinned cache memory can't swap,
+            // so the reserve must cover everything else on the machine.
             let gb = std::env::var("PULSAR_CACHE_GB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(if m.attn_dev.is_some() { 22 } else { 12 });
+                .unwrap_or_else(|| {
+                    let cap = if m.attn_dev.is_some() { 22 } else { 12 };
+                    let avail_gb = std::fs::read_to_string("/proc/meminfo")
+                        .ok()
+                        .and_then(|s| {
+                            s.lines().find(|l| l.starts_with("MemAvailable:"))?
+                                .split_whitespace()
+                                .nth(1)?
+                                .parse::<usize>()
+                                .ok()
+                        })
+                        .map(|kb| kb >> 20)
+                        .unwrap_or(cap + 6);
+                    cap.min(avail_gb.saturating_sub(6)).max(4)
+                });
             Self::with_cache(m, ctx, gb << 30)
         }
 
