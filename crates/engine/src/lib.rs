@@ -165,6 +165,9 @@ mod real {
             let quant = match t.ty {
                 TensorType::IQ2XXS => kernels::QUANT_IQ2_XXS,
                 TensorType::Q2K => kernels::QUANT_Q2_K,
+                TensorType::Q4K => kernels::QUANT_Q4_K,
+                TensorType::Q5K => kernels::QUANT_Q5_K,
+                TensorType::Q6K => kernels::QUANT_Q6_K,
                 other => return Err(format!("{}: unsupported expert type {other:?}", t.name).into()),
             };
             let row_elems = t.dims[0];
@@ -262,6 +265,9 @@ mod real {
         /// Draft-chain depth (PULSAR_MTP_DEPTH, default 3): tokens
         /// speculated per round, verified together in one forward.
         pub mtp_depth: u32,
+        /// (row_bytes, quant) when output.weight is a K-quant (AngelSlim
+        /// ggufs keep the lm-head q6_K); None = the q8_0 fast path.
+        output_kq: Option<(u64, u32)>,
     }
 
     /// v1 StreamingStore (DESIGN-expert-store.md): io_uring batch fetch of
@@ -762,6 +768,18 @@ mod real {
             };
             let output_norm = upload(&file, &gguf, "output_norm.weight")?;
             let output = upload(&file, &gguf, "output.weight")?;
+            let output_kq = {
+                let t = gguf.tensor("output.weight").ok_or_else(|| meta_err("output.weight"))?;
+                let quant = match t.ty {
+                    TensorType::Q2K => Some(kernels::QUANT_Q2_K),
+                    TensorType::IQ2XXS => Some(kernels::QUANT_IQ2_XXS),
+                    TensorType::Q4K => Some(kernels::QUANT_Q4_K),
+                    TensorType::Q5K => Some(kernels::QUANT_Q5_K),
+                    TensorType::Q6K => Some(kernels::QUANT_Q6_K),
+                    _ => None,
+                };
+                quant.map(|q| (t.ty.row_bytes(t.dims[0]).unwrap(), q))
+            };
 
             // Attn placement: park the whole stack on a second GPU when
             // one has room (Mla only; Gqa attn always fits beside the
@@ -1015,6 +1033,7 @@ mod real {
                 attn_dev,
                 mtp,
                 mtp_depth,
+                output_kq,
             })
         }
     }
@@ -1183,6 +1202,8 @@ mod real {
         mtp_hidden_save: DeviceBuf,
         pub mtp_drafted: u64,
         pub mtp_accepted: u64,
+        /// q8_K activation scratch for a K-quant lm-head (1 f32 otherwise)
+        head_xq: DeviceBuf,
     }
 
     impl State {
@@ -1471,6 +1492,15 @@ mod real {
                 mtp_hidden_save: f32s(if m.mtp.is_some() { s.n_embd } else { 1 })?,
                 mtp_drafted: 0,
                 mtp_accepted: 0,
+                head_xq: if m.output_kq.is_some() {
+                    DeviceBuf::alloc(
+                        (m.mtp_depth + 1).max(2) as usize * s.n_embd as usize
+                            / kernels::Q8_K_BLOCK_ELEMS
+                            * kernels::Q8_K_BLOCK_BYTES,
+                    )?
+                } else {
+                    f32s(1)?
+                },
             };
             let t0 = std::time::Instant::now();
             let warmed = st.load_warm(m)?;
@@ -1554,11 +1584,24 @@ mod real {
             let row = s.n_embd as usize * 4;
             kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (n_tok - k) as usize * row, k as usize * row)?;
             kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, eps)?;
-            kernels::matmul_q8_0(&mut st.logits, &self.output, &st.normed, s.n_embd, s.n_vocab, k)?;
+            self.head_logits(st, k)?;
             kernels::sync()?;
             let out = st.logits.read_f32(k as usize * s.n_vocab as usize)?;
             st.prof.tail += t_tail.elapsed();
             Ok(Some(out))
+        }
+
+        /// lm-head over the first `k` rows of st.normed into st.logits.
+        fn head_logits(&self, st: &mut State, k: u32) -> Result {
+            let s = self.shape;
+            match self.output_kq {
+                None => kernels::matmul_q8_0(&mut st.logits, &self.output, &st.normed, s.n_embd, s.n_vocab, k)?,
+                Some((row_bytes, quant)) => {
+                    kernels::quantize_q8_k(&mut st.head_xq, &st.normed, s.n_embd, k)?;
+                    kernels::matmul_kq(&mut st.logits, &self.output, &st.head_xq, s.n_embd, s.n_vocab, k, row_bytes, quant)?;
+                }
+            }
+            Ok(())
         }
 
         /// One transformer layer over st.cur (residual stream in/out).
@@ -1784,8 +1827,9 @@ mod real {
                         while let Ok((off, slab)) = st.prefetcher.done_rx.try_recv() {
                             st.store.absorb(off, slab);
                         }
-                        debug_assert_eq!(up_exps.expert_bytes, gate_exps.expert_bytes);
-                        debug_assert_eq!(down_exps.expert_bytes, gate_exps.expert_bytes);
+                        // gate/up/down may use different quants (K-quant
+                        // recipes put ffn_down a tier higher); staging
+                        // slots are strided by the largest of the three
                         let mut distinct: Vec<i32> = selected
                             .iter()
                             .copied()
@@ -1849,7 +1893,10 @@ mod real {
                                 None => wants.push(*r),
                             }
                         }
-                        let slab = gate_exps.expert_bytes as usize;
+                        let slab = gate_exps
+                            .expert_bytes
+                            .max(up_exps.expert_bytes)
+                            .max(down_exps.expert_bytes) as usize;
                         if wants.len() * slab > st.staging.bytes() {
                             st.staging = DeviceBuf::alloc(wants.len() * slab)?;
                         }
@@ -2008,7 +2055,7 @@ mod real {
             let mtp = self.mtp.as_ref().ok_or("mtp_draft without an MTP layer")?;
             let s = self.shape;
             kernels::rms_norm(&mut st.normed, &st.cur, &mtp.head_norm, s.n_embd, 1, s.rms_eps)?;
-            kernels::matmul_q8_0(&mut st.logits, &self.output, &st.normed, s.n_embd, s.n_vocab, 1)?;
+            self.head_logits(st, 1)?;
             kernels::sync()?;
             let logits = st.logits.read_f32(s.n_vocab as usize)?;
             if std::env::var_os("PULSAR_MTP_DEBUG").is_some() {

@@ -40,6 +40,9 @@ mod real {
 
     pub const QUANT_Q2_K: u32 = 0;
     pub const QUANT_IQ2_XXS: u32 = 1;
+    pub const QUANT_Q4_K: u32 = 2;
+    pub const QUANT_Q5_K: u32 = 3;
+    pub const QUANT_Q6_K: u32 = 4;
 
     const H2D: i32 = 1;
     const D2H: i32 = 2;
@@ -62,6 +65,7 @@ mod real {
         fn pulsar_rms_norm(out: *mut c_void, x: *const c_void, w: *const c_void, n: u32, rows: u32, eps: f32) -> i32;
         fn pulsar_q8_0_matmul(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_f32(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
+        fn pulsar_matmul_kq(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
         fn pulsar_swiglu(out: *mut c_void, gate: *const c_void, up: *const c_void, n: u32, clamp: f32, weight: f32) -> i32;
         fn pulsar_add(out: *mut c_void, a: *const c_void, b: *const c_void, n: u32) -> i32;
         fn pulsar_router_select(selected: *mut c_void, weights: *mut c_void, logits: *const c_void, bias: *const c_void, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32) -> i32;
@@ -568,6 +572,13 @@ mod real {
 
     pub fn matmul_q8_0(out: &mut DeviceBuf, w: &DeviceBuf, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_q8_0_matmul(out.ptr_mut(), w.ptr(), x.ptr(), in_dim, out_dim, n_tok) }, "matmul_q8_0")
+    }
+
+    /// Dense matmul over a K-quant weight matrix; `xq` holds q8_K-quantized
+    /// activations (quantize_q8_k) - the lm-head path for K-quant ggufs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_kq(out: &mut DeviceBuf, w: &DeviceBuf, xq: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64, quant: u32) -> Result {
+        check(unsafe { pulsar_matmul_kq(out.ptr_mut(), w.ptr(), xq.ptr(), in_dim, out_dim, n_tok, row_bytes, quant) }, "matmul_kq")
     }
 
     pub fn matmul_f32(out: &mut DeviceBuf, w: &DeviceBuf, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
