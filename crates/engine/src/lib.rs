@@ -1062,7 +1062,13 @@ mod real {
                     std::env::var("PULSAR_DEV_CACHE_GB")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(if s.family == Family::Mla { 1 } else { 3 })
+                        // with attn on its own GPU the primary has ~15GB
+                        // free; 8GB measured best (32% hits), 10 OOMs
+                        .unwrap_or(match (s.family, m.attn_dev) {
+                            (Family::Mla, Some(_)) => 8,
+                            (Family::Mla, None) => 1,
+                            (Family::Gqa, _) => 3,
+                        })
                         << 30,
                     max_slab,
                 )?,
