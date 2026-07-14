@@ -70,6 +70,7 @@ mod real {
         fn pulsar_idx_store_k(raw_k: *const c_void, w: *const c_void, b: *const c_void, cache: *mut c_void, pos0: u32, n_tok: u32, cache_cap: u32, head_dim: u32, rot_dim: u32, n_ctx_orig: u32, eps: f32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> i32;
         fn pulsar_idx_score_one(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, n_rows: u32, n_head: u32, head_dim: u32, scale: f32) -> i32;
         fn pulsar_idx_topk(selected: *mut c_void, scores: *const c_void, n_rows: u32, top_k: u32) -> i32;
+        fn pulsar_idx_scores_batch(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, n_rows: u32, n_tokens: u32, pos0: u32, n_head: u32, head_dim: u32, scale: f32) -> i32;
         fn pulsar_swiglu(out: *mut c_void, gate: *const c_void, up: *const c_void, n: u32, clamp: f32, weight: f32) -> i32;
         fn pulsar_add(out: *mut c_void, a: *const c_void, b: *const c_void, n: u32) -> i32;
         fn pulsar_router_select(selected: *mut c_void, weights: *mut c_void, logits: *const c_void, bias: *const c_void, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32) -> i32;
@@ -622,6 +623,22 @@ mod real {
 
     pub fn idx_topk(selected: &mut DeviceBuf, scores: &DeviceBuf, n_rows: u32, top_k: u32) -> Result {
         check(unsafe { pulsar_idx_topk(selected.ptr_mut(), scores.ptr(), n_rows, top_k) }, "idx_topk")
+    }
+
+    /// Per-token top-k over a batch score matrix: row list for token t
+    /// lands at selected[t*top_k..]. One bitonic launch per token.
+    pub fn idx_topk_batch(selected: &mut DeviceBuf, scores: &DeviceBuf, n_rows: u32, n_tok: u32, top_k: u32) -> Result {
+        for t in 0..n_tok as usize {
+            let sel = unsafe { (selected.ptr_mut() as *mut u8).add(t * top_k as usize * 4) };
+            let sc = unsafe { (scores.ptr() as *const u8).add(t * n_rows as usize * 4) };
+            check(unsafe { pulsar_idx_topk(sel as *mut c_void, sc as *const c_void, n_rows, top_k) }, "idx_topk_batch")?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn idx_scores_batch(scores: &mut DeviceBuf, q: &DeviceBuf, weights: &DeviceBuf, cache: &DeviceBuf, n_rows: u32, n_tok: u32, pos0: u32, n_head: u32, head_dim: u32, scale: f32) -> Result {
+        check(unsafe { pulsar_idx_scores_batch(scores.ptr_mut(), q.ptr(), weights.ptr(), cache.ptr(), n_rows, n_tok, pos0, n_head, head_dim, scale) }, "idx_scores_batch")
     }
 
     pub fn matmul_f32(out: &mut DeviceBuf, w: &DeviceBuf, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {

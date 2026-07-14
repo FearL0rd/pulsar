@@ -6,11 +6,11 @@ fn main() {
     let head = std::fs::read(&path).expect("read");
     let g = gguf::Gguf::parse(&head).expect("parse");
     println!("arch: {:?}", g.architecture());
-    let mut kv: Vec<&String> = g.meta_keys();
+    let mut kv: Vec<&String> = g.metadata.keys().collect();
     kv.sort();
     for k in kv {
         if !k.starts_with("tokenizer") {
-            println!("kv {k} = {}", g.meta_display(k));
+            println!("kv {k} = {:?}", g.metadata.get(k));
         }
     }
     for t in &g.tensors {

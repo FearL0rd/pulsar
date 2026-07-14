@@ -1465,9 +1465,9 @@ mod real {
                 });
             }
             let idx_kraw = f32s(if has_idx { mb * s.n_idx_dim } else { 1 })?;
-            let idx_q = f32s(if has_idx { s.n_idx_head * s.n_idx_dim } else { 1 })?;
-            let idx_w = f32s(if has_idx { s.n_idx_head } else { 1 })?;
-            let idx_scores = f32s(if has_idx { ctx } else { 1 })?;
+            let idx_q = f32s(if has_idx { mb * s.n_idx_head * s.n_idx_dim } else { 1 })?;
+            let idx_w = f32s(if has_idx { mb * s.n_idx_head } else { 1 })?;
+            let idx_scores = f32s(if has_idx { mb * ctx } else { 1 })?;
             let (normed_a, attn_out_a) = if m.attn_dev.is_some() {
                 (f32s(mb * s.n_embd)?, f32s(mb * s.n_embd)?)
             } else {
@@ -1650,6 +1650,19 @@ mod real {
             rows: u32,
         ) -> Result<Option<Vec<f32>>> {
             let s = self.shape;
+            // a batch must not straddle the indexer top_k boundary: rows
+            // before it use causal range selection, rows after it need
+            // scored top-k - split once here so every caller inherits it
+            let topk = s.n_idx_topk;
+            if topk > 0
+                && pos0 < topk
+                && pos0 + tokens.len() as u32 > topk
+                && tokens.len() > 1
+            {
+                let split = (topk - pos0) as usize;
+                self.forward_rows(st, &tokens[..split], pos0, 0)?;
+                return self.forward_rows(st, &tokens[split..], topk, rows);
+            }
             let n_tok = tokens.len() as u32;
             if n_tok == 0 || n_tok > st.max_batch {
                 return Err(format!("batch {} outside 1..={}", n_tok, st.max_batch).into());
@@ -1794,25 +1807,30 @@ mod real {
                             st.idx_last_sel = visible;
                             visible
                         } else if is_idx_layer && indexer.is_some() {
-                            if n_tok != 1 {
-                                return Err("indexed batch prefill not yet supported past top_k rows; long prompts need PULSAR_BATCH=1".into());
-                            }
                             let idx = indexer.as_ref().unwrap();
-                            kernels::matmul_q8_0(&mut st.idx_q, &idx.q_b, &st.q_rank_norm, s.n_lora_q, s.n_idx_head * s.n_idx_dim, 1)?;
-                            kernels::idx_rope0(&mut st.idx_q, 1, s.n_idx_head, s.n_idx_dim, s.qk_rope, pos0, &s.rope_cfg(), 0.0, 1.0)?;
+                            kernels::matmul_q8_0(&mut st.idx_q, &idx.q_b, &st.q_rank_norm, s.n_lora_q, s.n_idx_head * s.n_idx_dim, n_tok)?;
+                            kernels::idx_rope0(&mut st.idx_q, n_tok, s.n_idx_head, s.n_idx_dim, s.qk_rope, pos0, &s.rope_cfg(), 0.0, 1.0)?;
                             // ds4 feeds proj the pre-norm residual (cur).
                             // Under attn offload cur is on the primary;
                             // borrow attn_out_a as the hop buffer - it is
                             // not written until the output projection.
                             if self.attn_dev.is_some() {
-                                kernels::copy_across(&mut st.attn_out_a, &st.cur, s.n_embd as usize * 4)?;
-                                kernels::matmul_f32(&mut st.idx_w, &idx.proj, &st.attn_out_a, s.n_embd, s.n_idx_head, 1)?;
+                                kernels::copy_across(&mut st.attn_out_a, &st.cur, (n_tok * s.n_embd) as usize * 4)?;
+                                kernels::matmul_f32(&mut st.idx_w, &idx.proj, &st.attn_out_a, s.n_embd, s.n_idx_head, n_tok)?;
                             } else {
-                                kernels::matmul_f32(&mut st.idx_w, &idx.proj, &st.cur, s.n_embd, s.n_idx_head, 1)?;
+                                kernels::matmul_f32(&mut st.idx_w, &idx.proj, &st.cur, s.n_embd, s.n_idx_head, n_tok)?;
                             }
                             let scale = 1.0 / ((s.n_idx_dim * s.n_idx_head) as f32).sqrt();
-                            kernels::idx_score_one(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], visible, s.n_idx_head, s.n_idx_dim, scale)?;
-                            kernels::idx_topk(&mut st.mla_selected, &st.idx_scores, visible, topk)?;
+                            if n_tok == 1 {
+                                kernels::idx_score_one(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], visible, s.n_idx_head, s.n_idx_dim, scale)?;
+                                kernels::idx_topk(&mut st.mla_selected, &st.idx_scores, visible, topk)?;
+                            } else {
+                                // batch: every token in a post-boundary
+                                // chunk has >= top_k visible rows (the
+                                // forward_rows split guarantees it)
+                                kernels::idx_scores_batch(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], visible, n_tok, pos0, s.n_idx_head, s.n_idx_dim, scale)?;
+                                kernels::idx_topk_batch(&mut st.mla_selected, &st.idx_scores, visible, n_tok, topk)?;
+                            }
                             st.idx_last_sel = topk;
                             topk
                         } else {

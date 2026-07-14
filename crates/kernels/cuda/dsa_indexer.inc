@@ -182,6 +182,56 @@ extern "C" int pulsar_idx_score_one(
     return cuda_ok(cudaGetLastError(), "idx score one launch");
 }
 
+/* batch scores with causal masking: token t sees rows < pos0 + t + 1 */
+__global__ static void idx_scores_batch_kernel(
+        float *scores, const float *q, const float *weights,
+        const float *key_cache, uint32_t n_rows, uint32_t n_tokens,
+        uint32_t pos0, uint32_t n_head, uint32_t head_dim, float scale) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    if (row >= n_rows || token >= n_tokens) return;
+    float *dst = scores + (uint64_t)token * n_rows + row;
+    const uint32_t visible = min(pos0 + token + 1u, n_rows);
+    if (row >= visible) {
+        if (threadIdx.x == 0) *dst = -INFINITY;
+        return;
+    }
+    __shared__ float partial[256];
+    float score = 0.0f;
+    for (uint32_t h = 0; h < n_head; h++) {
+        const float *qh = q + ((uint64_t)token * n_head + h) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            dot += qh[d] * key_cache[(uint64_t)row * head_dim + d];
+        }
+        partial[threadIdx.x] = dot;
+        __syncthreads();
+        for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) score += fmaxf(partial[0] * scale, 0.0f) * weights[h];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *dst = score;
+}
+
+extern "C" int pulsar_idx_scores_batch(
+        void *scores_dev, const void *q_dev, const void *weights_dev,
+        const void *key_cache_dev, uint32_t n_rows, uint32_t n_tokens,
+        uint32_t pos0, uint32_t n_head, uint32_t head_dim, float scale) {
+    if (!scores_dev || !q_dev || !weights_dev || !key_cache_dev ||
+        n_rows == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0) {
+        return 0;
+    }
+    dim3 grid(n_rows, n_tokens, 1);
+    idx_scores_batch_kernel<<<grid, 256>>>(
+            (float *)scores_dev, (const float *)q_dev,
+            (const float *)weights_dev, (const float *)key_cache_dev,
+            n_rows, n_tokens, pos0, n_head, head_dim, scale);
+    return cuda_ok(cudaGetLastError(), "idx scores batch launch");
+}
+
 /* bitonic top-k: deterministic tie-break by lower index */
 __device__ __forceinline__ static bool idx_topk_better(
         float av, uint32_t ai, float bv, uint32_t bi) {
