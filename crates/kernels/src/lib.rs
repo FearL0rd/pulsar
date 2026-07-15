@@ -47,6 +47,7 @@ mod real {
     pub const QUANT_IQ2_XS: u32 = 6;
     pub const QUANT_IQ3_XXS: u32 = 7;
     pub const QUANT_Q4_0: u32 = 8;
+    pub const QUANT_Q5_1: u32 = 9;
 
     const H2D: i32 = 1;
     const D2H: i32 = 2;
@@ -76,19 +77,22 @@ mod real {
         fn pulsar_idx_score_one(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, n_rows: u32, n_head: u32, head_dim: u32, scale: f32) -> i32;
         fn pulsar_idx_topk(selected: *mut c_void, scores: *const c_void, n_rows: u32, top_k: u32) -> i32;
         fn pulsar_idx_scores_batch(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, n_rows: u32, n_tokens: u32, pos0: u32, n_head: u32, head_dim: u32, scale: f32) -> i32;
-        fn pulsar_swiglu(out: *mut c_void, gate: *const c_void, up: *const c_void, n: u32, clamp: f32, weight: f32) -> i32;
+        fn pulsar_swiglu(out: *mut c_void, gate: *const c_void, up: *const c_void, n: u32, clamp: f32, weight: f32, act_op: u32) -> i32;
+        fn pulsar_scale(x: *mut c_void, n: u32, c: f32) -> i32;
+        fn pulsar_softcap(x: *mut c_void, n: u32, cap: f32) -> i32;
+        fn pulsar_router_scale_selected(w: *mut c_void, sel: *const c_void, scale: *const c_void, n: u32, n_expert: u32) -> i32;
         fn pulsar_add(out: *mut c_void, a: *const c_void, b: *const c_void, n: u32) -> i32;
         fn pulsar_router_select(selected: *mut c_void, weights: *mut c_void, logits: *const c_void, bias: *const c_void, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32, softmax_mode: u32) -> i32;
         fn pulsar_quantize_q8_K(out: *mut c_void, x: *const c_void, in_dim: u32, n_rows: u32) -> i32;
-        fn pulsar_moe_pair_swiglu(mid: *mut c_void, ptrs: *const c_void, weights: *const c_void, x: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
+        fn pulsar_moe_pair_swiglu(mid: *mut c_void, ptrs: *const c_void, weights: *const c_void, x: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32, act_op: u32) -> i32;
         fn pulsar_moe_down(out: *mut c_void, ptrs: *const c_void, mid: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
-        fn pulsar_moe_pair_swiglu_grouped(mid: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, weights: *const c_void, xq: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32) -> i32;
+        fn pulsar_moe_pair_swiglu_grouped(mid: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, weights: *const c_void, xq: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32, act_op: u32) -> i32;
         fn pulsar_moe_down_grouped(partial: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, midq: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32) -> i32;
         fn pulsar_moe_slot_sum(out: *mut c_void, partial: *const c_void, out_dim: u32, n_used: u32, n_tok: u32) -> i32;
         fn pulsar_gqa_head_rms_norm(x: *mut c_void, w: *const c_void, rows: u32, head_dim: u32, eps: f32) -> i32;
-        fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32) -> i32;
+        fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
         fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32) -> i32;
-        fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32) -> i32;
+        fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32) -> i32;
 
         fn pulsar_gqa_selftest() -> i32;
         fn pulsar_q8_0_matmul_selftest() -> i32;
@@ -605,6 +609,11 @@ mod real {
         check(unsafe { pulsar_rms_norm(out.ptr_mut(), x.ptr(), w.ptr(), n, rows, eps) }, "rms_norm")
     }
 
+    /// In-place rms_norm (kernel reads each element before writing it).
+    pub fn rms_norm_inplace(x: &mut DeviceBuf, w: &DeviceBuf, n: u32, rows: u32, eps: f32) -> Result {
+        check(unsafe { pulsar_rms_norm(x.ptr_mut(), x.ptr(), w.ptr(), n, rows, eps) }, "rms_norm")
+    }
+
     pub fn matmul_q8_0(out: &mut DeviceBuf, w: &DeviceBuf, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_q8_0_matmul(out.ptr_mut(), w.ptr(), x.ptr(), in_dim, out_dim, n_tok) }, "matmul_q8_0")
     }
@@ -656,13 +665,26 @@ mod real {
         check(unsafe { pulsar_matmul_f32(out.ptr_mut(), w.ptr(), x.ptr(), in_dim, out_dim, n_tok) }, "matmul_f32")
     }
 
-    pub fn swiglu(out: &mut DeviceBuf, gate: &DeviceBuf, up: &DeviceBuf, n: u32, clamp: f32, weight: f32) -> Result {
-        check(unsafe { pulsar_swiglu(out.ptr_mut(), gate.ptr(), up.ptr(), n, clamp, weight) }, "swiglu")
+    pub fn scale(x: &mut DeviceBuf, n: u32, c: f32) -> Result {
+        check(unsafe { pulsar_scale(x.ptr_mut(), n, c) }, "scale")
+    }
+
+    pub fn softcap(x: &mut DeviceBuf, n: u32, cap: f32) -> Result {
+        check(unsafe { pulsar_softcap(x.ptr_mut(), n, cap) }, "softcap")
+    }
+
+    pub fn router_scale_selected(w: &mut DeviceBuf, sel: &DeviceBuf, scale: &DeviceBuf, n: u32, n_expert: u32) -> Result {
+        check(unsafe { pulsar_router_scale_selected(w.ptr_mut(), sel.ptr(), scale.ptr(), n, n_expert) }, "router_scale_selected")
+    }
+
+    /// act_op: 0 = silu (swiglu), 1 = gelu tanh (Gemma)
+    pub fn swiglu(out: &mut DeviceBuf, gate: &DeviceBuf, up: &DeviceBuf, n: u32, clamp: f32, weight: f32, act_op: u32) -> Result {
+        check(unsafe { pulsar_swiglu(out.ptr_mut(), gate.ptr(), up.ptr(), n, clamp, weight, act_op) }, "swiglu")
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_pair_swiglu_grouped(mid: &mut DeviceBuf, gptrs: &DeviceBuf, starts: &DeviceBuf, pairs: &DeviceBuf, weights: &DeviceBuf, xq: &DeviceBuf, in_dim: u32, mid_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32) -> Result {
-        check(unsafe { pulsar_moe_pair_swiglu_grouped(mid.ptr_mut(), gptrs.ptr(), starts.ptr(), pairs.ptr(), weights.ptr(), xq.ptr(), in_dim, mid_dim, n_used, n_group, row_bytes, quant) }, "moe_pair_swiglu_grouped")
+    pub fn moe_pair_swiglu_grouped(mid: &mut DeviceBuf, gptrs: &DeviceBuf, starts: &DeviceBuf, pairs: &DeviceBuf, weights: &DeviceBuf, xq: &DeviceBuf, in_dim: u32, mid_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32, act_op: u32) -> Result {
+        check(unsafe { pulsar_moe_pair_swiglu_grouped(mid.ptr_mut(), gptrs.ptr(), starts.ptr(), pairs.ptr(), weights.ptr(), xq.ptr(), in_dim, mid_dim, n_used, n_group, row_bytes, quant, act_op) }, "moe_pair_swiglu_grouped")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -708,10 +730,10 @@ mod real {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_pair_swiglu(mid: &mut DeviceBuf, ptrs: &DeviceBuf, weights: &DeviceBuf, x: &DeviceBuf, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32) -> Result {
+    pub fn moe_pair_swiglu(mid: &mut DeviceBuf, ptrs: &DeviceBuf, weights: &DeviceBuf, x: &DeviceBuf, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32, act_op: u32) -> Result {
         check(
             unsafe {
-                pulsar_moe_pair_swiglu(mid.ptr_mut(), ptrs.ptr(), weights.ptr(), x.ptr(), in_dim, mid_dim, n_used, n_tok, row_bytes, quant)
+                pulsar_moe_pair_swiglu(mid.ptr_mut(), ptrs.ptr(), weights.ptr(), x.ptr(), in_dim, mid_dim, n_used, n_tok, row_bytes, quant, act_op)
             },
             "moe_pair_swiglu",
         )
@@ -727,12 +749,12 @@ mod real {
         )
     }
 
-    pub fn gqa_head_rms_norm(x: &mut DeviceBuf, w: &DeviceBuf, rows: u32, head_dim: u32, eps: f32) -> Result {
-        check(unsafe { pulsar_gqa_head_rms_norm(x.ptr_mut(), w.ptr(), rows, head_dim, eps) }, "gqa_head_rms_norm")
+    pub fn gqa_head_rms_norm(x: &mut DeviceBuf, w: Option<&DeviceBuf>, rows: u32, head_dim: u32, eps: f32) -> Result {
+        check(unsafe { pulsar_gqa_head_rms_norm(x.ptr_mut(), w.map_or(std::ptr::null(), |b| b.ptr()), rows, head_dim, eps) }, "gqa_head_rms_norm")
     }
 
-    pub fn gqa_rope(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32) -> Result {
-        check(unsafe { pulsar_gqa_rope(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos0, theta) }, "gqa_rope")
+    pub fn gqa_rope(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: Option<&DeviceBuf>) -> Result {
+        check(unsafe { pulsar_gqa_rope(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos0, theta, factors.map_or(std::ptr::null(), |b| b.ptr())) }, "gqa_rope")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -741,10 +763,10 @@ mod real {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn gqa_attention(out: &mut DeviceBuf, q: &DeviceBuf, k_cache: &DeviceBuf, v_cache: &DeviceBuf, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32) -> Result {
+    pub fn gqa_attention(out: &mut DeviceBuf, q: &DeviceBuf, k_cache: &DeviceBuf, v_cache: &DeviceBuf, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32) -> Result {
         check(
             unsafe {
-                pulsar_gqa_attention(out.ptr_mut(), q.ptr(), k_cache.ptr(), v_cache.ptr(), n_tok, n_head, n_kv_head, head_dim, cap, pos0)
+                pulsar_gqa_attention(out.ptr_mut(), q.ptr(), k_cache.ptr(), v_cache.ptr(), n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window)
             },
             "gqa_attention",
         )

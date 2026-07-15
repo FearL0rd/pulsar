@@ -56,6 +56,10 @@ enum Pre {
     /// Qwen2/Qwen3 split ("qwen2"): minimax minus its extras; standalone
     /// contractions, single-digit numbers.
     Qwen2,
+    /// Gemma 4 raw SPM-style BPE (tokenizer.ggml.model == "gemma4"):
+    /// spaces become U+2581, only newline runs pre-split, merges run on
+    /// raw UTF-8 (no gpt2 byte map), unknown bytes fall back to <0xXX>.
+    Gemma4,
 }
 
 /// The special-token ids a chat loop needs, resolved from the vocab.
@@ -70,6 +74,9 @@ enum ChatStyle {
     Kimi,
     /// <|im_start|>user\ntext<|im_end|>\n ... (Qwen ChatML; no bos)
     ChatMl,
+    /// <start_of_turn>user\ntext<end_of_turn>\n ... (Gemma; roles are
+    /// "user"/"model", bos prepended)
+    Gemma,
 }
 
 pub struct ChatMarkers {
@@ -98,6 +105,18 @@ impl ChatMarkers {
                 assistant: find("<|im_assistant|>")?,
                 aux0: find("<|im_middle|>")?,
                 aux1: find("<|im_system|>")?,
+            });
+        }
+        if t.find_token("<start_of_turn>").is_some() {
+            return Ok(ChatMarkers {
+                style: ChatStyle::Gemma,
+                bos: t.bos_id,
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: t.find_token("<end_of_turn>"),
+                user: find("<start_of_turn>")?,
+                assistant: find("<start_of_turn>")?,
+                aux0: find("<end_of_turn>")?,
+                aux1: find("<end_of_turn>")?,
             });
         }
         if t.find_token("<|im_start|>").is_some() {
@@ -136,6 +155,14 @@ impl ChatMarkers {
                 v.extend(t.encode("\n"));
                 v
             }
+            // gemma has no system role: it rides as a user-role turn
+            ChatStyle::Gemma => {
+                let mut v = vec![self.user];
+                v.extend(t.encode(&format!("user\n{text}")));
+                v.push(self.aux0);
+                v.extend(t.encode("\n"));
+                v
+            }
             ChatStyle::Kimi => {
                 let mut v = vec![self.aux1];
                 v.extend(t.encode("system"));
@@ -163,7 +190,7 @@ impl ChatMarkers {
                 v.extend(self.eot);
                 v
             }
-            ChatStyle::ChatMl => {
+            ChatStyle::ChatMl | ChatStyle::Gemma => {
                 let mut v = vec![self.user];
                 v.extend(t.encode(&format!("user\n{text}")));
                 v.push(self.aux0);
@@ -190,6 +217,11 @@ impl ChatMarkers {
                 v.extend(t.encode("assistant\n"));
                 v
             }
+            ChatStyle::Gemma => {
+                let mut v = vec![self.assistant];
+                v.extend(t.encode("model\n"));
+                v
+            }
         }
     }
 
@@ -198,7 +230,7 @@ impl ChatMarkers {
         let mut v = self.open_assistant(t);
         v.extend(t.encode(text));
         v.push(self.eot.unwrap_or(self.eos));
-        if self.style == ChatStyle::ChatMl {
+        if matches!(self.style, ChatStyle::ChatMl | ChatStyle::Gemma) {
             v.extend(t.encode("\n"));
         }
         v
@@ -276,12 +308,18 @@ impl Tokenizer {
                 _ => g.metadata.get("tokenizer.ggml.model").and_then(Value::as_str)
                     == Some("llama"),
             },
-            pre: match g.metadata.get("tokenizer.ggml.pre").and_then(Value::as_str) {
-                Some("glm4") => Pre::Glm4,
-                Some("kimi-k2") => Pre::KimiK2,
-                Some("minimax-m2") => Pre::MiniMax,
-                Some("qwen2") => Pre::Qwen2,
-                _ => Pre::JoyAi,
+            pre: if g.metadata.get("tokenizer.ggml.model").and_then(Value::as_str)
+                == Some("gemma4")
+            {
+                Pre::Gemma4
+            } else {
+                match g.metadata.get("tokenizer.ggml.pre").and_then(Value::as_str) {
+                    Some("glm4") => Pre::Glm4,
+                    Some("kimi-k2") => Pre::KimiK2,
+                    Some("minimax-m2") => Pre::MiniMax,
+                    Some("qwen2") => Pre::Qwen2,
+                    _ => Pre::JoyAi,
+                }
             },
         })
     }
@@ -305,12 +343,30 @@ impl Tokenizer {
     /// pushed by id, exactly as ds4 does).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
+        if self.pre == Pre::Gemma4 {
+            // SPM-style: normalize spaces to U+2581, split only on
+            // newline runs, merge raw UTF-8 chars
+            let norm = text.replace(' ', "\u{2581}");
+            for (is_nl, piece) in split_newline_runs(&norm) {
+                if is_nl {
+                    // llama.cpp PR 21343: a pure-newline run that exists
+                    // in the vocab is one token, skipping the merges
+                    if let Some(&id) = self.token_to_id.get(piece) {
+                        out.push(id);
+                        continue;
+                    }
+                }
+                self.bpe_raw_piece(piece, &mut out);
+            }
+            return out;
+        }
         let pieces = match self.pre {
             Pre::JoyAi => pretokenize(text.as_bytes()),
             Pre::Glm4 => pretokenize_glm4(text.as_bytes()),
             Pre::KimiK2 => pretokenize_kimi_k2(text.as_bytes()),
             Pre::MiniMax => pretokenize_minimax(text.as_bytes()),
             Pre::Qwen2 => pretokenize_qwen2(text.as_bytes()),
+            Pre::Gemma4 => unreachable!(),
         };
         for piece in pieces {
             self.bpe_piece(piece, &mut out);
@@ -322,6 +378,24 @@ impl Tokenizer {
     /// pass through as their UTF-8 bytes.
     pub fn decode(&self, ids: &[u32]) -> Vec<u8> {
         let mut out = Vec::new();
+        if self.pre == Pre::Gemma4 {
+            for &id in ids {
+                let Some(tok) = self.tokens.get(id as usize) else { continue };
+                if let Some(b) = parse_byte_token(tok) {
+                    out.push(b);
+                    continue;
+                }
+                for c in tok.chars() {
+                    if c == '\u{2581}' {
+                        out.push(b' ');
+                    } else {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
+            }
+            return out;
+        }
         for &id in ids {
             let Some(tok) = self.tokens.get(id as usize) else { continue };
             for c in tok.chars() {
@@ -335,6 +409,39 @@ impl Tokenizer {
             }
         }
         out
+    }
+
+    /// Raw-BPE merge on one piece (gemma4): symbols are the piece's
+    /// unicode chars verbatim; unknown leftovers fall back to <0xXX>
+    /// byte tokens (gemma's vocab has all 256).
+    fn bpe_raw_piece(&self, piece: &str, out: &mut Vec<u32>) {
+        let mut sym: Vec<String> = piece.chars().map(String::from).collect();
+        loop {
+            let mut best: Option<(usize, u32)> = None;
+            for i in 0..sym.len().saturating_sub(1) {
+                let key = format!("{} {}", sym[i], sym[i + 1]);
+                if let Some(&rank) = self.merge_rank.get(&key) {
+                    if best.map_or(true, |(_, r)| rank < r) {
+                        best = Some((i, rank));
+                    }
+                }
+            }
+            let Some((i, _)) = best else { break };
+            let right = sym.remove(i + 1);
+            sym[i].push_str(&right);
+        }
+        for sm in &sym {
+            if let Some(&id) = self.token_to_id.get(sm.as_str()) {
+                out.push(id);
+            } else {
+                for b in sm.as_bytes() {
+                    let hex = format!("<0x{b:02X}>");
+                    if let Some(&id) = self.token_to_id.get(hex.as_str()) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
     }
 
     /// Byte-level BPE on one pre-tokenized piece.
@@ -373,6 +480,31 @@ impl Tokenizer {
             }
         }
     }
+}
+
+/// Split into alternating (is_newline_run, piece) segments.
+fn split_newline_runs(s: &str) -> Vec<(bool, &str)> {
+    let mut out = Vec::new();
+    let b = s.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let nl = b[i] == b'\n';
+        let run_start = i;
+        while i < b.len() && (b[i] == b'\n') == nl {
+            i += 1;
+        }
+        let _ = start;
+        start = run_start;
+        out.push((nl, &s[run_start..i]));
+    }
+    out
+}
+
+/// "<0xAB>" -> Some(0xAB)
+fn parse_byte_token(t: &str) -> Option<u8> {
+    let hex = t.strip_prefix("<0x")?.strip_suffix('>')?;
+    u8::from_str_radix(hex, 16).ok()
 }
 
 /* ---- pre-tokenizer: port of ds4's JoyAI-style split -------------------- */

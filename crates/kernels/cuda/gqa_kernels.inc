@@ -45,7 +45,7 @@ __global__ static void gqa_head_rms_norm_weight_kernel(
     }
     float inv = rsqrtf(red[0] / (float)head_dim + eps);
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        v[d] = v[d] * inv * w[d];
+        v[d] = v[d] * inv * (w ? w[d] : 1.0f);
     }
 }
 
@@ -58,7 +58,8 @@ __global__ static void gqa_rope_neox_kernel(
         uint32_t head_dim,
         uint32_t rot_dim, /* partial rotary: rotate first rot_dim dims */
         uint32_t pos0,
-        float theta) {
+        float theta,
+        const float *factors) { /* [rot_dim/2] freq divisors, NULL = none */
     uint32_t half = rot_dim / 2u;
     uint64_t total = (uint64_t)n_tok * n_head * half;
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -69,6 +70,7 @@ __global__ static void gqa_rope_neox_kernel(
     uint32_t t = rem / n_head;
     float *v = x + ((uint64_t)t * n_head + h) * head_dim;
     float freq = powf(theta, -2.0f * (float)d / (float)rot_dim);
+    if (factors) freq /= factors[d];
     float ang = (float)(pos0 + t) * freq;
     float c = cosf(ang), s = sinf(ang);
     float a = v[d], b = v[d + half];
@@ -108,18 +110,20 @@ __global__ static void gqa_attention_kernel(
         uint32_t n_tok,
         uint32_t n_head,
         uint32_t n_kv_head,
-        uint32_t head_dim,
+        uint32_t head_dim,   /* <= 512: each thread owns up to 4 dims */
         uint32_t cap,
-        uint32_t pos0) {
+        uint32_t pos0,
+        float scale,         /* qk scale (1/sqrt(head_dim) for vanilla) */
+        uint32_t window) {   /* sliding window; 0 = full causal */
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tok || h >= n_head) return;
     uint32_t kvh = h / (n_head / n_kv_head);
     uint32_t n_rows = pos0 + t + 1u;
+    uint32_t row0 = (window != 0u && n_rows > window) ? n_rows - window : 0u;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     const float *kh = k_cache + (uint64_t)kvh * cap * head_dim;
     const float *vh = v_cache + (uint64_t)kvh * cap * head_dim;
-    float scale = rsqrtf((float)head_dim);
     /* Online softmax, single pass over K and V.  128 threads: thread d owns
      * output dim d; rows are processed in chunks of 128 with each thread
      * computing one row's score, then everyone accumulates V against the
@@ -127,16 +131,16 @@ __global__ static void gqa_attention_kernel(
      * two-pass version recomputed them per output dim: ~130x the FLOPs and,
      * past L1, ~head_dim re-reads of K per row at long context). */
     const uint32_t tid = threadIdx.x;
-    __shared__ float sq[128];
+    __shared__ float sq[512];
     __shared__ float s_w[128];
     __shared__ float red[128];
-    if (tid < head_dim) sq[tid] = qh[tid];
+    for (uint32_t d = tid; d < head_dim; d += 128u) sq[d] = qh[d];
     __syncthreads();
 
-    float acc = 0.0f;   /* V accumulator for dim = tid */
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f}; /* V accum, dims tid+k*128 */
     float den = 0.0f;   /* running softmax denominator (same in all threads) */
     float m = -INFINITY;/* running max */
-    for (uint32_t base = 0; base < n_rows; base += 128u) {
+    for (uint32_t base = row0; base < n_rows; base += 128u) {
         uint32_t chunk = n_rows - base < 128u ? n_rows - base : 128u;
         /* one score per thread */
         float s = -INFINITY;
@@ -154,44 +158,48 @@ __global__ static void gqa_attention_kernel(
         }
         float m_new = fmaxf(m, red[0]);
         float corr = expf(m - m_new); /* expf(-inf) == 0, first chunk safe */
-        acc *= corr;
+        #pragma unroll
+        for (uint32_t k = 0; k < 4; k++) acc[k] *= corr;
         den *= corr;
         if (tid < chunk) s_w[tid] = expf(s - m_new);
         __syncthreads();
         for (uint32_t r = 0; r < chunk; r++) {
             float w = s_w[r];
             den += w;
-            if (tid < head_dim) {
-                acc += w * vh[(uint64_t)(base + r) * head_dim + tid];
+            const float *vrow = vh + (uint64_t)(base + r) * head_dim;
+            for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
+                acc[k] += w * vrow[d];
             }
         }
         m = m_new;
         __syncthreads();
     }
-    if (tid < head_dim) {
-        out[((uint64_t)t * n_head + h) * head_dim + tid] = acc / den;
+    for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
+        out[((uint64_t)t * n_head + h) * head_dim + d] = acc[k] / den;
     }
 }
 
 /* ---- host wrappers ---- */
 
 extern "C" int ds4_gpu_gqa_head_rms_norm_weight(
-        ds4_gpu_tensor *x, const ds4_gpu_tensor *w,
+        ds4_gpu_tensor *x, const ds4_gpu_tensor *w, /* w NULL = unit weight */
         uint32_t rows, uint32_t head_dim, float eps) {
-    if (!x || !w || rows == 0 || head_dim == 0 || head_dim > 128u) return 0;
+    if (!x || rows == 0 || head_dim == 0 || head_dim > 512u) return 0;
     gqa_head_rms_norm_weight_kernel<<<rows, 256>>>(
-            (float *)x->ptr, (const float *)w->ptr, rows, head_dim, eps);
+            (float *)x->ptr, w ? (const float *)w->ptr : NULL, rows, head_dim, eps);
     return cuda_ok(cudaGetLastError(), "gqa head rms norm launch");
 }
 
 extern "C" int ds4_gpu_gqa_rope(
         ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
-        uint32_t head_dim, uint32_t rot_dim, uint32_t pos0, float theta) {
+        uint32_t head_dim, uint32_t rot_dim, uint32_t pos0, float theta,
+        const ds4_gpu_tensor *factors) {
     if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 || rot_dim == 0 ||
         rot_dim > head_dim || rot_dim % 2u) return 0;
     uint64_t total = (uint64_t)n_tok * n_head * (rot_dim / 2u);
     gqa_rope_neox_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
-            (float *)x->ptr, n_tok, n_head, head_dim, rot_dim, pos0, theta);
+            (float *)x->ptr, n_tok, n_head, head_dim, rot_dim, pos0, theta,
+            factors ? (const float *)factors->ptr : NULL);
     return cuda_ok(cudaGetLastError(), "gqa rope launch");
 }
 
@@ -211,17 +219,18 @@ extern "C" int ds4_gpu_gqa_attention(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
-        uint32_t head_dim, uint32_t cap, uint32_t pos0) {
+        uint32_t head_dim, uint32_t cap, uint32_t pos0,
+        float scale, uint32_t window) {
     if (!out || !q || !k_cache || !v_cache ||
         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
-        head_dim == 0 || head_dim > 128u || pos0 + n_tok > cap) {
+        head_dim == 0 || head_dim > 512u || pos0 + n_tok > cap) {
         return 0;
     }
     dim3 grid(n_tok, n_head, 1);
     gqa_attention_kernel<<<grid, 128>>>(
             (float *)out->ptr, (const float *)q->ptr,
             (const float *)k_cache->ptr, (const float *)v_cache->ptr,
-            n_tok, n_head, n_kv_head, head_dim, cap, pos0);
+            n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window);
     return cuda_ok(cudaGetLastError(), "gqa attention launch");
 }
 
@@ -374,11 +383,12 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
         /* kernel pipeline */
         int ok = ds4_gpu_gqa_head_rms_norm_weight(g_q, g_qnw, n_tok * n_head, hd, eps) &&
                  ds4_gpu_gqa_head_rms_norm_weight(g_k, g_knw, n_tok * n_kv_head, hd, eps) &&
-                 ds4_gpu_gqa_rope(g_q, n_tok, n_head, hd, hd, pos0, theta) &&
-                 ds4_gpu_gqa_rope(g_k, n_tok, n_kv_head, hd, hd, pos0, theta) &&
+                 ds4_gpu_gqa_rope(g_q, n_tok, n_head, hd, hd, pos0, theta, NULL) &&
+                 ds4_gpu_gqa_rope(g_k, n_tok, n_kv_head, hd, hd, pos0, theta, NULL) &&
                  ds4_gpu_gqa_kv_cache_append(g_kc, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_kv_cache_append(g_vc, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
-                 ds4_gpu_gqa_attention(g_out, g_q, g_kc, g_vc, n_tok, n_head, n_kv_head, hd, cap, pos0) &&
+                 ds4_gpu_gqa_attention(g_out, g_q, g_kc, g_vc, n_tok, n_head, n_kv_head, hd, cap, pos0,
+                                       1.0f / sqrtf((float)hd), 0u) &&
                  cuda_ok(cudaDeviceSynchronize(), "gqa selftest sync");
         float *gpu_out = (float *)malloc(q_elems * sizeof(float));
         if (ok) ok = ds4_gpu_tensor_read(g_out, 0, gpu_out, q_elems * sizeof(float)) != 0;
