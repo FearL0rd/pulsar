@@ -25,10 +25,18 @@ sliding-window attention, dual GELU FFN). Reference box: RTX 5060 Ti
 |---|---|---|
 | Kimi K2.7-Code 1T (339GB, 8-shard split gguf) | **1.3 tok/s** | – |
 | Hy3 295B (85GB gguf) | **7.2 tok/s** | 0.64–0.70 (ds4) |
+| Gemma 4 26B-A4B (17GB gguf) | **36 tok/s** | – |
 | GLM-5.2 743B (197GB gguf) | **2.0 tok/s** | 0.40 (ds4) |
 | Hy3 long-prompt prefill | **28 tok/s** (tensor cores, 1.8×) | 0.44 (ds4) |
 | GLM-5.2 long-prompt prefill | **15 tok/s** (tensor cores, 2.7×) | – |
 | warm start | hot experts bulk-load in **~3s** | – |
+
+Decode figures are **warm-run** (second run onward). The first run is
+cold while the expert-popularity census fills; only after it is written
+do the host cache and resident tiers load hot, so a cold run reads far
+more from disk and clocks lower — don't benchmark the first run. On the
+reference box Gemma 4 goes 12.7 tok/s cold → 36 tok/s warm (hot experts
+resident on the second GPU). See the warm-start note under Quick start.
 
 Prefill runs the quantized weights through int8 tensor cores on
 sm_80+ (`mma.m16n8k32` dense GEMM + mmq-style grouped MoE that unpacks
