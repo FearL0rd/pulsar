@@ -195,6 +195,62 @@ __global__ static void matmul_q8_0_preq_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
+/* tiled prefill GEMM: the per-(row,token) kernel re-reads each weight row
+ * from global once per token; here a warp stages k-slabs of its own row in
+ * shared memory once and dots them against a 16-token tile, cutting weight
+ * traffic 16x. Per-warp slab, so no cross-warp sync. Tile layout is the
+ * substrate for the WMMA int8 variant (same slabs, mma.sync consumers). */
+#define PULSAR_Q8_TILE_TOK 16u
+#define PULSAR_Q8_SLAB_BLOCKS 32u /* 32 q8_0 blocks = 1088 B per warp */
+
+__global__ static void matmul_q8_0_preq_tiled_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        uint64_t blocks) {
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + warp;
+    const uint64_t t0 = (uint64_t)blockIdx.y * PULSAR_Q8_TILE_TOK;
+    if (row >= out_dim || t0 >= n_tok) return;
+    const uint32_t tn = n_tok - t0 < PULSAR_Q8_TILE_TOK
+            ? (uint32_t)(n_tok - t0) : PULSAR_Q8_TILE_TOK;
+    __shared__ unsigned char slab[8][PULSAR_Q8_SLAB_BLOCKS * 34u];
+    const unsigned char *wr = w + row * blocks * 34u;
+    float acc[PULSAR_Q8_TILE_TOK];
+#pragma unroll
+    for (uint32_t t = 0; t < PULSAR_Q8_TILE_TOK; t++) acc[t] = 0.0f;
+    for (uint64_t b0 = 0; b0 < blocks; b0 += PULSAR_Q8_SLAB_BLOCKS) {
+        const uint32_t bn = blocks - b0 < PULSAR_Q8_SLAB_BLOCKS
+                ? (uint32_t)(blocks - b0) : PULSAR_Q8_SLAB_BLOCKS;
+        const uint32_t slab_bytes = bn * 34u;
+        for (uint32_t i = lane; i < slab_bytes; i += 32u) {
+            slab[warp][i] = wr[b0 * 34u + i];
+        }
+        __syncwarp();
+        for (uint32_t t = 0; t < tn; t++) {
+            const int8_t *xt = xq + (t0 + t) * blocks * 32u;
+            const float *xs = xscale + (t0 + t) * blocks;
+            float a = 0.0f;
+            for (uint32_t b = lane; b < bn; b += 32u) {
+                const unsigned char *blk = slab[warp] + b * 34u;
+                int dot = dot_i8x32_dp4a((const int8_t *)(blk + 2),
+                                         xt + (b0 + b) * 32u);
+                a += __half2float(*(const __half *)blk) * xs[b0 + b] * (float)dot;
+            }
+            acc[t] += a;
+        }
+        __syncwarp();
+    }
+    for (uint32_t t = 0; t < tn; t++) {
+        float v = warp_sum_f32(acc[t]);
+        if (lane == 0) out[(t0 + t) * out_dim + row] = v;
+    }
+}
+
 __global__ static void matmul_q8_0_preq_warp8_kernel(
         float *out,
         const unsigned char *w,
@@ -264,6 +320,12 @@ extern "C" int pulsar_q8_0_matmul(
         matmul_q8_0_preq_warp8_kernel<<<(out_dim + 7u) / 8u, 256>>>(
                 (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
                 in_dim, out_dim, blocks);
+    } else if (n_tok >= 8) {
+        dim3 grid((unsigned)((out_dim + 7u) / 8u),
+                  (unsigned)((n_tok + PULSAR_Q8_TILE_TOK - 1u) / PULSAR_Q8_TILE_TOK), 1);
+        matmul_q8_0_preq_tiled_kernel<<<grid, 256>>>(
+                (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
+                out_dim, n_tok, blocks);
     } else {
         dim3 grid(out_dim, n_tok, 1);
         matmul_q8_0_preq_kernel<<<grid, 256>>>(
@@ -303,7 +365,9 @@ static uint16_t f32_to_f16_bits(float f) {
 }
 
 extern "C" int pulsar_q8_0_matmul_selftest(void) {
-    const uint32_t in_dim = 4096, out_dim = 512, n_tok = 3;
+    /* n_tok 19 exercises the tiled path (>= 8) incl. a partial 3-token
+     * tile; in_dim 4256 -> 133 blocks, a partial 5-block weight slab */
+    const uint32_t in_dim = 4256, out_dim = 512, n_tok = 19;
     const uint32_t blocks = in_dim / 32u;
     q8_0_block *w = (q8_0_block *)malloc((uint64_t)out_dim * blocks * sizeof(*w));
     float *wf = (float *)malloc((uint64_t)out_dim * in_dim * sizeof(float));

@@ -19,6 +19,12 @@ fn main() {
     let archs = std::env::var("PULSAR_CUDA_ARCH").unwrap_or_else(|_| "61,75,86,89".into());
     let mut build = cc::Build::new();
     build.cuda(true).flag("-O3").flag("--use_fast_math");
+    // nvcc rejects host compilers newer than its toolkit supports (e.g.
+    // CUDA 12.0 caps at gcc 12 while distro c++ is gcc 13). Probe a tiny
+    // compile with candidate ccbins and take the first one nvcc accepts.
+    if let Some(ccbin) = pick_ccbin() {
+        build.flag(&format!("-ccbin={ccbin}"));
+    }
     let list: Vec<&str> = archs.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
     for (i, a) in list.iter().enumerate() {
         let first = i == 0;
@@ -35,4 +41,30 @@ fn main() {
     build.file("cuda/pulsar_kernels.cu").compile("pulsar_kernels");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+}
+
+fn pick_ccbin() -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(env) = std::env::var("NVCC_CCBIN") {
+        return Some(env); // explicit override, no probe
+    }
+    candidates.push("c++".into());
+    for v in ["14", "13", "12", "11", "10"] {
+        candidates.push(format!("g++-{v}"));
+    }
+    let out = std::env::var("OUT_DIR").unwrap_or_else(|_| ".".into());
+    let probe = format!("{out}/ccbin_probe.cu");
+    std::fs::write(&probe, "int main(){return 0;}\n").ok()?;
+    for cand in candidates {
+        let ok = std::process::Command::new("nvcc")
+            .args([&format!("-ccbin={cand}"), "-c", &probe, "-o"])
+            .arg(format!("{out}/ccbin_probe.o"))
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(cand);
+        }
+    }
+    None // let nvcc use its default and report its own error
 }
