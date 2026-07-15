@@ -314,6 +314,8 @@ mod real {
 
     pub struct Model {
         path: std::path::PathBuf,
+        /// (virtual base, path) per shard; single file = one entry, base 0.
+        shards: Vec<(u64, std::path::PathBuf)>,
         pub shape: Shape,
         pub gguf: Gguf,
         token_embd: DeviceBuf,
@@ -459,8 +461,8 @@ mod real {
     }
 
     impl Prefetcher {
-        fn spawn(path: &Path) -> Result<Prefetcher> {
-            let mut fetcher = stream::fetch::Fetcher::open_with(path, 16, fetch_buf_alloc())?;
+        fn spawn(shards: &[(u64, std::path::PathBuf)]) -> Result<Prefetcher> {
+            let mut fetcher = stream::fetch::Fetcher::open_split(shards, 16, fetch_buf_alloc())?;
             let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<stream::Read>>();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -624,9 +626,9 @@ mod real {
     }
 
     impl StreamingStore {
-        fn open(path: &Path, budget: usize) -> Result<StreamingStore> {
+        fn open(shards: &[(u64, std::path::PathBuf)], budget: usize) -> Result<StreamingStore> {
             Ok(StreamingStore {
-                fetcher: stream::fetch::Fetcher::open_with(path, 32, fetch_buf_alloc())?,
+                fetcher: stream::fetch::Fetcher::open_split(shards, 32, fetch_buf_alloc())?,
                 cache: std::collections::HashMap::new(),
                 used: 0,
                 budget,
@@ -760,19 +762,41 @@ mod real {
     /// How many header bytes to read before parsing; grows on Truncated.
     const HEAD_READ_START: usize = 32 << 20;
 
-    pub fn parse_header(path: &Path) -> Result<(File, Gguf)> {
-        let file = File::open(path)?;
+    fn parse_one_header(file: &File) -> Result<Gguf> {
         let mut n = HEAD_READ_START;
         loop {
             let mut head = vec![0u8; n];
             let got = file.read_at(&mut head, 0)?;
             head.truncate(got);
             match Gguf::parse(&head) {
-                Ok(g) => return Ok((file, g)),
+                Ok(g) => return Ok(g),
                 Err(gguf::Error::Truncated { .. }) if got == n => n *= 2,
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// Open a model that may be a single gguf or a -00001-of-000NN split
+    /// set. Returns the merged header over a virtual offset space plus the
+    /// shard list ((virtual base, path); single file = one entry, base 0).
+    pub fn parse_header(path: &Path) -> Result<(Vec<(u64, std::path::PathBuf)>, Gguf)> {
+        let paths = gguf::split_shards(path)
+            .unwrap_or_else(|| vec![path.to_path_buf()]);
+        let mut shards = Vec::with_capacity(paths.len());
+        let mut bases = Vec::with_capacity(paths.len());
+        let mut ggufs = Vec::with_capacity(paths.len());
+        let mut base = 0u64;
+        for p in paths {
+            let file = File::open(&p)?;
+            ggufs.push(parse_one_header(&file)?);
+            bases.push(base);
+            shards.push((base, p.clone()));
+            base += file.metadata()?.len();
+        }
+        if ggufs.len() > 1 {
+            eprintln!("pulsar: split gguf: {} shards as one virtual file", ggufs.len());
+        }
+        Ok((shards, Gguf::merge_split(ggufs, &bases)))
     }
 
     /// Host requant: dense K-quant tensors -> q8_0 at load. Kimi K2 (and
@@ -952,7 +976,32 @@ mod real {
         }
     }
 
-    fn read_tensor_bytes(file: &File, g: &Gguf, name: &str) -> Result<Vec<u8>> {
+    /// One logical model file that may span split-gguf shards: shard i
+    /// covers [bases[i], bases[i]+size_i) of a virtual offset space (the
+    /// same space the merged Gguf's tensor offsets live in).
+    pub struct VFile {
+        files: Vec<(u64, File)>,
+    }
+
+    impl VFile {
+        fn open(shards: &[(u64, std::path::PathBuf)]) -> Result<VFile> {
+            let mut files = Vec::with_capacity(shards.len());
+            for (base, p) in shards {
+                files.push((*base, File::open(p)?));
+            }
+            Ok(VFile { files })
+        }
+
+        fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            let i = match self.files.binary_search_by(|(b, _)| b.cmp(&offset)) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
+            self.files[i].1.read_exact_at(buf, offset - self.files[i].0)
+        }
+    }
+
+    fn read_tensor_bytes(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<u8>> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
         let bytes = t.byte_size().ok_or_else(|| meta_err(name))?;
         let mut buf = vec![0u8; bytes as usize];
@@ -979,7 +1028,7 @@ mod real {
         Ok(buf)
     }
 
-    fn upload(file: &File, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+    fn upload(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
         Ok(DeviceBuf::from_bytes(&read_tensor_bytes(file, g, name)?)?)
     }
 
@@ -991,7 +1040,7 @@ mod real {
     /// every budgeted byte is ~50x cheaper to read each token.
     /// PULSAR_ATTN_HOST=1 forces everything pinned.
     fn upload_attn(
-        file: &File,
+        file: &VFile,
         g: &Gguf,
         name: &str,
         vram_budget: &mut i64,
@@ -1011,7 +1060,8 @@ mod real {
 
     impl Model {
         pub fn load(path: &Path) -> Result<Model> {
-            let (file, gguf) = parse_header(path)?;
+            let (shards, gguf) = parse_header(path)?;
+            let file = VFile::open(&shards)?;
             let shape = Shape::from_gguf(&gguf)?;
 
             // the embedding table is read ~one row per token - pinned
@@ -1298,6 +1348,7 @@ mod real {
 
             Ok(Model {
                 path: path.to_path_buf(),
+                shards,
                 shape,
                 gguf,
                 token_embd,
@@ -1349,7 +1400,7 @@ mod real {
         }
         triples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
 
-        let file = File::open(&m.path)?;
+        let file = VFile::open(&m.shards)?;
         let mut tiers = Vec::new();
         let mut next = triples.into_iter();
         for d in candidates {
@@ -1766,8 +1817,8 @@ mod real {
                 kcache,
                 vcache,
                 logits: f32s((m.mtp_depth + 1).max(2) * s.n_vocab)?,
-                store: StreamingStore::open(&m.path, cache_bytes)?,
-                prefetcher: Prefetcher::spawn(&m.path)?,
+                store: StreamingStore::open(&m.shards, cache_bytes)?,
+                prefetcher: Prefetcher::spawn(&m.shards)?,
                 pred_logits: f32s(s.n_expert)?,
                 pred_selected: DeviceBuf::alloc(n_used * 4)?,
                 pred_weights: f32s(s.n_expert_used)?,

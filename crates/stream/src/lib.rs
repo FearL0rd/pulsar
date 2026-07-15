@@ -278,7 +278,10 @@ pub mod fetch {
 
     pub struct Fetcher {
         ring: IoUring,
-        file: std::fs::File,
+        /// (virtual base, file), sorted by base. Single-file = one entry
+        /// at base 0; split ggufs treat the shard set as one virtual file
+        /// and route each read by offset (tensors never straddle shards).
+        files: Vec<(u64, std::fs::File)>,
         qd: usize,
         buf_alloc: Option<super::uring::BufAlloc>,
     }
@@ -296,11 +299,34 @@ pub mod fetch {
             qd: usize,
             buf_alloc: Option<super::uring::BufAlloc>,
         ) -> std::io::Result<Fetcher> {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(path)?;
-            Ok(Fetcher { ring: IoUring::new(qd as u32 * 2)?, file, qd, buf_alloc })
+            Self::open_split(std::slice::from_ref(&(0, path.to_path_buf())), qd, buf_alloc)
+        }
+
+        /// Open a virtual file spanning shards: `shards[i]` = (virtual
+        /// base offset, path). Bases must be ascending.
+        pub fn open_split(
+            shards: &[(u64, std::path::PathBuf)],
+            qd: usize,
+            buf_alloc: Option<super::uring::BufAlloc>,
+        ) -> std::io::Result<Fetcher> {
+            let mut files = Vec::with_capacity(shards.len());
+            for (base, path) in shards {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(path)?;
+                files.push((*base, file));
+            }
+            Ok(Fetcher { ring: IoUring::new(qd as u32 * 2)?, files, qd, buf_alloc })
+        }
+
+        /// (fd, local offset) for a virtual offset.
+        fn route(&self, offset: u64) -> (types::Fd, u64) {
+            let i = match self.files.binary_search_by(|(b, _)| b.cmp(&offset)) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
+            (types::Fd(self.files[i].1.as_raw_fd()), offset - self.files[i].0)
         }
 
         /// Fetch every read; result[i] corresponds to reads[i].
@@ -322,7 +348,6 @@ pub mod fetch {
             reads: &[Read],
             mut on_slab: impl FnMut(usize, Slab) -> std::io::Result<()>,
         ) -> std::io::Result<()> {
-            let fd = types::Fd(self.file.as_raw_fd());
             let mut pending: Vec<Option<Slab>> = Vec::with_capacity(reads.len());
             pending.resize_with(reads.len(), || None);
             let mut next = 0usize;
@@ -331,8 +356,9 @@ pub mod fetch {
             loop {
                 while inflight < self.qd && next < reads.len() {
                     let r = reads[next];
-                    let aligned_off = r.offset & !(ALIGN - 1);
-                    let payload_off = (r.offset - aligned_off) as usize;
+                    let (fd, local) = self.route(r.offset);
+                    let aligned_off = local & !(ALIGN - 1);
+                    let payload_off = (local - aligned_off) as usize;
                     let disk_len = (payload_off as u64 + r.len).next_multiple_of(ALIGN);
                     let buf = Aligned::new_with(disk_len as usize, ALIGN as usize, self.buf_alloc)
                         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;

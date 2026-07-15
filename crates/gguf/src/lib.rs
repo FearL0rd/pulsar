@@ -262,6 +262,31 @@ impl Gguf {
         Ok(Gguf { version, metadata, tensors, alignment, data_offset })
     }
 
+    /// Merge split-gguf shard headers into one table over a VIRTUAL file:
+    /// shard i occupies [bases[i], bases[i]+size_i), every tensor offset is
+    /// rewritten to its virtual absolute position, and data_offset becomes
+    /// 0 so `data_offset + tensor.offset` stays the read address. Metadata
+    /// (tokenizer etc.) comes from shard 0, which is where the split
+    /// convention puts it. Tensors never straddle shards, so any consumer
+    /// that routes a virtual offset to (shard, local) can read normally.
+    pub fn merge_split(mut shards: Vec<Gguf>, bases: &[u64]) -> Gguf {
+        assert_eq!(shards.len(), bases.len());
+        let mut merged = shards.remove(0);
+        let mut tensors = std::mem::take(&mut merged.tensors);
+        for t in &mut tensors {
+            t.offset += bases[0] + merged.data_offset;
+        }
+        for (i, mut s) in shards.into_iter().enumerate() {
+            for mut t in s.tensors.drain(..) {
+                t.offset += bases[i + 1] + s.data_offset;
+                tensors.push(t);
+            }
+        }
+        merged.tensors = tensors;
+        merged.data_offset = 0;
+        merged
+    }
+
     pub fn architecture(&self) -> Option<&str> {
         self.metadata.get("general.architecture")?.as_str()
     }
@@ -348,4 +373,31 @@ impl<'a> Cursor<'a> {
             other => return Err(Error::BadValueType(other)),
         })
     }
+}
+
+/// Expand "...-00001-of-000NN.gguf" to the full shard list (all must
+/// exist); None when the name doesn't match the split convention.
+pub fn split_shards(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf")?;
+    // ...-%05d-of-%05d
+    let (head, of_part) = stem.rsplit_once("-of-")?;
+    let (prefix, no_part) = head.rsplit_once('-')?;
+    if no_part.len() != 5 || of_part.len() != 5 || no_part != "00001" {
+        return None;
+    }
+    let count: u32 = of_part.parse().ok()?;
+    if count < 2 {
+        return None;
+    }
+    let dir = path.parent()?;
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 1..=count {
+        let p = dir.join(format!("{prefix}-{i:05}-of-{count:05}.gguf"));
+        if !p.exists() {
+            return None;
+        }
+        out.push(p);
+    }
+    Some(out)
 }
