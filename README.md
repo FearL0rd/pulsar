@@ -13,16 +13,22 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Runs **Hy3 295B** (hy-v3, GQA) and **GLM-5.2 743B** (glm-dsa, MLA) on
-consumer GPUs. Reference box: RTX 5060 Ti 16GB + RTX 4060 Ti 16GB,
-Ryzen 9900X, 30GB RAM, one Gen5 NVMe.
+Three model families on consumer GPUs — **Hy3 295B** (hy-v3, GQA),
+**GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention), and
+**Kimi K2.7 1T** (deepseek2, MLA). Reference box: RTX 5060 Ti 16GB +
+RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one Gen5 NVMe.
 
-| decode | pulsar | ds4/NeutronStar (reference C engine, same box) |
+| decode | pulsar | reference engine (same box) |
 |---|---|---|
-| Hy3 295B (85GB gguf) | **7.2 tok/s** | 0.64–0.70 |
-| GLM-5.2 743B (197GB gguf) | **2.0 tok/s** | 0.40 |
-| Hy3 long-prompt prefill | **7.9+ tok/s** | 0.44 |
+| Kimi K2.7-Code 1T (339GB, 8-shard split gguf) | **1.3 tok/s** | – |
+| Hy3 295B (85GB gguf) | **7.2 tok/s** | 0.64–0.70 (ds4) |
+| GLM-5.2 743B (197GB gguf) | **2.0 tok/s** | 0.40 (ds4) |
+| Hy3 long-prompt prefill | **7.9+ tok/s** | 0.44 (ds4) |
 | warm start | hot experts bulk-load in **~3s** | – |
+
+GLM runs contexts past its naive 2048-row ceiling via a port of the
+DSA lightning indexer (top-k row selection per token), validated
+against the reference engine with a long-context retrieval probe.
 
 On a single RTX 4060 Ti (where NeutronStar set its numbers): Hy3 2.6,
 GLM 0.56.
@@ -67,8 +73,11 @@ determinism on a fixed code path (`--decode-consistency`, below).
 
 ## Get a model
 
-Pulsar runs ds4-recipe ggufs (mixed precision: ~2-bit routed experts,
-q8 attention). Two are published and known-good:
+Pulsar reads standard llama.cpp ggufs: nine routed-expert quant
+formats (q2_K, q3_K, q4_0, q4_K, q5_K, q6_K, iq2_xxs, iq2_xs,
+iq3_xxs), K-quant dense tensors (requantized to q8_0 at load), split
+-00001-of-000NN shard sets (point `-m` at the first shard), and both
+converter dialects (ds4-lineage and upstream). Known-good starters:
 
 ```sh
 # Hy3 295B - 85GB, the friendlier starting point
@@ -78,6 +87,9 @@ curl -L -C - -o Hy3-ds4-IQ2XXS-AttnQ8.gguf \
 # GLM-5.2 743B - 197GB, needs a second 16GB GPU for the attention stack
 curl -L -C - -o GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
   "https://huggingface.co/antirez/GLM-5.2-GGUF/resolve/main/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
+
+# Kimi K2.7-Code 1T - 339GB in 8 shards (unsloth UD-Q2_K_XL); download
+# the folder and point pulsar at shard -00001-of-00008
 ```
 
 Put the file on your fastest NVMe - decode speed is read speed.
