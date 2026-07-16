@@ -196,7 +196,7 @@ Everything auto-configures; these override.
 | var | default | what |
 |---|---|---|
 | `PULSAR_GPU` | measured | CUDA index of the expert-streaming (primary) GPU |
-| `PULSAR_ATTN_GPU` | auto | CUDA index of the attention GPU (MLA models); `off` disables offload |
+| `PULSAR_ATTN_GPU` | auto (MLA) | attention GPU by CUDA index. MLA models auto-offload (`off` disables); GQA models are opt-in by index: a capacity shuffle that loses on 2 GPUs at short context, pays on 3+ GPUs or long context |
 | `PULSAR_TIERS` | on | `off` disables resident expert tiers (also the bit-exact single-device path) |
 | `PULSAR_CACHE_GB` | measured | host RAM budget for the expert LFU cache (solved from MemAvailable) |
 | `PULSAR_DEV_CACHE_GB` | solved | VRAM hot-expert pool: measured free VRAM minus staging + reserve |
