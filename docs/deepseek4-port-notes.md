@@ -182,8 +182,13 @@ still TODO). prefill has a batch path + compressor_finish_prefill_state.
   how raw window + compressed rows compose per query - the ONE remaining
   unread region (prefill batch path included)
 
-## Status: recon 100%, implementation WRITTEN (commit 3d7c4ed) -
-## NOT yet compiled/run (substrate ssh blocked on tailscale re-auth).
+## Status: SHIPPED 2026-07-16. Compiled first try; dsv4_selftest PASS;
+## check.sh PASS (existing archs bit-exact); correct output on the
+## first-ever run; needle recall at 2.4k ctx (compressed rows + live
+## indexer masking); chat template working. bench.sh canonical:
+## 5.9 tok/s warm n=64 (fastest big-MoE in the table; Hy3 is 5.3).
+## Perf ceilings for the next pass: sequential prefill (~5 tok/s),
+## no tiers/prefetch for this arch, ~86 host syncs/token.
 
 ### Session-3: remaining recon answers (all former unknowns closed)
 - DS4_N_HASH_LAYER = 3 (`deepseek4.hash_layer_count`)
