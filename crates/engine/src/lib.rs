@@ -1894,7 +1894,13 @@ mod real {
                             hc_attn_base: read_tensor_f32(&file, &gguf, &t("hc_attn_base.weight"))?,
                             hc_ffn_scale: read_tensor_f32(&file, &gguf, &t("hc_ffn_scale.weight"))?,
                             hc_ffn_base: read_tensor_f32(&file, &gguf, &t("hc_ffn_base.weight"))?,
-                            probs_b: read_tensor_f32(&file, &gguf, &t("exp_probs_b.bias"))?,
+                            // absent on hash layers (selection is tid2eid
+                            // there); zeros keep the top-k path harmless
+                            probs_b: if gguf.tensor(&t("exp_probs_b.bias")).is_some() {
+                                read_tensor_f32(&file, &gguf, &t("exp_probs_b.bias"))?
+                            } else {
+                                vec![0.0; shape.n_expert as usize]
+                            },
                             tid2eid,
                             comp: if ratio != 0 {
                                 Some(comp_lane("attn_compressor", shape.head_dim, &mut *attn_vram_budget)?)
