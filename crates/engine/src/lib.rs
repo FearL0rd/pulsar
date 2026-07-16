@@ -683,6 +683,11 @@ mod real {
         out: DeviceBuf,
         ptrs: DeviceBuf,
         weights: DeviceBuf,
+        /// inkling sink slots on a differently-quantized bank run as a
+        /// second launch pair into their own output (mid/midq reuse is
+        /// stream-ordered); 1-byte dummies elsewhere
+        ptrs_sink: DeviceBuf,
+        out_sink: DeviceBuf,
         pub hits: u64,
     }
 
@@ -1365,7 +1370,22 @@ mod real {
                         })
                     }
                 },
-                Family::Gqa => None,
+                // Gqa: opt-in only (PULSAR_ATTN_GPU=<idx>). Gqa attention is
+                // already VRAM-resident on the primary, so offloading is a
+                // capacity SHUFFLE: the attn stack's bytes migrate to the
+                // second card, evicting that much expert tier from it. It
+                // pays when the primary is squeezed (fat attn stacks, long
+                // contexts); measured per model, not assumed.
+                Family::Gqa => match std::env::var("PULSAR_ATTN_GPU").ok().as_deref() {
+                    Some("off") | Some("-1") | None => None,
+                    Some(v) => v.trim().parse::<i32>().ok().filter(|&d| {
+                        let ok = d != primary && d >= 0 && d < kernels::device_count();
+                        if !ok {
+                            eprintln!("pulsar: ignoring PULSAR_ATTN_GPU={d} (primary is {primary}, {} devices)", kernels::device_count());
+                        }
+                        ok
+                    }),
+                },
             };
             if let Some(d) = attn_dev {
                 eprintln!("pulsar: attn weights + KV resident on CUDA device {d}");
@@ -1462,7 +1482,16 @@ mod real {
                 Vec::new()
             };
             let rope_factors = if gemma_arch && gguf.tensor("rope_freqs.weight").is_some() {
-                Some(upload(&file, &gguf, "rope_freqs.weight")?)
+                // the rope kernel runs wherever q/k live - factors follow
+                // the attn card under Gqa offload
+                if let Some(d) = attn_dev {
+                    kernels::set_device(d)?;
+                }
+                let f = upload(&file, &gguf, "rope_freqs.weight")?;
+                if attn_dev.is_some() {
+                    kernels::set_device(primary)?;
+                }
+                Some(f)
             } else {
                 None
             };
@@ -1661,20 +1690,32 @@ mod real {
                             tr[e * dr + d] = raw[d * ext + e];
                         }
                     }
-                    let mut rel_proj = DeviceBuf::alloc(tr.len() * 4)?;
-                    rel_proj.write(0, kernels::as_bytes(&tr))?;
                     let upload_f32 = |name: &str| -> Result<DeviceBuf> {
                         let v = read_tensor_f32(&file, &gguf, name)?;
                         let mut b = DeviceBuf::alloc(v.len() * 4)?;
                         b.write(0, kernels::as_bytes(&v))?;
                         Ok(b)
                     };
+                    // attn-side weights (wr, rel_proj, k/v shortconvs) live
+                    // where the attention segment computes; the attn/mlp
+                    // stream shortconvs run on the primary after the hop
+                    if let Some(d) = attn_dev {
+                        kernels::set_device(d)?;
+                    }
+                    let wr = upload_attn(&file, &gguf, &t("attn_r.weight"), &mut *attn_vram_budget)?;
+                    let mut rel_proj = DeviceBuf::alloc(tr.len() * 4)?;
+                    rel_proj.write(0, kernels::as_bytes(&tr))?;
+                    let sconv_k = upload_f32(&t("shortconv_k.weight"))?;
+                    let sconv_v = upload_f32(&t("shortconv_v.weight"))?;
+                    if attn_dev.is_some() {
+                        kernels::set_device(primary)?;
+                    }
                     Some(InkW {
-                        wr: upload_attn(&file, &gguf, &t("attn_r.weight"), &mut *attn_vram_budget)?,
+                        wr,
                         rel_proj,
                         rel_extent: ext as u32,
-                        sconv_k: upload_f32(&t("shortconv_k.weight"))?,
-                        sconv_v: upload_f32(&t("shortconv_v.weight"))?,
+                        sconv_k,
+                        sconv_v,
                         sconv_attn: upload_f32(&t("shortconv_attn.weight"))?,
                         sconv_mlp: upload_f32(&t("shortconv_mlp.weight"))?,
                         gscale: read_tensor_f32(&file, &gguf, &t("ffn_gscale.weight"))?[0],
@@ -1833,9 +1874,17 @@ mod real {
         if std::env::var("PULSAR_TIERS").ok().as_deref() == Some("off") {
             return Ok(Vec::new());
         }
-        let candidates: Vec<i32> = (0..kernels::device_count())
+        // dedicated cards first; the attn card joins LAST with whatever
+        // VRAM the resident attn stack left over (the free-space check
+        // below decides if that's worth a tier)
+        let mut candidates: Vec<i32> = (0..kernels::device_count())
             .filter(|&d| d != primary && Some(d) != m.attn_dev)
             .collect();
+        if let Some(ad) = m.attn_dev {
+            if ad != primary {
+                candidates.push(ad);
+            }
+        }
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -1845,10 +1894,16 @@ mod real {
             eprintln!("pulsar: no warm census yet - expert tiers idle until the next run");
             return Ok(Vec::new());
         }
-        // rank whole triples by summed slab heat
+        // rank whole triples by summed slab heat. Inkling's sink bank
+        // ranks BELOW every routed triple despite its every-token heat:
+        // the tier's marginal value is avoided DISK misses, and sinks
+        // never disk-miss (the host LFU always keeps what every token
+        // touches) - measured: sinks evicting routed triples cost 3%,
+        // sinks filling spare tier capacity are free wins.
         let mut triples: Vec<(u64, [ (u64, u64); 3 ])> = Vec::new();
+        let mut sink_triples: Vec<(u64, [ (u64, u64); 3 ])> = Vec::new();
         for l in &m.layers {
-            let Ffn::Moe { gate_exps, up_exps, down_exps, .. } = &l.ffn else {
+            let Ffn::Moe { gate_exps, up_exps, down_exps, sink, .. } = &l.ffn else {
                 continue;
             };
             for e in 0..s.n_expert as u64 {
@@ -1859,8 +1914,20 @@ mod real {
                     triples.push((heat, slabs));
                 }
             }
+            if let Some(sk) = sink {
+                for e in 0..s.n_shexp_sink as u64 {
+                    let slabs = [&sk[0], &sk[1], &sk[2]]
+                        .map(|t| (t.abs_offset + e * t.expert_bytes, t.expert_bytes));
+                    let heat: u64 = slabs.iter().filter_map(|(off, _)| census.get(off)).sum();
+                    if heat > 0 {
+                        sink_triples.push((heat, slabs));
+                    }
+                }
+            }
         }
         triples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        sink_triples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        triples.extend(sink_triples);
 
         let file = VFile::open(&m.shards)?;
         let mut tiers = Vec::new();
@@ -1891,6 +1958,16 @@ mod real {
                 out: DeviceBuf::alloc(mb as usize * s.n_embd as usize * 4)?,
                 ptrs: DeviceBuf::alloc(mb as usize * n_used * std::mem::size_of::<ExpertPtrs>())?,
                 weights: DeviceBuf::alloc(mb as usize * n_used * 4)?,
+                ptrs_sink: if s.n_shexp_sink > 0 {
+                    DeviceBuf::alloc(mb as usize * n_used * std::mem::size_of::<ExpertPtrs>())?
+                } else {
+                    DeviceBuf::alloc(1)?
+                },
+                out_sink: if s.n_shexp_sink > 0 {
+                    DeviceBuf::alloc(mb as usize * s.n_embd as usize * 4)?
+                } else {
+                    DeviceBuf::alloc(1)?
+                },
                 hits: 0,
             };
             let mut cursor = 0usize;
@@ -2007,9 +2084,12 @@ mod real {
         head_xq: DeviceBuf,
         // Inkling scratch (empty/dummies elsewhere): per-layer packed
         // shortconv states [k | v | attn | mlp], the r projection, the
-        // rel-bias logits, and a sconv output bounce buffer
+        // rel-bias logits, and sconv bounce buffers. The k/v streams
+        // (states + tmp) and r/rel buffers live on the attn card under
+        // Gqa offload; attn/mlp streams stay on the primary.
         sconv_state: Vec<[DeviceBuf; 4]>,
         sconv_tmp: DeviceBuf,
+        sconv_tmp_kv: DeviceBuf,
         r_buf: DeviceBuf,
         rel_buf: DeviceBuf,
         /// Unified-memory box (GB10/Spark, Jetson): host-cache slabs are
@@ -2248,6 +2328,36 @@ mod real {
             } else {
                 (f32s(1)?, f32s(1)?)
             };
+            // Gqa attention scratch beside the KV caches (attn card under
+            // offload, primary otherwise): raw k/v projections, inkling's
+            // rel-bias buffers and the k/v-stream shortconv state+tmp
+            let kbuf = f32s(mb * s.n_head_kv * s.head_dim)?;
+            let vbuf = f32s(mb * s.n_head_kv * s.head_dim)?;
+            let r_buf = f32s(if s.d_rel > 0 { mb * s.n_head * s.d_rel } else { 1 })?;
+            let rel_buf = f32s(if s.d_rel > 0 {
+                mb * s.n_head * s.rel_ext.max(s.rel_ext_swa)
+            } else {
+                1
+            })?;
+            let sconv_tmp_kv = f32s(if s.sconv_k > 1 { mb * s.n_embd } else { 1 })?;
+            let mut sconv_kv: Vec<(DeviceBuf, DeviceBuf)> = Vec::new();
+            if s.sconv_k > 1 {
+                let d = s.sconv_k - 1;
+                for il in 0..s.n_exec_layer as usize {
+                    let kvw = m
+                        .geom
+                        .get(il)
+                        .map(|g| g.n_head_kv * g.head_dim)
+                        .unwrap_or(s.n_head_kv * s.head_dim);
+                    let mk = |w: u32| -> Result<DeviceBuf> {
+                        let mut b = f32s(d * w)?;
+                        let n = b.bytes();
+                        kernels::zero(&mut b, n)?;
+                        Ok(b)
+                    };
+                    sconv_kv.push((mk(kvw)?, mk(kvw)?));
+                }
+            }
             if m.attn_dev.is_some() {
                 kernels::set_device(primary)?;
             }
@@ -2261,8 +2371,8 @@ mod real {
                 cur: f32s(mb * s.n_embd)?,
                 normed: f32s(mb * s.n_embd)?,
                 q,
-                k: f32s(mb * s.n_head_kv * s.head_dim)?,
-                v: f32s(mb * s.n_head_kv * s.head_dim)?,
+                k: kbuf,
+                v: vbuf,
                 heads,
                 attn_out: f32s(mb * s.n_embd)?,
                 after_attn: f32s(mb * s.n_embd)?,
@@ -2356,34 +2466,29 @@ mod real {
                 } else {
                     f32s(1)?
                 },
+                // kv-stream states (attn card under offload) zip with the
+                // attn/mlp-stream states (always primary: they run after
+                // the hop back)
                 sconv_state: if s.sconv_k > 1 {
                     let d = s.sconv_k - 1;
                     let mut v = Vec::with_capacity(s.n_exec_layer as usize);
-                    for il in 0..s.n_exec_layer as usize {
-                        let kvw = m
-                            .geom
-                            .get(il)
-                            .map(|g| g.n_head_kv * g.head_dim)
-                            .unwrap_or(s.n_head_kv * s.head_dim);
+                    for (kst, vst) in sconv_kv {
                         let mk = |w: u32| -> Result<DeviceBuf> {
                             let mut b = f32s(d * w)?;
                             let n = b.bytes();
                             kernels::zero(&mut b, n)?;
                             Ok(b)
                         };
-                        v.push([mk(kvw)?, mk(kvw)?, mk(s.n_embd)?, mk(s.n_embd)?]);
+                        v.push([kst, vst, mk(s.n_embd)?, mk(s.n_embd)?]);
                     }
                     v
                 } else {
                     Vec::new()
                 },
                 sconv_tmp: f32s(if s.sconv_k > 1 { mb * s.n_embd } else { 1 })?,
-                r_buf: f32s(if s.d_rel > 0 { mb * s.n_head * s.d_rel } else { 1 })?,
-                rel_buf: f32s(if s.d_rel > 0 {
-                    mb * s.n_head * s.rel_ext.max(s.rel_ext_swa)
-                } else {
-                    1
-                })?,
+                sconv_tmp_kv,
+                r_buf,
+                rel_buf,
                 unified: {
                     let u = kernels::unified_memory();
                     if u {
@@ -2549,8 +2654,21 @@ mod real {
             }
             if pos0 == 0 {
                 // fresh sequence: shortconv history restarts at zero
+                // (k/v streams live on the attn card under offload)
+                if let Some(d) = self.attn_dev {
+                    kernels::set_device(d)?;
+                }
                 for states in st.sconv_state.iter_mut() {
-                    for b in states.iter_mut() {
+                    for b in &mut states[..2] {
+                        let n = b.bytes();
+                        kernels::zero(b, n)?;
+                    }
+                }
+                if self.attn_dev.is_some() {
+                    kernels::set_device(primary)?;
+                }
+                for states in st.sconv_state.iter_mut() {
+                    for b in &mut states[2..] {
                         let n = b.bytes();
                         kernels::zero(b, n)?;
                     }
@@ -2644,10 +2762,18 @@ mod real {
                         let factors = gm
                             .filter(|g| g.factors)
                             .and_then(|_| self.rope_factors.as_ref());
-                        kernels::matmul_q8_0(&mut st.q, attn_q, &st.normed, s.n_embd, s.n_head * hd, n_tok)?;
-                        kernels::matmul_q8_0(&mut st.k, attn_k, &st.normed, s.n_embd, hkv * hd, n_tok)?;
+                        // Gqa attn offload (opt-in): hop the normed input
+                        // over and run the whole segment on the attn card,
+                        // exactly like the Mla path below
+                        if let Some(d) = self.attn_dev {
+                            kernels::copy_across(&mut st.normed_a, &st.normed, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::set_device(d)?;
+                        }
+                        let xin = if self.attn_dev.is_some() { &st.normed_a } else { &st.normed };
+                        kernels::matmul_q8_0(&mut st.q, attn_q, xin, s.n_embd, s.n_head * hd, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.k, attn_k, xin, s.n_embd, hkv * hd, n_tok)?;
                         match attn_v {
-                            Some(v_w) => kernels::matmul_q8_0(&mut st.v, v_w, &st.normed, s.n_embd, hkv * hd, n_tok)?,
+                            Some(v_w) => kernels::matmul_q8_0(&mut st.v, v_w, xin, s.n_embd, hkv * hd, n_tok)?,
                             // attention_k_eq_v: v = the raw k projection
                             None => kernels::copy_across(&mut st.v, &st.k, (n_tok * hkv * hd) as usize * 4)?,
                         }
@@ -2656,10 +2782,10 @@ mod real {
                             // projections, before head norm (reference
                             // order: matmul -> sconv -> reshape -> norm)
                             let kvb = (n_tok * hkv * hd) as usize * 4;
-                            kernels::sconv(&mut st.sconv_tmp, &st.k, &ink.sconv_k, &mut st.sconv_state[il][0], n_tok, hkv * hd, s.sconv_k)?;
-                            kernels::copy_across(&mut st.k, &st.sconv_tmp, kvb)?;
-                            kernels::sconv(&mut st.sconv_tmp, &st.v, &ink.sconv_v, &mut st.sconv_state[il][1], n_tok, hkv * hd, s.sconv_k)?;
-                            kernels::copy_across(&mut st.v, &st.sconv_tmp, kvb)?;
+                            kernels::sconv(&mut st.sconv_tmp_kv, &st.k, &ink.sconv_k, &mut st.sconv_state[il][0], n_tok, hkv * hd, s.sconv_k)?;
+                            kernels::copy_across(&mut st.k, &st.sconv_tmp_kv, kvb)?;
+                            kernels::sconv(&mut st.sconv_tmp_kv, &st.v, &ink.sconv_v, &mut st.sconv_state[il][1], n_tok, hkv * hd, s.sconv_k)?;
+                            kernels::copy_across(&mut st.v, &st.sconv_tmp_kv, kvb)?;
                         }
                         kernels::gqa_head_rms_norm(&mut st.q, Some(q_norm), n_tok * s.n_head, hd, eps)?;
                         kernels::gqa_head_rms_norm(&mut st.k, Some(k_norm), n_tok * hkv, hd, eps)?;
@@ -2688,7 +2814,7 @@ mod real {
                         let rel_ext = if let Some(ink) = &l.ink {
                             // rel-pos bias: rel_proj^T . (x . wr), per
                             // (token, head) a rel_extent-long bias row
-                            kernels::matmul_q8_0(&mut st.r_buf, &ink.wr, &st.normed, s.n_embd, s.n_head * s.d_rel, n_tok)?;
+                            kernels::matmul_q8_0(&mut st.r_buf, &ink.wr, xin, s.n_embd, s.n_head * s.d_rel, n_tok)?;
                             kernels::matmul_f32(&mut st.rel_buf, &ink.rel_proj, &st.r_buf, s.d_rel, ink.rel_extent, n_tok * s.n_head)?;
                             ink.rel_extent
                         } else {
@@ -2696,6 +2822,14 @@ mod real {
                         };
                         let rel = l.ink.as_ref().map(|_| &st.rel_buf);
                         kernels::gqa_attention_rel(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext)?;
+
+                        // output projection on the attn card, hop back,
+                        // restore the primary (mirrors the Mla path)
+                        if self.attn_dev.is_some() {
+                            kernels::matmul_q8_0(&mut st.attn_out_a, attn_output_w, &st.heads, s.n_head * hd, s.n_embd, n_tok)?;
+                            kernels::copy_across(&mut st.attn_out, &st.attn_out_a, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::set_device(primary)?;
+                        }
                     }
                     Attn::Mla { q_a, q_a_norm, q_b, kv_a_mqa, kv_a_norm, k_b, v_b, indexer } => {
                         // ds4's GLM compact-KV decode path: q through the
@@ -3033,15 +3167,19 @@ mod real {
                         };
                         let off_of = |t: &ExpertTensor, le: u64| t.abs_offset + le * t.expert_bytes;
                         // resident-tier experts compute on their own card;
-                        // they are never fetched, cached, or staged here
-                        let tier_of = |e: i32| -> Option<(usize, ExpertPtrs)> {
-                            if e as u32 >= s.n_expert {
-                                return None; // sink slabs never tier
-                            }
-                            let g = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
+                        // they are never fetched, cached, or staged here.
+                        // Sink ids resolve into the tier too (their census
+                        // heat ranks them first at placement) - the bool
+                        // says which launch pair serves them.
+                        let tier_of = |e: i32| -> Option<(usize, ExpertPtrs, bool)> {
+                            let is_sink = e as u32 >= s.n_expert;
+                            let [g3, u3, d3] = slabs_of(e as u32);
+                            let g = off_of(g3.0, g3.1);
                             // resident MTP experts beat a tier copy (same
                             // device as the compute, no partial gather)
-                            if self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&g)) {
+                            if !is_sink
+                                && self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&g))
+                            {
                                 return None;
                             }
                             st.tiers.iter().enumerate().find_map(|(ti, t)| {
@@ -3049,11 +3187,11 @@ mod real {
                                 Some((ti, ExpertPtrs {
                                     gate,
                                     up: byte_off(
-                                        *t.map.get(&(up_exps.abs_offset + e as u64 * up_exps.expert_bytes))?,
-                                        *fused_up_off,
+                                        *t.map.get(&off_of(u3.0, u3.1))?,
+                                        if is_sink { 0 } else { *fused_up_off },
                                     ),
-                                    down: *t.map.get(&(down_exps.abs_offset + e as u64 * down_exps.expert_bytes))?,
-                                }))
+                                    down: *t.map.get(&off_of(d3.0, d3.1))?,
+                                }, is_sink))
                             })
                         };
                         let mut offsets =
@@ -3163,16 +3301,29 @@ mod real {
                             .iter()
                             .map(|_| vec![ExpertPtrs::NULL; selected.len()])
                             .collect();
+                        // sink slots on a differently-quantized bank get
+                        // their own tier launch pair (mirrors the primary)
+                        let mut tptrs_sink: Vec<Vec<ExpertPtrs>> = if sink_same {
+                            Vec::new()
+                        } else {
+                            st.tiers.iter().map(|_| vec![ExpertPtrs::NULL; selected.len()]).collect()
+                        };
                         let mut tier_slots = vec![0u64; st.tiers.len()];
+                        let mut tier_slots_sink = vec![0u64; st.tiers.len()];
                         for (si, &e) in selected.iter().enumerate() {
                             if e < 0 || e as u32 >= s.n_expert + sink_n {
                                 ptrs.push(ExpertPtrs::NULL);
                                 continue;
                             }
-                            if let Some((ti, tp)) = tier_of(e) {
+                            if let Some((ti, tp, is_sink)) = tier_of(e) {
                                 ptrs.push(ExpertPtrs::NULL);
-                                tptrs[ti][si] = tp;
-                                tier_slots[ti] += 1;
+                                if is_sink && !sink_same {
+                                    tptrs_sink[ti][si] = tp;
+                                    tier_slots_sink[ti] += 1;
+                                } else {
+                                    tptrs[ti][si] = tp;
+                                    tier_slots[ti] += 1;
+                                }
                                 continue;
                             }
                             let [g3, u3, d3] = slabs_of(e as u32);
@@ -3244,27 +3395,49 @@ mod real {
                         // cards, overlapping the primary's MoE below
                         let mut active = Vec::new();
                         for ti in 0..st.tiers.len() {
-                            if tier_slots[ti] == 0 {
+                            let sink_hits = *tier_slots_sink.get(ti).unwrap_or(&0);
+                            if tier_slots[ti] == 0 && sink_hits == 0 {
                                 continue;
                             }
                             let tier = &mut st.tiers[ti];
-                            tier.hits += tier_slots[ti];
+                            tier.hits += tier_slots[ti] + sink_hits;
                             kernels::copy_across(&mut tier.xin, &st.normed, (n_tok * s.n_embd) as usize * 4)?;
                             kernels::copy_across(&mut tier.weights, &st.router_weights, (n_tok * s.n_expert_used) as usize * 4)?;
                             kernels::set_device(tier.dev)?;
+                            // both ptr arrays land before any launch so the
+                            // whole tier chain runs async under primary work
                             tier.ptrs.write(0, kernels::as_bytes(&tptrs[ti]))?;
+                            if sink_hits > 0 {
+                                tier.ptrs_sink.write(0, kernels::as_bytes(&tptrs_sink[ti]))?;
+                            }
                             kernels::quantize_q8_k(&mut tier.xq, &tier.xin, s.n_embd, n_tok)?;
-                            kernels::moe_pair_swiglu(
-                                &mut tier.mid, &tier.ptrs, &tier.weights, &tier.xq,
-                                s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, s.moe_act_op,
-                            )?;
-                            kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
-                            kernels::moe_down(
-                                &mut tier.out, &tier.ptrs, &tier.midq,
-                                s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
-                            )?;
+                            if tier_slots[ti] > 0 {
+                                kernels::moe_pair_swiglu(
+                                    &mut tier.mid, &tier.ptrs, &tier.weights, &tier.xq,
+                                    s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, s.moe_act_op,
+                                )?;
+                                kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                                kernels::moe_down(
+                                    &mut tier.out, &tier.ptrs, &tier.midq,
+                                    s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+                                )?;
+                            }
+                            if sink_hits > 0 {
+                                // sink pass: same mid/midq scratch, stream-
+                                // ordered after the routed pass consumed it
+                                let sk = sink.as_ref().unwrap();
+                                kernels::moe_pair_swiglu(
+                                    &mut tier.mid, &tier.ptrs_sink, &tier.weights, &tier.xq,
+                                    s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, sk[0].row_bytes, sk[0].quant, s.moe_act_op,
+                                )?;
+                                kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                                kernels::moe_down(
+                                    &mut tier.out_sink, &tier.ptrs_sink, &tier.midq,
+                                    s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, sk[2].row_bytes, sk[2].quant,
+                                )?;
+                            }
                             kernels::set_device(primary)?;
-                            active.push(ti);
+                            active.push((ti, tier_slots[ti] > 0, sink_hits > 0));
                         }
 
                         // routed experts: activations quantized to q8_K,
@@ -3319,12 +3492,20 @@ mod real {
                         // NOTE: summing partials reorders float adds vs the
                         // single-kernel slot loop - same drift class as
                         // batch-vs-decode; PULSAR_TIERS=off restores exact.
-                        for ti in active {
+                        for (ti, routed_out, sink_out) in active {
                             let tier = &st.tiers[ti];
-                            kernels::set_device(tier.dev)?;
-                            kernels::copy_across(&mut st.tier_ret, &tier.out, (n_tok * s.n_embd) as usize * 4)?;
-                            kernels::set_device(primary)?;
-                            kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * s.n_embd)?;
+                            if routed_out {
+                                kernels::set_device(tier.dev)?;
+                                kernels::copy_across(&mut st.tier_ret, &tier.out, (n_tok * s.n_embd) as usize * 4)?;
+                                kernels::set_device(primary)?;
+                                kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * s.n_embd)?;
+                            }
+                            if sink_out {
+                                kernels::set_device(tier.dev)?;
+                                kernels::copy_across(&mut st.tier_ret, &tier.out_sink, (n_tok * s.n_embd) as usize * 4)?;
+                                kernels::set_device(primary)?;
+                                kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * s.n_embd)?;
+                            }
                         }
 
                         // cur = after_attn + routed + shared (ds4's add3).
