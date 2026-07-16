@@ -78,7 +78,8 @@ mod real {
         fn pulsar_idx_store_k(raw_k: *const c_void, w: *const c_void, b: *const c_void, cache: *mut c_void, pos0: u32, n_tok: u32, cache_cap: u32, head_dim: u32, rot_dim: u32, n_ctx_orig: u32, eps: f32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> i32;
         fn pulsar_idx_score_one(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, n_rows: u32, n_head: u32, head_dim: u32, scale: f32) -> i32;
         fn pulsar_idx_topk(selected: *mut c_void, scores: *const c_void, n_rows: u32, top_k: u32) -> i32;
-        fn pulsar_idx_scores_batch(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, n_rows: u32, n_tokens: u32, pos0: u32, n_head: u32, head_dim: u32, scale: f32) -> i32;
+        fn pulsar_idx_scores_batch(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, q16: *mut c_void, n_rows: u32, n_tokens: u32, pos0: u32, n_head: u32, head_dim: u32, scale: f32) -> i32;
+        fn pulsar_idx_selftest() -> i32;
         fn pulsar_swiglu(out: *mut c_void, gate: *const c_void, up: *const c_void, n: u32, clamp: f32, weight: f32, act_op: u32) -> i32;
         fn pulsar_scale(x: *mut c_void, n: u32, c: f32) -> i32;
         fn pulsar_fill_row_tail(x: *mut c_void, rows: u32, row_w: u32, keep: u32, v: f32) -> i32;
@@ -670,8 +671,8 @@ mod real {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn idx_scores_batch(scores: &mut DeviceBuf, q: &DeviceBuf, weights: &DeviceBuf, cache: &DeviceBuf, n_rows: u32, n_tok: u32, pos0: u32, n_head: u32, head_dim: u32, scale: f32) -> Result {
-        check(unsafe { pulsar_idx_scores_batch(scores.ptr_mut(), q.ptr(), weights.ptr(), cache.ptr(), n_rows, n_tok, pos0, n_head, head_dim, scale) }, "idx_scores_batch")
+    pub fn idx_scores_batch(scores: &mut DeviceBuf, q: &DeviceBuf, weights: &DeviceBuf, cache: &DeviceBuf, q16: Option<&mut DeviceBuf>, n_rows: u32, n_tok: u32, pos0: u32, n_head: u32, head_dim: u32, scale: f32) -> Result {
+        check(unsafe { pulsar_idx_scores_batch(scores.ptr_mut(), q.ptr(), weights.ptr(), cache.ptr(), q16.map_or(std::ptr::null_mut(), |b| b.ptr_mut()), n_rows, n_tok, pos0, n_head, head_dim, scale) }, "idx_scores_batch")
     }
 
     pub fn matmul_f32(out: &mut DeviceBuf, w: &DeviceBuf, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
@@ -814,6 +815,10 @@ mod real {
 
     pub fn gqa_selftest() -> bool {
         unsafe { pulsar_gqa_selftest() != 0 }
+    }
+
+    pub fn idx_selftest() -> bool {
+        unsafe { pulsar_idx_selftest() != 0 }
     }
 
     pub fn sconv_selftest() -> bool {

@@ -19,3 +19,4 @@ selftest!(router_selftest);
 selftest!(moe_selftest);
 selftest!(glue_selftest);
 selftest!(mla_selftest);
+selftest!(idx_selftest);

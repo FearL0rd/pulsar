@@ -2057,6 +2057,8 @@ mod real {
         // across layers so non-indexer layers reuse the last list
         idx_kcache: Vec<DeviceBuf>,
         idx_kraw: DeviceBuf,
+        /// f16 staging for the tensor-core batch scorer
+        idx_q16: DeviceBuf,
         idx_q: DeviceBuf,
         idx_w: DeviceBuf,
         idx_scores: DeviceBuf,
@@ -2362,13 +2364,14 @@ mod real {
             let mut idx_kcache = Vec::new();
             for il in 0..s.n_exec_layer as usize {
                 idx_kcache.push(if has_idx && uses_full_indexer(il, s.n_leading_dense) {
-                    DeviceBuf::alloc(ctx as usize * s.n_idx_dim as usize * 4)?
+                    DeviceBuf::alloc(ctx as usize * s.n_idx_dim as usize * 2)? // f16 keys
                 } else {
                     f32s(1)?
                 });
             }
             let idx_kraw = f32s(if has_idx { mb * s.n_idx_dim } else { 1 })?;
             let idx_q = f32s(if has_idx { mb * s.n_idx_head * s.n_idx_dim } else { 1 })?;
+            let idx_q16 = DeviceBuf::alloc(if has_idx { (mb * s.n_idx_head * s.n_idx_dim) as usize * 2 } else { 1 })?;
             let idx_w = f32s(if has_idx { mb * s.n_idx_head } else { 1 })?;
             let idx_scores = f32s(if has_idx { mb * ctx } else { 1 })?;
             let (normed_a, attn_out_a) = if m.attn_dev.is_some() {
@@ -2480,6 +2483,7 @@ mod real {
                 mla_selected,
                 idx_kcache,
                 idx_kraw,
+                idx_q16,
                 idx_q,
                 idx_w,
                 idx_scores,
@@ -2963,7 +2967,7 @@ mod real {
                                 // batch: every token in a post-boundary
                                 // chunk has >= top_k visible rows (the
                                 // forward_rows split guarantees it)
-                                kernels::idx_scores_batch(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], visible, n_tok, pos0, s.n_idx_head, s.n_idx_dim, scale)?;
+                                kernels::idx_scores_batch(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], Some(&mut st.idx_q16), visible, n_tok, pos0, s.n_idx_head, s.n_idx_dim, scale)?;
                                 kernels::idx_topk_batch(&mut st.mla_selected, &st.idx_scores, visible, n_tok, topk)?;
                             }
                             st.idx_last_sel = topk;
