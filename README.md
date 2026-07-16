@@ -13,20 +13,21 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Seven model architectures on consumer GPUs, running: **Hy3 295B**
+Seven model architectures running on consumer GPUs: **Hy3 295B**
 (hy-v3, GQA), **GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention),
 **Kimi K2.7 1T** (deepseek2, MLA + YaRN), **MiniMax M3** (partial
 rotary, swiglu_oai), **Gemma 4 26B-A4B** (interleaved sliding-window
-attention, dual GELU FFN), and **TML Inkling 1T** (no rope, learned
+attention, dual GELU FFN), **TML Inkling 1T** (no rope, learned
 relative-position bias, shortconv streams, sink router; supported the
-day after release); code-complete, first run pending: **Qwen3-235B/30B**
-(qwen3moe, softmax router). Reference box: RTX 5060 Ti 16GB + RTX
-4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one Gen5 NVMe.
+day after release), and **Qwen3-235B-A22B** (qwen3moe, softmax router;
+correct output on its first-ever run). Reference box: RTX 5060 Ti 16GB +
+RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one Gen5 NVMe.
 
 | Model | Total | Active / token | gguf | Decode, warm | vs ds4, same box |
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **5.3 tok/s** | 0.64–0.70 |
+| Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **4.6 tok/s** | – |
 | MiniMax M3 | 428B | 23B | 134GB (Q2_K_XL) | **3.4 tok/s** | – |
 | GLM-5.2† | 744B | 40B | 197GB (Q2_K_XL) | **2.0 tok/s** | 0.40 |
 | TML Inkling | 975B | 41B (6 + 2 shared) | 296GB (Q2_K_XL) | **1.6 tok/s** | – |
