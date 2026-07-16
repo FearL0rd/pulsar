@@ -2286,29 +2286,11 @@ mod real {
                     mb as usize * n_used * s.n_ff_exp as usize / kernels::Q8_K_BLOCK_ELEMS
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
-                dev_cache: DeviceSlabCache::new(
-                    if kernels::unified_memory() {
-                        // zero-copy resolve: a separate VRAM pool would
-                        // just duplicate the same physical memory
-                        1
-                    } else {
-                        std::env::var("PULSAR_DEV_CACHE_GB")
-                            .ok()
-                            .and_then(|v| v.parse::<usize>().ok())
-                            // with attn on its own GPU the primary has ~15GB
-                            // free; 8GB measured best (32% hits), 10 OOMs
-                            .unwrap_or(match (s.family, m.attn_dev) {
-                                (Family::Mla, Some(_)) => 8,
-                                (Family::Mla, None) => 1,
-                                (Family::Gqa, _) => 3,
-                            })
-                            << 30
-                    },
-                    max_slab,
-                )?,
-                // grow-only: decode stages <=n_used*3 slabs; a batched
-                // prefill union (up to n_expert*3) grows it on first use
-                staging: DeviceBuf::alloc(n_used * 3 * max_slab + SLAB_SLACK)?,
+                // placeholders: the capacity solver below sizes both from
+                // MEASURED free VRAM once every fixed buffer has landed
+                // (unified boxes keep the 1-byte cache: zero-copy resolve)
+                dev_cache: DeviceSlabCache::new(1, max_slab)?,
+                staging: DeviceBuf::alloc(1)?,
                 expert_ptrs: DeviceBuf::alloc(
                     mb as usize * n_used * std::mem::size_of::<ExpertPtrs>(),
                 )?,
@@ -2410,6 +2392,79 @@ mod real {
                     u
                 },
             };
+
+            // ---- capacity solver: size the VRAM budget from MEASUREMENT.
+            // Every fixed buffer has landed, so free VRAM on the primary IS
+            // the pool; family-constant defaults OOM'd three models in one
+            // week. Env knobs still win - the solver only fills what's
+            // unset (PULSAR_DEV_CACHE_GB, PULSAR_BATCH).
+            if !st.unified {
+                let dev_env = std::env::var("PULSAR_DEV_CACHE_GB")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .map(|g| g << 30);
+                let batch_env = std::env::var("PULSAR_BATCH").is_ok();
+                if let Ok((free, _)) = kernels::mem_info(primary) {
+                    // CUDA context growth + allocator slack + kernel scratch
+                    let reserve: usize = 768 << 20;
+                    let pool = free.saturating_sub(reserve);
+                    // prefill staging worst case for chunk c: every routed
+                    // slot distinct until the expert count saturates, sink
+                    // slabs always along (selected by every token). Fused
+                    // gate_up shares one slab. Max over layers: quants vary.
+                    let route_k = (s.n_expert_used - s.n_shexp_sink) as usize;
+                    let stage_worst = |c: usize| -> usize {
+                        let mut worst = 0usize;
+                        for l in m.layers.iter().chain(m.mtp.iter().map(|mt| &mt.layer)) {
+                            let Ffn::Moe { gate_exps, up_exps, down_exps, fused_up_off, sink, .. } = &l.ffn else {
+                                continue;
+                            };
+                            let triple = gate_exps.expert_bytes as usize
+                                + if *fused_up_off != 0 { 0 } else { up_exps.expert_bytes as usize }
+                                + down_exps.expert_bytes as usize;
+                            let distinct = (c * route_k.max(1)).min(s.n_expert as usize);
+                            let mut b = distinct * triple;
+                            if let Some(sk) = sink {
+                                b += s.n_shexp_sink as usize
+                                    * sk.iter().map(|t| t.expert_bytes as usize).sum::<usize>();
+                            }
+                            worst = worst.max(b);
+                        }
+                        worst
+                    };
+                    // chunk: biggest that keeps prefill staging within a
+                    // third of the pool - decode wants the rest as cache
+                    let chunk = if batch_env {
+                        st.max_batch as usize
+                    } else {
+                        let share = pool / 3;
+                        let mut c = st.max_batch as usize;
+                        while c > 4 && stage_worst(c) > share {
+                            c /= 2;
+                        }
+                        c.max(1)
+                    };
+                    // decode floor: one layer's slot resolve always fits
+                    let staging_bytes = stage_worst(chunk).max(n_used * 3 * max_slab);
+                    let dev_bytes = match dev_env {
+                        Some(b) => b.max(1),
+                        None => pool
+                            .saturating_sub(staging_bytes)
+                            .clamp(256 << 20, pool.max(256 << 20)),
+                    };
+                    st.dev_cache = DeviceSlabCache::new(dev_bytes, max_slab)?;
+                    st.staging = DeviceBuf::alloc(staging_bytes + SLAB_SLACK)?;
+                    st.max_batch = (chunk as u32).clamp(1, st.max_batch);
+                    eprintln!(
+                        "pulsar: auto budget: {:.1}GB VRAM free -> expert cache {:.1}GB, staging {:.1}GB, prefill chunk {}",
+                        free as f64 / 1e9,
+                        dev_bytes as f64 / 1e9,
+                        staging_bytes as f64 / 1e9,
+                        st.max_batch,
+                    );
+                }
+            }
+
             let t0 = std::time::Instant::now();
             let warmed = st.load_warm(m)?;
             if warmed > 0 {
