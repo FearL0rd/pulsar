@@ -863,7 +863,7 @@ extern "C" int pulsar_dsv4_selftest(void) {
         cudaMemcpy(dmix, mix, 24 * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dscale, scale, 3 * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dbase, base, 24 * 4, cudaMemcpyHostToDevice);
-        ok &= pulsar_dsv4_sinkhorn(dcoef, dmix, dscale, dbase, NHC, ITERS, eps);
+        ok &= pulsar_dsv4_sinkhorn(dcoef, dmix, dscale, dbase, NHC, ITERS, eps, 1u);
         float got[24];
         cudaMemcpy(got, dcoef, 24 * 4, cudaMemcpyDeviceToHost);
         for (int i = 0; i < 24 && ok; i++) {
