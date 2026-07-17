@@ -403,6 +403,145 @@ extern "C" int pulsar_qwen35_draft_attn(
     return cuda_ok(cudaGetLastError(), "qwen35 draft attn launch");
 }
 
+/* Split the conv output rows [t][2*key+value] into contiguous q/k/v
+ * batch buffers in ONE launch (replaces 3*t blocking d2d copies). */
+__global__ static void qwen35_split_qkv_kernel(
+        float *q, float *k, float *v, const float *x,
+        uint32_t n_tok, uint32_t key_dim, uint32_t value_dim) {
+    const uint32_t conv_dim = 2u * key_dim + value_dim;
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)n_tok * conv_dim;
+    if (idx >= total) return;
+    const uint32_t tok = idx / conv_dim;
+    const uint32_t c = idx % conv_dim;
+    const float val = x[idx];
+    if (c < key_dim) {
+        q[(uint64_t)tok * key_dim + c] = val;
+    } else if (c < 2u * key_dim) {
+        k[(uint64_t)tok * key_dim + (c - key_dim)] = val;
+    } else {
+        v[(uint64_t)tok * value_dim + (c - 2u * key_dim)] = val;
+    }
+}
+
+extern "C" int pulsar_qwen35_split_qkv(
+        void *q_dev, void *k_dev, void *v_dev, const void *x_dev,
+        uint32_t n_tok, uint32_t key_dim, uint32_t value_dim) {
+    if (!q_dev || !k_dev || !v_dev || !x_dev || n_tok == 0 ||
+        key_dim == 0 || value_dim == 0) {
+        return 0;
+    }
+    const uint64_t total = (uint64_t)n_tok * (2u * key_dim + value_dim);
+    qwen35_split_qkv_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)q_dev, (float *)k_dev, (float *)v_dev,
+            (const float *)x_dev, n_tok, key_dim, value_dim);
+    return cuda_ok(cudaGetLastError(), "qwen35 split qkv launch");
+}
+
+/* Ring scatter/gather for the DFlash feature ring (slot = pos % cap):
+ * scatter writes t source rows into ring[(pos+i)%cap][off..off+row);
+ * gather reads n rows from ring[(start+i)%cap] into a contiguous dst.
+ * One launch each (replaces per-row blocking d2d copies). */
+__global__ static void qwen35_ring_scatter_kernel(
+        float *ring, const float *src, uint32_t pos, uint32_t cap,
+        uint32_t n_rows, uint32_t row_elems, uint32_t ring_stride,
+        uint32_t ring_off) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)n_rows * row_elems;
+    if (idx >= total) return;
+    const uint32_t i = idx / row_elems;
+    const uint32_t d = idx % row_elems;
+    const uint32_t slot = (pos + i) % cap;
+    ring[(uint64_t)slot * ring_stride + ring_off + d] = src[idx];
+}
+
+extern "C" int pulsar_qwen35_ring_scatter(
+        void *ring_dev, const void *src_dev, uint32_t pos, uint32_t cap,
+        uint32_t n_rows, uint32_t row_elems, uint32_t ring_stride,
+        uint32_t ring_off) {
+    if (!ring_dev || !src_dev || cap == 0 || n_rows == 0 || row_elems == 0) {
+        return 0;
+    }
+    const uint64_t total = (uint64_t)n_rows * row_elems;
+    qwen35_ring_scatter_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)ring_dev, (const float *)src_dev, pos, cap, n_rows,
+            row_elems, ring_stride, ring_off);
+    return cuda_ok(cudaGetLastError(), "qwen35 ring scatter launch");
+}
+
+__global__ static void qwen35_ring_gather_kernel(
+        float *dst, const float *ring, uint32_t start, uint32_t cap,
+        uint32_t n_rows, uint32_t row_elems) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)n_rows * row_elems;
+    if (idx >= total) return;
+    const uint32_t i = idx / row_elems;
+    const uint32_t d = idx % row_elems;
+    const uint32_t slot = (start + i) % cap;
+    dst[idx] = ring[(uint64_t)slot * row_elems + d];
+}
+
+extern "C" int pulsar_qwen35_ring_gather(
+        void *dst_dev, const void *ring_dev, uint32_t start, uint32_t cap,
+        uint32_t n_rows, uint32_t row_elems) {
+    if (!dst_dev || !ring_dev || cap == 0 || n_rows == 0 || row_elems == 0) {
+        return 0;
+    }
+    const uint64_t total = (uint64_t)n_rows * row_elems;
+    qwen35_ring_gather_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)dst_dev, (const float *)ring_dev, start, cap, n_rows,
+            row_elems);
+    return cuda_ok(cudaGetLastError(), "qwen35 ring gather launch");
+}
+
+/* GDN mixing coefficients on-device (replaces two host readbacks per
+ * GDN layer per forward): g = a * softplus(alpha + dt_bias),
+ * beta = sigmoid(beta_raw). In place over [n_tok][n_head]. */
+__global__ static void qwen35_gdn_coeffs_kernel(
+        float *g_alpha, float *beta, const float *a, const float *dt,
+        uint32_t n_tok, uint32_t n_head) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_tok * n_head) return;
+    const uint32_t h = idx % n_head;
+    const float x = g_alpha[idx] + dt[h];
+    const float sp = x > 20.0f ? x : (x < -20.0f ? expf(x) : log1pf(expf(x)));
+    g_alpha[idx] = a[h] * sp;
+    beta[idx] = 1.0f / (1.0f + expf(-beta[idx]));
+}
+
+extern "C" int pulsar_qwen35_gdn_coeffs(
+        void *g_alpha_dev, void *beta_dev, const void *a_dev,
+        const void *dt_dev, uint32_t n_tok, uint32_t n_head) {
+    if (!g_alpha_dev || !beta_dev || !a_dev || !dt_dev || n_tok == 0 ||
+        n_head == 0) {
+        return 0;
+    }
+    const uint32_t total = n_tok * n_head;
+    qwen35_gdn_coeffs_kernel<<<(total + 255u) / 256u, 256>>>(
+            (float *)g_alpha_dev, (float *)beta_dev, (const float *)a_dev,
+            (const float *)dt_dev, n_tok, n_head);
+    return cuda_ok(cudaGetLastError(), "qwen35 gdn coeffs launch");
+}
+
+/* x[row][:] *= sigmoid(s[row]) (shared-expert scalar gates without the
+ * per-forward host readback). */
+__global__ static void qwen35_row_sigmoid_scale_kernel(
+        float *x, const float *sv, uint32_t n_rows, uint32_t dim) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (uint64_t)n_rows * dim) return;
+    const float g = 1.0f / (1.0f + expf(-sv[idx / dim]));
+    x[idx] *= g;
+}
+
+extern "C" int pulsar_qwen35_row_sigmoid_scale(
+        void *x_dev, const void *s_dev, uint32_t n_rows, uint32_t dim) {
+    if (!x_dev || !s_dev || n_rows == 0 || dim == 0) return 0;
+    const uint64_t total = (uint64_t)n_rows * dim;
+    qwen35_row_sigmoid_scale_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)x_dev, (const float *)s_dev, n_rows, dim);
+    return cuda_ok(cudaGetLastError(), "qwen35 row sigmoid scale launch");
+}
+
 /* NEOX-paired YaRN rope (DFlash draft: trained with rope_scaling yarn
  * factor 64 / orig 4096 on theta 10M - plain rope smears its positions
  * 64x). Pair (i, i+half); cos/sin from the mla yarn helpers (ggml

@@ -566,9 +566,9 @@ mod real {
         conv: DeviceBuf, // f32 [conv_dim][ssm_conv_k]
         alpha_w: DeviceBuf, // f32 [n_embd -> ssm_v_heads]
         beta_w: DeviceBuf,
-        /// host: g = a * softplus(alpha + dt_bias); a stored as -exp(A_log)
-        a: Vec<f32>,
-        dt_bias: Vec<f32>,
+        /// g = a * softplus(alpha + dt_bias); a stored as -exp(A_log)
+        a: DeviceBuf,
+        dt_bias: DeviceBuf,
         ssm_norm: DeviceBuf, // f32 [ssm_state] per-v-head gated rms weight
         ssm_out: DeviceBuf,  // q8_0 [value_dim -> n_embd]
     }
@@ -2012,8 +2012,8 @@ mod real {
                                     conv: upload(&file, &gguf, &t("ssm_conv1d.weight"))?,
                                     alpha_w: upload(&file, &gguf, &t("ssm_alpha.weight"))?,
                                     beta_w: upload(&file, &gguf, &t("ssm_beta.weight"))?,
-                                    a: read_tensor_f32(&file, &gguf, &t("ssm_a"))?,
-                                    dt_bias: read_tensor_f32(&file, &gguf, &t("ssm_dt.bias"))?,
+                                    a: upload(&file, &gguf, &t("ssm_a"))?,
+                                    dt_bias: upload(&file, &gguf, &t("ssm_dt.bias"))?,
                                     ssm_norm: upload(&file, &gguf, &t("ssm_norm.weight"))?,
                                     ssm_out: upload(&file, &gguf, &t("ssm_out.weight"))?,
                                 })

@@ -25,20 +25,6 @@ const T_MAX: usize = 16;
 /// defaults to 2048; v1 keeps the fc cost down with 256).
 const RING_CAP: usize = 256;
 
-fn softplus(x: f32) -> f32 {
-    if x > 20.0 {
-        x
-    } else if x < -20.0 {
-        x.exp()
-    } else {
-        x.exp().ln_1p()
-    }
-}
-
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
 fn argmax(row: &[f32]) -> u32 {
     let mut best = 0usize;
     for (i, &v) in row.iter().enumerate() {
@@ -437,18 +423,17 @@ impl Model {
         // the residual stream ENTERING layer il (= output of layer il-1)
         if let Some(df) = &mut rt.dflash {
             if let Some(idx) = df.layer_ids.iter().position(|&x| x == il) {
-                let feat_w = df.layer_ids.len() * s.n_embd as usize * 4;
-                let row = s.n_embd as usize * 4;
-                for tok in 0..t as usize {
-                    let slot = (pos as usize + tok) % RING_CAP;
-                    kernels::copy_d2d(
-                        &mut df.ring,
-                        slot * feat_w + idx * row,
-                        &st.cur,
-                        tok * row,
-                        row,
-                    )?;
-                }
+                let stride = (df.layer_ids.len() as u32) * s.n_embd;
+                kernels::qwen35_ring_scatter(
+                    &mut df.ring,
+                    &st.cur,
+                    pos,
+                    RING_CAP as u32,
+                    t,
+                    s.n_embd,
+                    stride,
+                    idx as u32 * s.n_embd,
+                )?;
             }
         }
 
@@ -458,37 +443,15 @@ impl Model {
             // ---- Gated DeltaNet (recurrences loop inside the launches)
             kernels::matmul_q8_0(&mut rt.qkv, &gdn.wqkv, &st.normed, s.n_embd, conv_dim, t)?;
             kernels::matmul_q8_0(&mut rt.z, &gdn.wz, &st.normed, s.n_embd, value_dim, t)?;
-            kernels::matmul_f32(&mut rt.small, &gdn.alpha_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
-            kernels::sync()?;
-            let alpha = rt.small.read_f32((t * s.ssm_v_heads) as usize)?;
-            let g: Vec<f32> = alpha
-                .iter()
-                .enumerate()
-                .map(|(i, &al)| {
-                    let h = i % s.ssm_v_heads as usize;
-                    gdn.a[h] * softplus(al + gdn.dt_bias[h])
-                })
-                .collect();
-            rt.g.write(0, kernels::as_bytes(&g))?;
-            kernels::matmul_f32(&mut rt.small, &gdn.beta_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
-            kernels::sync()?;
-            let beta: Vec<f32> = rt
-                .small
-                .read_f32((t * s.ssm_v_heads) as usize)?
-                .iter()
-                .map(|&b| sigmoid(b))
-                .collect();
-            rt.beta.write(0, kernels::as_bytes(&beta))?;
+            // g/beta coefficients fully on-device (no host readbacks)
+            kernels::matmul_f32(&mut rt.g, &gdn.alpha_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
+            kernels::matmul_f32(&mut rt.beta, &gdn.beta_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
+            kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, s.ssm_v_heads)?;
 
             let gs = rt.states[il].as_mut().ok_or("gdn state missing")?;
             kernels::qwen35_conv_batch(&mut rt.conv_out, &rt.qkv, &gdn.conv, &mut gs.conv, conv_dim, s.ssm_conv_k, t)?;
-            // split [q|k|v] rows into contiguous batch buffers
-            let (kd, vd, cd) = (key_dim as usize * 4, value_dim as usize * 4, conv_dim as usize * 4);
-            for tok in 0..t as usize {
-                kernels::copy_d2d(&mut rt.gq, tok * kd, &rt.conv_out, tok * cd, kd)?;
-                kernels::copy_d2d(&mut rt.gk, tok * kd, &rt.conv_out, tok * cd + kd, kd)?;
-                kernels::copy_d2d(&mut rt.gv, tok * vd, &rt.conv_out, tok * cd + 2 * kd, vd)?;
-            }
+            // split [q|k|v] rows into contiguous batch buffers, one launch
+            kernels::qwen35_split_qkv(&mut rt.gq, &mut rt.gk, &mut rt.gv, &rt.conv_out, t, key_dim, value_dim)?;
             kernels::qwen35_l2_norm(&mut rt.gq, t * s.ssm_k_heads, s.ssm_state, eps)?;
             kernels::qwen35_l2_norm(&mut rt.gk, t * s.ssm_k_heads, s.ssm_state, eps)?;
             kernels::qwen35_gdn_batch(
@@ -549,10 +512,7 @@ impl Model {
             kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * s.n_ff_exp, 0.0, 1.0, 0)?;
             kernels::matmul_q8_0(&mut st.shared_out, sd, &st.ffn_mid, s.n_ff_exp, s.n_embd, t)?;
             kernels::matmul_f32(&mut rt.shg, &w.shexp_gate, &st.normed, s.n_embd, 1, t)?;
-            kernels::sync()?;
-            let gl: Vec<f32> = rt.shg.read_f32(t as usize)?.iter().map(|&x| sigmoid(x)).collect();
-            rt.shg.write(0, kernels::as_bytes(&gl))?;
-            kernels::qwen35_row_scale(&mut st.shared_out, &rt.shg, t, s.n_embd)?;
+            kernels::qwen35_row_sigmoid_scale(&mut st.shared_out, &rt.shg, t, s.n_embd)?;
         } else {
             kernels::zero(&mut st.shared_out, (t * s.n_embd) as usize * 4)?;
         }
@@ -577,14 +537,18 @@ impl Model {
         let w_eff = (committed as usize).min(RING_CAP);
         let start = committed as usize - w_eff;
         let feat_w = d.layer_ids.len() * s.n_embd as usize * 4;
-        // gather the window in position order (the ring is slot-keyed)
+        // gather the window in position order (one modulo-gather launch)
         {
             let rt = st.qwen35.as_ref().ok_or("qwen35 state missing")?;
             let df = rt.dflash.as_ref().ok_or("dflash not enabled")?;
-            for i in 0..w_eff {
-                let slot = (start + i) % RING_CAP;
-                kernels::copy_d2d(&mut d.feat_in, i * feat_w, &df.ring, slot * feat_w, feat_w)?;
-            }
+            kernels::qwen35_ring_gather(
+                &mut d.feat_in,
+                &df.ring,
+                (start % RING_CAP) as u32,
+                RING_CAP as u32,
+                w_eff as u32,
+                (feat_w / 4) as u32,
+            )?;
         }
         // noise block: [last_tok, MASK x bs-1] embedded with the target table
         let mut ids: Vec<i32> = vec![d.mask_id as i32; bs];

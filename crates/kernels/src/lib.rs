@@ -125,6 +125,11 @@ mod real {
         fn pulsar_qwen35_row_scale(x: *mut c_void, s: *const c_void, n_rows: u32, dim: u32) -> i32;
         fn pulsar_qwen35_draft_attn(out: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, n_q: u32, n_kv: u32, n_head: u32, n_kv_head: u32, dim: u32, scale: f32) -> i32;
         fn pulsar_qwen35_rope_yarn(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, pos0: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, n_ctx_orig: u32) -> i32;
+        fn pulsar_qwen35_split_qkv(q: *mut c_void, k: *mut c_void, v: *mut c_void, x: *const c_void, n_tok: u32, key_dim: u32, value_dim: u32) -> i32;
+        fn pulsar_qwen35_ring_scatter(ring: *mut c_void, src: *const c_void, pos: u32, cap: u32, n_rows: u32, row_elems: u32, ring_stride: u32, ring_off: u32) -> i32;
+        fn pulsar_qwen35_ring_gather(dst: *mut c_void, ring: *const c_void, start: u32, cap: u32, n_rows: u32, row_elems: u32) -> i32;
+        fn pulsar_qwen35_gdn_coeffs(g_alpha: *mut c_void, beta: *mut c_void, a: *const c_void, dt: *const c_void, n_tok: u32, n_head: u32) -> i32;
+        fn pulsar_qwen35_row_sigmoid_scale(x: *mut c_void, s: *const c_void, n_rows: u32, dim: u32) -> i32;
         fn pulsar_qwen35_selftest() -> i32;
         fn pulsar_mla_kv_lora_rms_norm(out: *mut c_void, kv_raw: *const c_void, w: *const c_void, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> i32;
         fn pulsar_mla_store_compact_kv(kv_lora_cache: *mut c_void, k_rope_cache: *mut c_void, kv_norm: *const c_void, kv_raw: *const c_void, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32) -> i32;
@@ -999,6 +1004,32 @@ mod real {
     /// with rope_scaling yarn; ggml semantics via RopeCfg).
     pub fn qwen35_rope_yarn(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, pos0: u32, r: &RopeCfg) -> Result {
         check(unsafe { pulsar_qwen35_rope_yarn(x.ptr_mut(), n_tok, n_head, head_dim, pos0, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor, r.beta_fast, r.beta_slow, r.n_ctx_orig) }, "qwen35_rope_yarn")
+    }
+
+    /// Split conv rows [t][2*key+value] into contiguous q/k/v buffers.
+    pub fn qwen35_split_qkv(q: &mut DeviceBuf, k: &mut DeviceBuf, v: &mut DeviceBuf, x: &DeviceBuf, n_tok: u32, key_dim: u32, value_dim: u32) -> Result {
+        check(unsafe { pulsar_qwen35_split_qkv(q.ptr_mut(), k.ptr_mut(), v.ptr_mut(), x.ptr(), n_tok, key_dim, value_dim) }, "qwen35_split_qkv")
+    }
+
+    /// Scatter t rows into ring[(pos+i)%cap] at column offset ring_off.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_ring_scatter(ring: &mut DeviceBuf, src: &DeviceBuf, pos: u32, cap: u32, n_rows: u32, row_elems: u32, ring_stride: u32, ring_off: u32) -> Result {
+        check(unsafe { pulsar_qwen35_ring_scatter(ring.ptr_mut(), src.ptr(), pos, cap, n_rows, row_elems, ring_stride, ring_off) }, "qwen35_ring_scatter")
+    }
+
+    /// Gather n rows from ring[(start+i)%cap] into a contiguous dst.
+    pub fn qwen35_ring_gather(dst: &mut DeviceBuf, ring: &DeviceBuf, start: u32, cap: u32, n_rows: u32, row_elems: u32) -> Result {
+        check(unsafe { pulsar_qwen35_ring_gather(dst.ptr_mut(), ring.ptr(), start, cap, n_rows, row_elems) }, "qwen35_ring_gather")
+    }
+
+    /// In place over [n_tok][n_head]: g = a*softplus(g+dt), beta = sigmoid(beta).
+    pub fn qwen35_gdn_coeffs(g_alpha: &mut DeviceBuf, beta: &mut DeviceBuf, a: &DeviceBuf, dt: &DeviceBuf, n_tok: u32, n_head: u32) -> Result {
+        check(unsafe { pulsar_qwen35_gdn_coeffs(g_alpha.ptr_mut(), beta.ptr_mut(), a.ptr(), dt.ptr(), n_tok, n_head) }, "qwen35_gdn_coeffs")
+    }
+
+    /// x[row] *= sigmoid(s[row]).
+    pub fn qwen35_row_sigmoid_scale(x: &mut DeviceBuf, s: &DeviceBuf, n_rows: u32, dim: u32) -> Result {
+        check(unsafe { pulsar_qwen35_row_sigmoid_scale(x.ptr_mut(), s.ptr(), n_rows, dim) }, "qwen35_row_sigmoid_scale")
     }
 
     pub fn qwen35_selftest() -> bool {
