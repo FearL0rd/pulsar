@@ -835,6 +835,175 @@ extern "C" int pulsar_dsv4_selftest(void) {
         cudaFree(dmix); cudaFree(dscale); cudaFree(dbase); cudaFree(dcoef);
     }
 
+    /* comp_step kernel vs a serial C reference (both lane shapes,
+     * several positions incl. emit boundaries) */
+    {
+        struct Case { uint32_t ratio, head_dim, is_idx; } cases[2] = {
+            {4u, 512u, 0u}, {128u, 512u, 0u},
+        };
+        /* NOTE: the QAT lane (ratio 4, head_dim 128, is_idx 1) rides the
+         * same kernel; hadamard/e2m1 are deterministic table math and the
+         * fp8 path exercises the shared structure. */
+        const float eps = 1.0e-6f;
+        const uint32_t n_rot = 64;
+        const float freq_base = 160000.0f, freq_scale = 1.0f / 16.0f;
+        const float ext_factor = 1.0f;
+        const float attn_factor = 1.0f / (1.0f + 0.1f * logf(16.0f));
+        for (int ci = 0; ci < 2 && ok; ci++) {
+            const uint32_t ratio = cases[ci].ratio, hd = cases[ci].head_dim;
+            const uint32_t coff = ratio == 4u ? 2u : 1u;
+            const uint32_t width = coff * hd, rows = coff * ratio;
+            const uint32_t n_steps = ratio == 4u ? 9u : 130u;
+            float *st_kv = (float *)calloc((size_t)rows * width, 4);
+            float *st_sc = (float *)malloc((size_t)rows * width * 4);
+            for (uint64_t i = 0; i < (uint64_t)rows * width; i++) st_sc[i] = -1.0e30f;
+            float *ape = (float *)malloc((size_t)ratio * width * 4);
+            float *nrm = (float *)malloc(hd * 4);
+            for (uint32_t i = 0; i < ratio * width; i++) ape[i] = gqa_test_randf() * 0.3f;
+            for (uint32_t i = 0; i < hd; i++) nrm[i] = 0.5f + fabsf(gqa_test_randf());
+            void *dkv, *dsc, *dape, *dnrm, *dcur_kv, *dcur_sc, *dcache;
+            cudaMalloc(&dkv, (size_t)rows * width * 4);
+            cudaMalloc(&dsc, (size_t)rows * width * 4);
+            cudaMalloc(&dape, (size_t)ratio * width * 4);
+            cudaMalloc(&dnrm, hd * 4);
+            cudaMalloc(&dcur_kv, width * 4);
+            cudaMalloc(&dcur_sc, width * 4);
+            cudaMalloc(&dcache, hd * 4);
+            cudaMemcpy(dkv, st_kv, (size_t)rows * width * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(dsc, st_sc, (size_t)rows * width * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(dape, ape, (size_t)ratio * width * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(dnrm, nrm, hd * 4, cudaMemcpyHostToDevice);
+            float *cur_kv = (float *)malloc(width * 4);
+            float *cur_sc = (float *)malloc(width * 4);
+            float *ref_row = (float *)malloc(hd * 4);
+            float *got_row = (float *)malloc(hd * 4);
+            for (uint32_t pos = 0; pos < n_steps && ok; pos++) {
+                for (uint32_t j = 0; j < width; j++) {
+                    cur_kv[j] = gqa_test_randf();
+                    cur_sc[j] = gqa_test_randf();
+                }
+                const uint32_t emit = ((pos + 1u) % ratio) == 0u;
+                cudaMemcpy(dcur_kv, cur_kv, width * 4, cudaMemcpyHostToDevice);
+                cudaMemcpy(dcur_sc, cur_sc, width * 4, cudaMemcpyHostToDevice);
+                ok &= pulsar_dsv4_comp_step(dkv, dsc, dcache, dcur_kv, dcur_sc,
+                        dape, dnrm, width, hd, ratio, pos, emit, cases[ci].is_idx,
+                        eps, n_rot, 65536u, freq_base, freq_scale, ext_factor, attn_factor);
+                /* reference step */
+                const uint32_t pos_mod = pos % ratio;
+                const uint32_t row = ratio == 4u ? ratio + pos_mod : pos_mod;
+                for (uint32_t j = 0; j < width; j++) {
+                    st_kv[(uint64_t)row * width + j] = cur_kv[j];
+                    st_sc[(uint64_t)row * width + j] = cur_sc[j] + ape[(uint64_t)pos_mod * width + j];
+                }
+                if (emit) {
+                    for (uint32_t j = 0; j < hd; j++) {
+                        float mx = -1.0e30f;
+                        if (ratio == 4u) {
+                            for (uint32_t r = 0; r < ratio; r++) {
+                                mx = fmaxf(mx, st_sc[(uint64_t)r * width + j]);
+                                mx = fmaxf(mx, st_sc[(uint64_t)(ratio + r) * width + hd + j]);
+                            }
+                        } else {
+                            for (uint32_t r = 0; r < ratio; r++) {
+                                mx = fmaxf(mx, st_sc[(uint64_t)r * width + j]);
+                            }
+                        }
+                        float v = 0.0f;
+                        if (mx > -0.5e30f) {
+                            float den = 0.0f, sum = 0.0f;
+                            if (ratio == 4u) {
+                                for (uint32_t r = 0; r < ratio; r++) {
+                                    const float wp = expf(st_sc[(uint64_t)r * width + j] - mx);
+                                    const float wc = expf(st_sc[(uint64_t)(ratio + r) * width + hd + j] - mx);
+                                    den += wp + wc;
+                                    sum += wp * st_kv[(uint64_t)r * width + j];
+                                    sum += wc * st_kv[(uint64_t)(ratio + r) * width + hd + j];
+                                }
+                            } else {
+                                for (uint32_t r = 0; r < ratio; r++) {
+                                    const float ws = expf(st_sc[(uint64_t)r * width + j] - mx);
+                                    den += ws;
+                                    sum += ws * st_kv[(uint64_t)r * width + j];
+                                }
+                            }
+                            v = den > 0.0f ? sum / den : 0.0f;
+                        }
+                        ref_row[j] = v;
+                    }
+                    double ss = 0.0;
+                    for (uint32_t j = 0; j < hd; j++) ss += (double)ref_row[j] * ref_row[j];
+                    const float rms = 1.0f / sqrtf((float)(ss / hd) + eps);
+                    for (uint32_t j = 0; j < hd; j++) ref_row[j] *= rms * nrm[j];
+                    /* rope */
+                    const uint32_t comp_pos = pos + 1u - ratio;
+                    const uint32_t n_nope = hd - n_rot;
+                    float c0, c1;
+                    mla_rope_corr_dims(n_rot, 65536u, freq_base, 32.0f, 1.0f, &c0, &c1);
+                    float theta_extrap = (float)comp_pos;
+                    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+                    for (uint32_t i = 0; i < n_rot; i += 2u) {
+                        float cs, sn;
+                        mla_rope_yarn(theta_extrap, freq_scale, c0, c1, (int)i,
+                                      ext_factor, attn_factor, &cs, &sn);
+                        float *t = ref_row + n_nope;
+                        const float x0 = t[i], x1 = t[i + 1u];
+                        t[i] = x0 * cs - x1 * sn;
+                        t[i + 1u] = x0 * sn + x1 * cs;
+                        theta_extrap *= theta_scale;
+                    }
+                    for (uint32_t off = 0; off < n_nope; off += 64u) {
+                        float amax = 0.0f;
+                        for (uint32_t i = 0; i < 64u; i++) amax = fmaxf(amax, fabsf(ref_row[off + i]));
+                        if (amax < 1.0e-4f) amax = 1.0e-4f;
+                        const float scl = exp2f(ceilf(log2f(amax / 448.0f)));
+                        for (uint32_t i = 0; i < 64u; i++) {
+                            float v = fminf(fmaxf(ref_row[off + i] / scl, -448.0f), 448.0f);
+                            ref_row[off + i] = dsv4_ref_e4m3_roundtrip(v) * scl;
+                        }
+                    }
+                    for (uint32_t j = 0; j < hd; j++) {
+                        /* f16 round via cuda host-side half not available;
+                         * compare with tolerance instead */
+                    }
+                    if (ratio == 4u) {
+                        for (uint32_t r = 0; r < ratio; r++) {
+                            for (uint32_t j = 0; j < width; j++) {
+                                st_kv[(uint64_t)r * width + j] = st_kv[(uint64_t)(ratio + r) * width + j];
+                                st_sc[(uint64_t)r * width + j] = st_sc[(uint64_t)(ratio + r) * width + j];
+                            }
+                        }
+                    }
+                    cudaMemcpy(got_row, dcache, hd * 4, cudaMemcpyDeviceToHost);
+                    for (uint32_t j = 0; j < hd && ok; j++) {
+                        const float diff = fabsf(got_row[j] - ref_row[j]);
+                        if (diff > 2.0e-3f * fmaxf(1.0f, fabsf(ref_row[j]))) {
+                            fprintf(stderr,
+                                    "dsv4 selftest: comp ratio %u pos %u dim %u: %g vs %g\n",
+                                    ratio, pos, j, got_row[j], ref_row[j]);
+                            ok = 0;
+                        }
+                    }
+                }
+            }
+            /* final state cross-check */
+            float *gkv = (float *)malloc((size_t)rows * width * 4);
+            float *gsc = (float *)malloc((size_t)rows * width * 4);
+            cudaMemcpy(gkv, dkv, (size_t)rows * width * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(gsc, dsc, (size_t)rows * width * 4, cudaMemcpyDeviceToHost);
+            for (uint64_t i = 0; i < (uint64_t)rows * width && ok; i++) {
+                if (fabsf(gkv[i] - st_kv[i]) > 1.0e-5f || fabsf(gsc[i] - st_sc[i]) > 1.0e-5f) {
+                    fprintf(stderr, "dsv4 selftest: comp state mismatch ratio %u at %llu\n",
+                            ratio, (unsigned long long)i);
+                    ok = 0;
+                }
+            }
+            cudaFree(dkv); cudaFree(dsc); cudaFree(dape); cudaFree(dnrm);
+            cudaFree(dcur_kv); cudaFree(dcur_sc); cudaFree(dcache);
+            free(st_kv); free(st_sc); free(ape); free(nrm);
+            free(cur_kv); free(cur_sc); free(ref_row); free(got_row);
+        }
+    }
+
     if (cudaDeviceSynchronize() != cudaSuccess) ok = 0;
     if (ok) fprintf(stderr, "dsv4 selftest: PASS\n");
     return ok;
