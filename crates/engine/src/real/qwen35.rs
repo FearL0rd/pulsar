@@ -237,7 +237,8 @@ pub struct DraftModel {
     n_embd: u32,
     ff: u32,
     // scratch
-    feat: DeviceBuf, // [RING_CAP][n_embd] fused features
+    feat_in: DeviceBuf, // [RING_CAP][n_capture*n_embd] window gather
+    feat: DeviceBuf,    // [RING_CAP][n_embd] fused features
     h: DeviceBuf,    // [16][n_embd] block hidden
     hn: DeviceBuf,
     q: DeviceBuf,    // [16][n_head*dim]
