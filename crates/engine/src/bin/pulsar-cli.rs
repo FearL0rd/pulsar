@@ -301,6 +301,46 @@ fn run() -> engine::Result {
         return Ok(());
     }
 
+    // DFlash speculative decode (qwen35moe + a matched block-diffusion
+    // draft gguf): PULSAR_DFLASH=/path/to/draft.gguf, greedy one-shot
+    if let (Ok(draft_path), None) = (std::env::var("PULSAR_DFLASH"), dump_logits.as_ref()) {
+        let mut draft = engine::DraftModel::load(std::path::Path::new(&draft_path))?;
+        eprintln!("pulsar: dflash draft loaded ({draft_path})");
+        let mut generated: Vec<u32> = Vec::new();
+        let mut t_first: Option<std::time::Instant> = None;
+        let out = std::io::stdout();
+        engine::generate_dflash(
+            &model,
+            &mut draft,
+            &mut st,
+            &prompt_ids,
+            0,
+            n_predict,
+            |t| tok.is_eog(t),
+            |t| {
+                t_first.get_or_insert_with(std::time::Instant::now);
+                generated.push(t);
+                use std::io::Write;
+                let mut o = out.lock();
+                o.write_all(&tok.decode(&[t])).ok();
+                o.flush().ok();
+            },
+        )?;
+        println!();
+        st.save_warm(&model)?;
+        let dt = t_first.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
+        eprintln!(
+            "pulsar: {} tokens in {:.2}s ({:.2} tok/s), dflash {}/{} drafts accepted ({:.0}%)\npulsar: ids {generated:?}",
+            generated.len(),
+            dt,
+            generated.len() as f32 / dt.max(1e-6),
+            st.mtp_accepted,
+            st.mtp_drafted,
+            100.0 * st.mtp_accepted as f64 / st.mtp_drafted.max(1) as f64
+        );
+        return Ok(());
+    }
+
     // MTP speculative decode routes through engine::generate (the spec
     // loop lives there); greedy-only, so the one-shot default applies
     if (std::env::var("PULSAR_MTP").ok().as_deref() == Some("1")

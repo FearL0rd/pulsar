@@ -2736,6 +2736,8 @@ mod real {
             // win; activations at 512 cost only ~150MB
             let spec_rows = (m.mtp_depth + 1)
                 .max(2)
+                // qwen35 DFlash verify reads logits for a whole 16-row block
+                .max(if s.family == Family::Qwen35 { 16 } else { 0 })
                 .max(
                     std::env::var("PULSAR_NGRAM")
                         .ok()
