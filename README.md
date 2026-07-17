@@ -316,20 +316,21 @@ batched target forward verifies the block, recurrent state snapshots
 roll back rejections). The machinery works - structured text accepts
 whole 16-blocks - but it ships opt-in experimental
 (`PULSAR_DFLASH=draft.gguf`) because on the reference box it is
-net-slower (8.7 vs ~35 tok/s): a 16-row verify runs 16x the expert-dot
-work of a sequential token, and the iq3/iq4 dequant compute dominates
-once the weights are resident. The hybrid families do get resident
-expert tiers now (the spare card serves ~98% of expert slots at VRAM
-speed - that took DFlash from 6.1 to 8.7 and cost sequential decode
-nothing), and the profile pins the rest: tensor-core MoE unpackers for
-iq3_xxs/iq4_xs (decode each expert block once per verify instead of
-once per row), acceptance tuning, fast state rollback.
+net-slower (14.5 vs ~36 tok/s). Two rounds of profiling closed most of
+the gap already: hybrid families now get resident expert tiers (the
+spare card serves ~98% of expert slots at VRAM speed), and verify-size
+chunks route through the grouped tensor-core MoE on the tier card
+(each expert block decodes to int8 smem once per launch instead of
+once per row) - together 6.1 -> 14.5 tok/s with sequential decode
+untouched. What remains is acceptance (2.8 of 15 drafted per round on
+a Q3 target against a bf16-trained draft; the break-even is ~6) and
+fast state rollback.
 
 Not yet:
 
-- DFlash perf pass, remaining: iq3_xxs/iq4_xs unpackers for the
-  grouped tensor-core MoE (the verify-cost fix), draft context-KV
-  ring + acceptance tuning, fast GDN rollback
+- DFlash perf pass, remaining: acceptance tuning (Q4 target, bigger
+  feature window, draft context-KV ring), fast GDN rollback,
+  token-tiled K-quant lm head
 - deepseek4 perf pass: batched prefill (prompts currently process
   sequentially), resident tiers + cross-layer prefetch for the dsv4
   resolve, fewer host syncs on the hyper-connection gates

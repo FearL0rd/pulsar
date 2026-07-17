@@ -161,12 +161,21 @@ equivalents + draft (~1ms) and commits accept_n+bonus (lucebox measures
 ## dots re-decode iq3_xxs/iq4_xs per token. Round commits ~2.8 tokens
 ## for ~12 sequential-tokens of work.
 ##
+## GROUPED VERIFY DONE (same night): the iq3_xxs/iq4_xs unpackers
+## already existed in the MMA dispatch (roadmap note was stale) - the
+## gap was the lean resolve never building the CSR. Tier launches now
+## route verify-size chunks (n_tok >= 16) through the grouped
+## tensor-core kernels: verify 260 -> 107ms, DFlash 8.7 -> 14.5 tok/s.
+## Sequential untouched (36.3). Round now: draft 47 + verify 107 +
+## replay ~18/tok, committing ~2.8.
+##
 ## Remaining moves, in value order:
-## 1. unpack16_iq3_xxs + unpack16_iq4_xs (~40 lines each) -> the
-##    task-#15 grouped-MMA MoE kernels decode each expert superblock
-##    to int8 smem ONCE per launch. Est. verify 260 -> 60-90ms.
-## 2. acceptance 2.8 -> 6+: Q4_K_XL target (feature noise vs the
+## 1. acceptance 2.8 -> 6+: Q4_K_XL target (feature noise vs the
 ##    bf16-trained draft), RING_CAP 2048, draft ctx-KV cache ring.
-## 3. fast rollback (per-position GDN input stash) drops the replay.
-## Break-even math: round_ms / 25ms-per-sequential-token < commits.
-## All three land ~2x over sequential; any one alone does not flip it.
+##    At 6 commits/round the current round cost is ~29ms/token = break
+##    even; with #2 it wins.
+## 2. fast rollback (per-position GDN input stash) drops the replay
+##    (~50ms/round at current acceptance).
+## 3. draft + verify both pay ~24ms in head_logits over the q6_K vocab
+##    (row bytes re-read per token; the q8_0 head path has a tensor-
+##    core GEMM). Requant the head at load or token-tile matmul_kq.
