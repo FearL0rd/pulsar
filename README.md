@@ -41,8 +41,8 @@ Gen5 NVMe.
 | Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 22GB (Q4_K_XL) | **51.8 tok/s** | – |
 | DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **8.0 tok/s** (11.4 w/ CPU lane) | – |
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **5.3 tok/s** (7.0 w/ CPU lane) | 0.64–0.70 |
-| Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **4.6 tok/s** | – |
-| MiniMax M3 | 428B | 23B | 134GB (Q2_K_XL) | **3.4 tok/s** | – |
+| Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **5.3 tok/s** (6.4 w/ CPU lane) | – |
+| MiniMax M3 | 428B | 23B | 134GB (Q2_K_XL) | **4.5 tok/s** | – |
 | GLM-5.2 | 744B | 40B | 211GB (ds4 recipe) | **1.7 tok/s** (1.9–2.8 w/ CPU lane) | 0.40 |
 | TML Inkling | 975B | 41B (6 + 2 shared) | 296GB (Q2_K_XL) | **1.6 tok/s** | – |
 | Kimi K2.7 Code† | ~1T | 32B | 339GB (Q2_K_XL) | **1.3 tok/s** | – |
@@ -87,8 +87,10 @@ upload bandwidth and VRAM cache slots, so both effects compound:
 DeepSeek-V4-Flash measures 8.1 to 11.4 tok/s (+41%), Hy3 5.0 to 7.0
 (+40%), GLM-5.2 1.6 to 2.8 on good runs. GLM's exact gain varies run
 to run with how the cache ecology settles (the floor stays at
-baseline). Covers every iq2_xxs/q2_K expert mix, which includes the
-Q2_K_XL giants (Qwen3-235B, MiniMax M3, Kimi, Inkling).
+baseline). Covers iq2_xxs, q2_K, q3_K and q4_K expert tensors, which
+spans the ds4 recipes and UD-Q2_K_XL mixes like Qwen3-235B (5.3 to
+6.4, +21%). MiniMax M3's mix quantizes experts to IQ2_XS/IQ3_XXS, not
+yet covered.
 
 Decode rate slides with output length on the streaming models: a longer
 generation routes to a wider set of experts, so the disk-miss fraction
