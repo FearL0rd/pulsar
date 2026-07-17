@@ -58,11 +58,13 @@ compute-bound, not streaming-bound.
 to free disk); the sustained rate is likely a little lower than shown, as
 GLM-5.2's re-measurement confirmed (2.0 -> 1.7).
 
-DeepSeek-V4-Flash prefill currently runs at decode speed: the V4 graph's
-sliding-window ring and streaming KV compressor are per-token state
-machines, and the first port processes prompts sequentially. Long-context
-retrieval works (needle recall at 2.4k ctx through compressed rows with
-live indexer top-k masking); batched prefill is on the roadmap.
+DeepSeek-V4-Flash runs its state machines (sliding-window ring,
+streaming KV compressor, Sinkhorn hyper-connection gates) fully on
+device and prefills in batched 16-token chunks (~14 tok/s prefill,
+2.7x the first port; one router readback and one expert union per
+chunk-layer, with the per-token ring/compressor/attention interleave
+preserved bit-exactly). Long-context retrieval verified by needle
+recall at 2.4k ctx through compressed rows.
 
 Decode rate slides with output length on the streaming models: a longer
 generation routes to a wider set of experts, so the disk-miss fraction

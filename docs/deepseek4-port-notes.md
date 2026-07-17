@@ -195,7 +195,18 @@ still TODO). prefill has a batch path + compressor_finish_prefill_state.
 ## (device expf vs host exp ulps - the documented drift class).
 ## Tiers arrived earlier the same day (5.9 -> 8.0).
 ##
-## PHASE 2 (next session): chunked batched prefill. On-device state
+## PHASE 2 DONE (2026-07-17, same session): chunked batched prefill
+## SHIPPED. 16-chunks: matmuls/norms/rope/hc/router/shexp/MoE batched
+## (ONE router readback + ONE grouped-tier MoE union per chunk-layer);
+## ring append + comp steps + attention stay per-token inside the
+## chunk (the load-bearing interleave); indexer masking regime (ctx >
+## 2048ish) gates chunks back to single-token. MEASURED: needle
+## prefill 2368 tokens 460s -> 169s (5.1 -> 14.0 tok/s, 2.7x), ids
+## BYTE-IDENTICAL, decode unchanged (7.9), selftests + Hy3 gate green.
+## Remaining prefill wall: the per-(token,group) grouped-out launches
+## (128/layer/chunk) and per-token attention - CUDA-graph territory.
+##
+## PHASE 2 original design notes: chunked batched prefill. On-device state
 ## makes it feasible; layer flow = batched [hc_pre/norms/q-kv/rope/
 ## fp8] -> per-token sequential [ring append, comp steps, attention]
 ## -> batched [un-rope, grouped out, hc_post, ONE union MoE per chunk
