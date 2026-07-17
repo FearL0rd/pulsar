@@ -1260,6 +1260,19 @@ mod real {
             }
         }
 
+        /// quants the lane can compute; extend together with dot()
+        pub fn supported(quant: u32) -> bool {
+            quant == kernels::QUANT_IQ2_XXS || quant == kernels::QUANT_Q2_K
+        }
+
+        pub fn dot(quant: u32, row: &[u8], xq: &quant::cpu_dot::Q8KRow, n: usize) -> f32 {
+            if quant == kernels::QUANT_Q2_K {
+                quant::cpu_dot::vec_dot_q2_k_q8_k(row, xq, n)
+            } else {
+                quant::cpu_dot::vec_dot_iq2_xxs_q8_k(row, xq, n)
+            }
+        }
+
         /// mirrors pulsar_glu in pulsar_kernels.cu (0 = silu, 1 = gelu
         /// tanh, 2 = swiglu_oai, 3 = deepseek4 clamped silu)
         pub fn glu(g: f32, u: f32, op: u32) -> f32 {
@@ -3893,9 +3906,10 @@ mod real {
                             && !st.unified
                             && s.n_embd % 256 == 0
                             && s.n_ff_exp % 256 == 0
-                            && [gate_exps.quant, up_exps.quant, down_exps.quant]
+                            && gate_exps.quant == up_exps.quant
+                            && [gate_exps.quant, down_exps.quant]
                                 .iter()
-                                .all(|&q| q == kernels::QUANT_IQ2_XXS);
+                                .all(|&q| cpu_tier::supported(q));
                         let n_used = s.n_expert_used as usize;
                         let (ne, nf) = (s.n_embd as usize, s.n_ff_exp as usize);
                         let mut cpu_idx: std::collections::HashMap<i32, usize> =
@@ -3969,6 +3983,7 @@ mod real {
                             cpu_mids = vec![0f32; npairs * nf];
                             let act_op = s.moe_act_op;
                             let grb = gate_exps.row_bytes as usize;
+                            let gq = gate_exps.quant;
                             let xq_ptr = cpu_tier::SendPtr(cpu_xqs.as_ptr() as *const u8);
                             let mut jobs: Vec<cpu_tier::Job> = Vec::new();
                             let mut mid_base = 0usize;
@@ -3993,12 +4008,8 @@ mod real {
                                                 let xq = &*(xq_ptr.get()
                                                     as *const quant::cpu_dot::Q8KRow)
                                                     .add(tok);
-                                                let g = quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
-                                                    g_row, xq, ne,
-                                                );
-                                                let u = quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
-                                                    u_row, xq, ne,
-                                                );
+                                                let g = cpu_tier::dot(gq, g_row, xq, ne);
+                                                let u = cpu_tier::dot(gq, u_row, xq, ne);
                                                 *mid.get().add(pi * nf + j) =
                                                     cpu_tier::glu(g, u, act_op) * w;
                                             }
@@ -4373,6 +4384,7 @@ mod real {
                             }
                             let mut acc = vec![0f32; n_tok as usize * ne];
                             let drb = down_exps.row_bytes as usize;
+                            let dq = down_exps.quant;
                             let acc_ptr = cpu_tier::SendMut(acc.as_mut_ptr());
                             let midq_ptr = cpu_tier::SendPtr(midq.as_ptr() as *const u8);
                             let mut jobs: Vec<cpu_tier::Job> = Vec::new();
@@ -4393,9 +4405,7 @@ mod real {
                                                 let mq = &*(midq_ptr.get()
                                                     as *const quant::cpu_dot::Q8KRow)
                                                     .add(mi);
-                                                sum += quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
-                                                    row, mq, nf,
-                                                );
+                                                sum += cpu_tier::dot(dq, row, mq, nf);
                                             }
                                             *acc_ptr.get().add(t * ne + r) = sum;
                                         }

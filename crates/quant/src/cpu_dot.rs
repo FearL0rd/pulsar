@@ -15,10 +15,12 @@ pub const QK_K: usize = 256;
 /// iq2_xxs: 2 bytes f16 d + 16 u32 per 256 values
 pub const IQ2_XXS_BLOCK_BYTES: usize = 2 + 64;
 
-/// q8_K activation row: one f32 scale + 256 i8 per block.
+/// q8_K activation row: one f32 scale + 256 i8 per block, plus the 16
+/// per-16-value group sums the K-quant min terms need (ggml's bsums).
 pub struct Q8KRow {
     pub d: Vec<f32>,
     pub qs: Vec<i8>,
+    pub bsums: Vec<i32>,
 }
 
 /// ggml quantize_row_q8_K: d = amax/127, q = round(x/d).
@@ -26,7 +28,7 @@ pub fn quantize_row_q8_k(x: &[f32]) -> Q8KRow {
     debug_assert_eq!(x.len() % QK_K, 0);
     let nb = x.len() / QK_K;
     let mut d = Vec::with_capacity(nb);
-    let mut qs = Vec::with_capacity(x.len());
+    let mut qs: Vec<i8> = Vec::with_capacity(x.len());
     for b in x.chunks_exact(QK_K) {
         let amax = b.iter().fold(0f32, |a, &v| a.max(v.abs()));
         if amax == 0.0 {
@@ -41,7 +43,11 @@ pub fn quantize_row_q8_k(x: &[f32]) -> Q8KRow {
             qs.push((v * inv).round().clamp(-127.0, 127.0) as i8);
         }
     }
-    Q8KRow { d, qs }
+    let bsums = qs
+        .chunks_exact(16)
+        .map(|g| g.iter().map(|&q| q as i32).sum())
+        .collect();
+    Q8KRow { d, qs, bsums }
 }
 
 #[inline]
@@ -146,6 +152,53 @@ mod avx2 {
     }
     static KSIGNS64: [u64; 128] = build_ksigns64();
 
+    /// q2_K: per (k-half, shift) one 32-byte unpack ((v >> 2s) & 3 via
+    /// 16-bit shifts, the cross-byte bits die on the mask), maddubs with
+    /// q8, madd with the two 16-group scales split across lanes.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vec_dot_q2k(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+        let nb = n / QK_K;
+        debug_assert!(row.len() >= nb * Q2_K_BLOCK_BYTES);
+        let low2 = _mm256_set1_epi8(3);
+        let mut total = 0f32;
+        for ibl in 0..nb {
+            let blk = row.as_ptr().add(ibl * Q2_K_BLOCK_BYTES);
+            let sc = std::slice::from_raw_parts(blk, 16);
+            let xd = f16_to_f32(u16::from_le_bytes([*blk.add(80), *blk.add(81)]));
+            let xmin = f16_to_f32(u16::from_le_bytes([*blk.add(82), *blk.add(83)]));
+            let q8 = x.qs.as_ptr().add(ibl * QK_K);
+            let bs = &x.bsums[ibl * 16..(ibl + 1) * 16];
+            let mut summs = 0i32;
+            for j in 0..16 {
+                summs += bs[j] * (sc[j] >> 4) as i32;
+            }
+            let mut acc = _mm256_setzero_si256();
+            let mut is = 0;
+            for k in 0..2 {
+                let q2v = _mm256_loadu_si256(blk.add(16 + 32 * k) as *const __m256i);
+                for shift in 0..4 {
+                    let q = _mm256_and_si256(_mm256_srli_epi16(q2v, 2 * shift), low2);
+                    let q8v =
+                        _mm256_loadu_si256(q8.add(128 * k + 32 * shift) as *const __m256i);
+                    let d16 = _mm256_maddubs_epi16(q, q8v);
+                    let scv = _mm256_set_m128i(
+                        _mm_set1_epi16((sc[is + 1] & 0x0f) as i16),
+                        _mm_set1_epi16((sc[is] & 0x0f) as i16),
+                    );
+                    is += 2;
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(d16, scv));
+                }
+            }
+            let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+            let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
+            let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
+            let isum = _mm_cvtsi128_si32(s);
+            total += *x.d.get_unchecked(ibl) * xd * isum as f32
+                - *x.d.get_unchecked(ibl) * xmin * summs as f32;
+        }
+        total
+    }
+
     #[target_feature(enable = "avx2")]
     pub unsafe fn vec_dot(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
         let t = tables();
@@ -188,6 +241,58 @@ mod avx2 {
         }
         total
     }
+}
+
+/// q2_K: 84 bytes per 256 values - scales[16] (lo nibble = scale, hi =
+/// min), qs[64] (2-bit, unsigned 0..3), f16 d + f16 dmin. Mirrors
+/// dev_dot_q2_K_q8_K_block in pulsar_kernels.cu: dall*isum - dmin*summs
+/// with summs = sum(bsums[j] * (sc[j]>>4)).
+pub const Q2_K_BLOCK_BYTES: usize = 16 + 64 + 2 + 2;
+
+pub fn vec_dot_q2_k_q8_k(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { avx2::vec_dot_q2k(row, x, n) };
+    }
+    vec_dot_q2_k_q8_k_scalar(row, x, n)
+}
+
+/// Scalar reference/fallback.
+pub fn vec_dot_q2_k_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+    debug_assert_eq!(n % QK_K, 0);
+    let nb = n / QK_K;
+    debug_assert!(row.len() >= nb * Q2_K_BLOCK_BYTES);
+    let mut total = 0f32;
+    for ibl in 0..nb {
+        let blk = &row[ibl * Q2_K_BLOCK_BYTES..(ibl + 1) * Q2_K_BLOCK_BYTES];
+        let (sc, q2) = (&blk[..16], &blk[16..80]);
+        let xd = f16_to_f32(u16::from_le_bytes([blk[80], blk[81]]));
+        let xmin = f16_to_f32(u16::from_le_bytes([blk[82], blk[83]]));
+        let q8 = &x.qs[ibl * QK_K..(ibl + 1) * QK_K];
+        let bs = &x.bsums[ibl * 16..(ibl + 1) * 16];
+        let mut summs = 0i32;
+        for j in 0..16 {
+            summs += bs[j] * (sc[j] >> 4) as i32;
+        }
+        let mut isum = 0i32;
+        let mut is = 0;
+        for k in 0..2 {
+            for shift in [0u8, 2, 4, 6] {
+                for half in 0..2 {
+                    let d = (sc[is] & 0x0f) as i32;
+                    is += 1;
+                    let mut sumi = 0i32;
+                    for i in 0..16 {
+                        let q = ((q2[32 * k + 16 * half + i] >> shift) & 3) as i32;
+                        sumi += q * q8[128 * k + 32 * (shift as usize / 2) + 16 * half + i] as i32;
+                    }
+                    isum += d * sumi;
+                }
+            }
+        }
+        total += x.d[ibl] * xd * isum as f32 - x.d[ibl] * xmin * summs as f32;
+    }
+    total
 }
 
 /// Scalar dequant of an iq2_xxs row to f32 (unit-test reference only).
@@ -248,6 +353,59 @@ mod tests {
         // and the quantization itself must be sane vs the true dot
         let true_dot: f64 = src.iter().zip(&act).map(|(&a, &b)| a as f64 * b as f64).sum();
         assert!(reference.signum() == true_dot.signum() || true_dot.abs() < 1.0);
+    }
+
+    /// q2_K dequant reference straight from the format: value chunk c
+    /// (16 values) uses scale sc[c], q2 byte 32*(c/8) + 16*(c%2), shift
+    /// 2*((c%8)/2).
+    fn dequant_q2_k(row: &[u8], n: usize, out: &mut Vec<f32>) {
+        out.clear();
+        for ibl in 0..n / QK_K {
+            let blk = &row[ibl * Q2_K_BLOCK_BYTES..(ibl + 1) * Q2_K_BLOCK_BYTES];
+            let (sc, q2) = (&blk[..16], &blk[16..80]);
+            let xd = f16_to_f32(u16::from_le_bytes([blk[80], blk[81]]));
+            let xmin = f16_to_f32(u16::from_le_bytes([blk[82], blk[83]]));
+            for c in 0..16 {
+                let (k, js, half) = (c / 8, (c % 8) / 2, c % 2);
+                for i in 0..16 {
+                    let q = (q2[32 * k + 16 * half + i] >> (2 * js)) & 3;
+                    out.push(
+                        xd * (sc[c] & 0x0f) as f32 * q as f32 - xmin * (sc[c] >> 4) as f32,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q2k_dot_matches_dequant_and_scalar() {
+        let n = 5120;
+        let mut st = 99u64;
+        // random bytes are a valid q2_K row; cap the f16 d/dmin exponents
+        // so the reference stays finite
+        let nb = n / QK_K;
+        let mut row = vec![0u8; nb * Q2_K_BLOCK_BYTES];
+        for b in row.iter_mut() {
+            *b = (lcg(&mut st) * 127.0 + 128.0) as u8;
+        }
+        for ibl in 0..nb {
+            let o = ibl * Q2_K_BLOCK_BYTES;
+            row[o + 81] &= 0x3b; // d exponent small
+            row[o + 83] &= 0x3b; // dmin exponent small
+        }
+        let act: Vec<f32> = (0..n).map(|_| lcg(&mut st)).collect();
+        let xq = quantize_row_q8_k(&act);
+        let got = vec_dot_q2_k_q8_k_scalar(&row, &xq, n);
+        let mut deq = Vec::new();
+        dequant_q2_k(&row, n, &mut deq);
+        let mut reference = 0f64;
+        for i in 0..n {
+            reference += deq[i] as f64 * (xq.d[i / QK_K] as f64 * xq.qs[i] as f64);
+        }
+        let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
+        assert!(rel < 1e-4, "q2k dot {got} vs reference {reference} (rel {rel})");
+        let simd = vec_dot_q2_k_q8_k(&row, &xq, n);
+        assert_eq!(simd.to_bits(), got.to_bits(), "q2k simd {simd} vs scalar {got}");
     }
 
     /// bsum is exact integer math in both paths and the float ops run in
