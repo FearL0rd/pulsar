@@ -1015,6 +1015,18 @@ impl Model {
         // tier partials first: their kernels run on the other card,
         // overlapping the primary's MoE below (st.normed still holds
         // the FFN input in both hybrid layer graphs)
+        //
+        // Verify-size chunks route through the grouped tensor-core MoE
+        // (CSR of tokens per expert; each expert block decodes to int8
+        // smem ONCE per launch instead of once per row - the dp4a path
+        // re-decodes iq3/iq4 codebooks per slot, which measured as THE
+        // DFlash verify cost at 6.5ms/layer).
+        let grouped = n_tok >= 16
+            && s.n_expert_used <= 16
+            && s.n_ff_exp % 256 == 0
+            && 2 * gate_exps.row_bytes.max(up_exps.row_bytes) * 4 <= 49152
+            && down_exps.row_bytes * 4 <= 49152
+            && std::env::var_os("PULSAR_NO_GROUPED").is_none();
         let mut active = Vec::new();
         for ti in 0..st.tiers.len() {
             if tier_slots[ti] == 0 {
@@ -1027,17 +1039,70 @@ impl Model {
             kernels::copy_across(&mut tier.xin, &st.normed, normed_bytes)?;
             kernels::copy_across(&mut tier.weights, &st.router_weights, weight_bytes)?;
             kernels::set_device(tier.dev)?;
-            tier.ptrs.write(0, kernels::as_bytes(&tptrs[ti]))?;
             kernels::quantize_q8_k(&mut tier.xq, &tier.xin, s.n_embd, n_tok)?;
-            kernels::moe_pair_swiglu(
-                &mut tier.mid, &tier.ptrs, &tier.weights, &tier.xq,
-                s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, act_op,
-            )?;
-            kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
-            kernels::moe_down(
-                &mut tier.out, &tier.ptrs, &tier.midq,
-                s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
-            )?;
+            let mut ran_grouped = false;
+            if grouped {
+                // CSR: distinct expert -> [(token << 4) | slot]
+                let mut gid: std::collections::HashMap<*const std::ffi::c_void, u32> =
+                    std::collections::HashMap::new();
+                let mut gptrs: Vec<kernels::ExpertPtrs> = Vec::new();
+                let mut members: Vec<Vec<u32>> = Vec::new();
+                for (si, p) in tptrs[ti].iter().enumerate() {
+                    if p.gate.is_null() {
+                        continue;
+                    }
+                    let g = *gid.entry(p.gate).or_insert_with(|| {
+                        gptrs.push(*p);
+                        members.push(Vec::new());
+                        (gptrs.len() - 1) as u32
+                    });
+                    let token = (si / s.n_expert_used as usize) as u32;
+                    let slot = (si % s.n_expert_used as usize) as u32;
+                    members[g as usize].push((token << 4) | slot);
+                }
+                let n_group = gptrs.len() as u32;
+                if n_group > 0 {
+                    let mut starts = Vec::with_capacity(n_group as usize + 1);
+                    let mut pairs = Vec::new();
+                    starts.push(0u32);
+                    for m in &members {
+                        pairs.extend_from_slice(m);
+                        starts.push(pairs.len() as u32);
+                    }
+                    tier.grp_ptrs.write(0, kernels::as_bytes(&gptrs))?;
+                    tier.grp_starts.write(0, kernels::as_bytes(&starts))?;
+                    tier.grp_pairs.write(0, kernels::as_bytes(&pairs))?;
+                    kernels::moe_pair_swiglu_grouped(
+                        &mut tier.mid, &tier.grp_ptrs, &tier.grp_starts, &tier.grp_pairs,
+                        &tier.weights, &tier.xq,
+                        s.n_embd, s.n_ff_exp, s.n_expert_used, n_group,
+                        gate_exps.row_bytes, gate_exps.quant, act_op,
+                    )?;
+                    kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                    let pbytes = n_tok as usize * s.n_expert_used as usize * s.n_embd as usize * 4;
+                    kernels::zero(&mut tier.grp_partial, pbytes)?;
+                    kernels::moe_down_grouped(
+                        &mut tier.grp_partial, &tier.grp_ptrs, &tier.grp_starts, &tier.grp_pairs,
+                        &tier.midq,
+                        s.n_ff_exp, s.n_embd, s.n_expert_used, n_group,
+                        down_exps.row_bytes, down_exps.quant,
+                    )?;
+                    kernels::moe_slot_sum(&mut tier.out, &tier.grp_partial, s.n_embd, s.n_expert_used, n_tok)?;
+                    ran_grouped = true;
+                }
+            }
+            if !ran_grouped {
+                tier.ptrs.write(0, kernels::as_bytes(&tptrs[ti]))?;
+                kernels::moe_pair_swiglu(
+                    &mut tier.mid, &tier.ptrs, &tier.weights, &tier.xq,
+                    s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, act_op,
+                )?;
+                kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                kernels::moe_down(
+                    &mut tier.out, &tier.ptrs, &tier.midq,
+                    s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+                )?;
+            }
             kernels::set_device(primary)?;
             active.push(ti);
         }

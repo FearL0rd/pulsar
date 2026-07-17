@@ -885,6 +885,12 @@ mod real {
         /// stream-ordered); 1-byte dummies elsewhere
         ptrs_sink: DeviceBuf,
         out_sink: DeviceBuf,
+        /// grouped batch-MoE CSR scratch (hybrid-family verify/prefill
+        /// chunks run the tensor-core kernels ON the tier card)
+        grp_ptrs: DeviceBuf,
+        grp_starts: DeviceBuf,
+        grp_pairs: DeviceBuf,
+        grp_partial: DeviceBuf,
         pub hits: u64,
     }
 
@@ -2383,6 +2389,13 @@ mod real {
                 } else {
                     DeviceBuf::alloc(1)?
                 },
+                grp_ptrs: DeviceBuf::alloc(s.n_expert.max(1) as usize * std::mem::size_of::<ExpertPtrs>())?,
+                grp_starts: DeviceBuf::alloc((s.n_expert as usize + 1) * 4)?,
+                grp_pairs: DeviceBuf::alloc(mb as usize * n_used * 4)?,
+                grp_partial: DeviceBuf::alloc(
+                    // hybrid verify chunks cap at 16 tokens
+                    16 * n_used * s.n_embd as usize * 4,
+                )?,
                 hits: 0,
             };
             let mut cursor = 0usize;
