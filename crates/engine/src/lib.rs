@@ -4019,13 +4019,14 @@ mod real {
                                 continue;
                             }
                             if cpu_idx.contains_key(&e) {
-                                // CPU-lane experts: no fetch, no upload;
-                                // keep their VRAM-census heat warm like the
-                                // tier branch does
-                                for (t, le) in slabs_of(e as u32) {
-                                    let off = off_of(t, le);
-                                    st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
-                                }
+                                // CPU-lane experts: no fetch, no upload,
+                                // and NO census touch - bumping their heat
+                                // gets them VRAM-seeded at next load, which
+                                // evicts them from the lane and churns the
+                                // cache equilibrium run to run (measured:
+                                // GLM oscillated 1.6-2.8 tok/s). Store LFU
+                                // heat via peek_ptr keeps them host-cached;
+                                // frozen census keeps them CPU-owned.
                                 continue;
                             }
                             for (t, le) in slabs_of(e as u32) {
