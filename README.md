@@ -38,7 +38,7 @@ Gen5 NVMe.
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
 | Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 22GB (Q4_K_XL) | **51.8 tok/s** | – |
-| DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **5.9 tok/s** | – |
+| DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **8.0 tok/s** | – |
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **5.3 tok/s** | 0.64–0.70 |
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **4.6 tok/s** | – |
 | MiniMax M3 | 428B | 23B | 134GB (Q2_K_XL) | **3.4 tok/s** | – |
