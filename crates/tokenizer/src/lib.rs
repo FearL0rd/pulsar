@@ -94,6 +94,10 @@ enum ChatStyle {
     /// assistant-marker </think> ... (DeepSeek V3/V4 lineage; ds4's
     /// ds4_chat_append_message with thinking off)
     Deepseek,
+    /// [gMASK]<sop> prologue, then <|system|>\ntext <|user|>\ntext
+    /// <|assistant|>\n ... (GLM 4/5 lineage; role tokens delimit turns,
+    /// stops are the role tokens themselves + <|endoftext|>)
+    Glm,
 }
 
 pub struct ChatMarkers {
@@ -191,6 +195,21 @@ impl ChatMarkers {
                 stops: t.stop_ids.clone(),
             });
         }
+        if t.find_token("<sop>").is_some() && t.find_token("<|user|>").is_some() {
+            // GLM 4/5: [gMASK]<sop> opens the conversation (prologue()),
+            // dedicated role tokens, no per-turn closers
+            return Ok(ChatMarkers {
+                style: ChatStyle::Glm,
+                bos: t.find_token("[gMASK]"),
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: None,
+                user: find("<|user|>")?,
+                assistant: find("<|assistant|>")?,
+                aux0: find("<|system|>")?,
+                aux1: find("<sop>")?,
+                stops: t.stop_ids.clone(),
+            });
+        }
         if t.find_token("<|im_start|>").is_some() {
             // Qwen ChatML: <|im_start|> opens every turn, <|im_end|> closes
             return Ok(ChatMarkers {
@@ -216,6 +235,15 @@ impl ChatMarkers {
             aux1: find("</think:opensource>")?,
             stops: t.stop_ids.clone(),
         })
+    }
+
+    /// Conversation prologue: bos for most styles, [gMASK]<sop> for GLM.
+    pub fn prologue(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.bos.into_iter().collect();
+        if self.style == ChatStyle::Glm {
+            v.push(self.aux1);
+        }
+        v
     }
 
     /// System text ids for the first turn (Hy3: bare text after bos).
@@ -250,6 +278,11 @@ impl ChatMarkers {
                 v.extend(t.encode(&format!("system\n{text}")));
                 v.push(self.aux0);
                 v.extend(t.encode("\n"));
+                v
+            }
+            ChatStyle::Glm => {
+                let mut v = vec![self.aux0];
+                v.extend(t.encode(&format!("\n{text}")));
                 v
             }
             ChatStyle::Inkling => {
@@ -294,6 +327,11 @@ impl ChatMarkers {
                 v.extend(t.encode("\n"));
                 v
             }
+            ChatStyle::Glm => {
+                let mut v = vec![self.user];
+                v.extend(t.encode(&format!("\n{text}")));
+                v
+            }
             ChatStyle::Inkling => {
                 let mut v = vec![self.user, self.aux1];
                 v.extend(t.encode(text));
@@ -303,7 +341,7 @@ impl ChatMarkers {
         }
     }
 
-    /// The assistant opener; generation starts right after it.
+    /// The assistant opener; generation starts right after this.
     pub fn open_assistant(&self, t: &Tokenizer) -> Vec<u32> {
         match self.style {
             ChatStyle::Hy3 => vec![self.assistant, self.aux0, self.aux1],
@@ -333,6 +371,18 @@ impl ChatMarkers {
                 v.push(self.aux1); // <mm:think>: thinking-enabled prefix
                 v
             }
+            ChatStyle::Glm => {
+                let mut v = vec![self.assistant];
+                v.extend(t.encode("\n"));
+                // thinking off when the vocab carries think tokens
+                if let (Some(ts), Some(te)) =
+                    (t.find_token("<think>"), t.find_token("</think>"))
+                {
+                    v.extend([ts, te]);
+                    v.extend(t.encode("\n"));
+                }
+                v
+            }
             // bare <|message_model|>: the model emits its own content-
             // kind marker (thinking or text)
             ChatStyle::Inkling => vec![self.assistant],
@@ -350,6 +400,9 @@ impl ChatMarkers {
         }
         let mut v = self.open_assistant(t);
         v.extend(t.encode(text));
+        if self.style == ChatStyle::Glm {
+            return v; // next role token delimits the turn
+        }
         v.push(self.eot.unwrap_or(self.eos));
         if matches!(self.style, ChatStyle::ChatMl | ChatStyle::Gemma | ChatStyle::MiniMax) {
             v.extend(t.encode("\n"));

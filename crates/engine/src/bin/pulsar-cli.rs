@@ -88,7 +88,7 @@ fn run_chat(
 
         let mut ids = Vec::new();
         if first {
-            ids.extend(markers.bos);
+            ids.extend(markers.prologue());
             if let Some(sys) = &system {
                 ids.extend(markers.render_system(tok, sys));
             }
