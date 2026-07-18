@@ -1,7 +1,7 @@
 //! pulsar-serve: OpenAI-compatible chat completions over the pulsar
 //! engine.
 //!
-//!   pulsar-serve -m model.gguf [--port 11435] [--ctx 8192]
+//!   pulsar-serve -m model.gguf [--port 11435] [--host 127.0.0.1] [--ctx 8192]
 //!
 //! Endpoints: GET /v1/models, POST /v1/chat/completions (stream and
 //! non-stream). One engine, one request at a time, prefill from position
@@ -30,6 +30,7 @@ fn run() -> engine::Result {
 
     let mut model_path = None;
     let mut port = 11435u16;
+    let mut host = String::from("127.0.0.1");
     let mut ctx = 8192u32;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -37,6 +38,7 @@ fn run() -> engine::Result {
         match a.as_str() {
             "-m" => model_path = Some(need("-m")?),
             "--port" => port = need("--port")?.parse()?,
+            "--host" => host = need("--host")?.to_string(),
             "--ctx" => ctx = need("--ctx")?.parse()?,
             other => return Err(format!("unknown arg {other}").into()),
         }
@@ -62,8 +64,8 @@ fn run() -> engine::Result {
         .and_then(gguf::Value::as_f32)
         .unwrap_or(0.9);
 
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
-    eprintln!("pulsar-serve: listening on http://127.0.0.1:{port}/v1");
+    let listener = std::net::TcpListener::bind((host.as_str(), port))?;
+    eprintln!("pulsar-serve: listening on http://{host}:{port}/v1");
 
     let mut request_id = 0u64;
     for stream in listener.incoming() {
@@ -157,7 +159,7 @@ fn encode_messages(
     m: &tokenizer::ChatMarkers,
     messages: &[serde_json::Value],
 ) -> Vec<u32> {
-    let mut ids: Vec<u32> = m.bos.into_iter().collect();
+    let mut ids: Vec<u32> = m.prologue();
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("");
         let content = msg["content"].as_str().unwrap_or("");
