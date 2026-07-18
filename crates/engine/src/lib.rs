@@ -969,6 +969,7 @@ mod real {
         }
 
         /// Free `slot` and every other slot sharing its group (whole triple).
+        /// Only for triple-unit admit/evict — never for single-slab runtime admits.
         fn free_group_of(&mut self, slot: u32) {
             let g = self.meta[slot as usize].2;
             if g == u32::MAX {
@@ -1009,10 +1010,14 @@ mod real {
             self.map.get(&offset).map(|&slot| self.slot_ptr(slot))
         }
 
-        /// Admit `payload` if it is hotter than the coldest resident (or a
-        /// slot is free). Returns None when the slab is not worthy - the
-        /// caller streams it through staging instead. `in_use` offsets are
-        /// never evicted. Ungrouped singleton (runtime cold-path admits).
+        /// Admit `payload` if it is hotter than the coldest *ungrouped*
+        /// resident (or a free slot exists). Returns None when the slab is
+        /// not worthy - the caller streams it through staging instead.
+        ///
+        /// Critical: never evict a warm-loaded triple member for a singleton
+        /// admit. Breaking triples filled VRAM with incomplete experts and
+        /// collapsed slab hit rate 72% -> 53% (measured). Triple groups are
+        /// only replaced by `maybe_insert_triple`.
         fn maybe_insert(
             &mut self,
             offset: u64,
@@ -1026,25 +1031,25 @@ mod real {
             let slot = match self.meta.iter().position(|m| m.1 == u64::MAX) {
                 Some(free) => free as u32,
                 None => {
+                    // only steal UNGROUPED slots (group == u32::MAX)
                     let Some((victim, vmeta)) = self
                         .meta
                         .iter()
                         .enumerate()
-                        .filter(|(_, m)| m.1 != u64::MAX && !in_use.contains(&m.1))
+                        .filter(|(_, m)| {
+                            m.1 != u64::MAX && m.2 == u32::MAX && !in_use.contains(&m.1)
+                        })
                         .min_by_key(|(_, m)| m.0)
                     else {
+                        // pool is all warm triples - leave them; stage instead
                         return Ok(None);
                     };
                     if vmeta.0 >= freq {
                         return Ok(None);
                     }
                     let victim = victim as u32;
-                    // free whole triple if the victim was group-admitted
-                    self.free_group_of(victim);
-                    match self.meta.iter().position(|m| m.1 == u64::MAX) {
-                        Some(free) => free as u32,
-                        None => return Ok(None),
-                    }
+                    self.free_slot(victim);
+                    victim
                 }
             };
             let base = slot as usize * self.slab_bytes;
@@ -1204,17 +1209,25 @@ mod real {
             if missing.is_empty() {
                 return Ok(());
             }
-            // evict lowest (freq, tick) not wanted right now
-            // ponytail: O(n) scan per eviction; heap it if the cache ever
-            // holds >100k entries
+            // Evict lowest (freq, tick) among a strided SAMPLE of eligible
+            // entries. Full min scans over ~40k host slabs burned seconds
+            // into resolve "disk/host"; take(64) alone was iteration-order
+            // biased and thrashy.
             let incoming: usize = missing.iter().map(|r| r.len as usize).sum();
+            const EVICT_SAMPLE: usize = 64;
             while self.used + incoming > self.budget && !self.cache.is_empty() {
+                let n = self.cache.len().max(1);
+                let step = (n / EVICT_SAMPLE).max(1);
                 let victim = self
                     .cache
                     .iter()
                     .filter(|(k, _)| {
                         !wants.iter().any(|w| w.offset == **k) && !self.pinned.contains(k)
                     })
+                    .enumerate()
+                    .filter(|(i, _)| i % step == 0)
+                    .map(|(_, kv)| kv)
+                    .take(EVICT_SAMPLE)
                     .min_by_key(|(_, e)| (e.freq, e.tick))
                     .map(|(k, _)| *k);
                 let Some(k) = victim else { break };
@@ -1285,11 +1298,18 @@ mod real {
                 return;
             }
             let incoming = slab.bytes();
+            const EVICT_SAMPLE: usize = 64;
             while self.used + incoming > self.budget && !self.cache.is_empty() {
+                let n = self.cache.len().max(1);
+                let step = (n / EVICT_SAMPLE).max(1);
                 let victim = self
                     .cache
                     .iter()
                     .filter(|(k, _)| !self.pinned.contains(k))
+                    .enumerate()
+                    .filter(|(i, _)| i % step == 0)
+                    .map(|(_, kv)| kv)
+                    .take(EVICT_SAMPLE)
                     .min_by_key(|(_, e)| (e.freq, e.tick))
                     .map(|(k, _)| *k);
                 let Some(k) = victim else { break };
@@ -4242,8 +4262,6 @@ mod real {
                             if pf.layer == il {
                                 if pf.recorded {
                                     let t = std::time::Instant::now();
-                                    // host-side sync: destination is ready and
-                                    // source host buffers may be freed after
                                     st.expert_h2d.synchronize()?;
                                     st.expert_h2d.wait_default()?;
                                     st.prof.h2d += t.elapsed();
@@ -4252,9 +4270,12 @@ mod real {
                                     resolved.insert(off, p);
                                 }
                             } else if pf.recorded {
-                                // stale prediction — drain the stream so a
-                                // later free of host slabs is safe
+                                // stale prediction — must drain DMA before
+                                // absorb can free host sources; count as h2d
+                                // so it does not pollute disk/host
+                                let t = std::time::Instant::now();
                                 let _ = st.expert_h2d.synchronize();
+                                st.prof.h2d += t.elapsed();
                             }
                         }
                         // absorb whatever the disk prefetcher finished
@@ -4721,14 +4742,15 @@ mod real {
                             kernels::add_assign(&mut st.moe_out, &st.ffn_out, n_tok * s.n_embd)?;
                         }
 
-                        // Cross-layer async H2D: while MoE kernels run on the
-                        // default stream, copy the *predicted* next-layer
-                        // expert slabs into staging_alt. Next layer's resolve
-                        // claims the map (wait_default) and skips re-upload
-                        // when the prediction was right.
+                        // Cross-layer async H2D (OPT-IN: PULSAR_H2D_PREFETCH=1).
+                        // Wrong predictions leave a recorded event that the next
+                        // layer must host-synchronize before absorb — that wait
+                        // lands in resolve "disk/host" and cost ~seconds on GLM.
+                        // Same-layer async H2D (above) stays on by default.
                         if st.async_expert_h2d
                             && !st.unified
                             && n_tok == 1
+                            && std::env::var_os("PULSAR_H2D_PREFETCH").is_some()
                             && std::env::var_os("PULSAR_NO_PREFETCH").is_none()
                         {
                             if let Some((_, _, next_exps)) = &next_moe {
