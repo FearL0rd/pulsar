@@ -195,6 +195,7 @@ fn handle_chat(
         .ok_or("chat request needs a messages array")?;
     let temp = req["temperature"].as_f64().map(|v| v as f32).unwrap_or(default_temp);
     let top_p = req["top_p"].as_f64().map(|v| v as f32).unwrap_or(1.0);
+    let min_p = req["min_p"].as_f64().map(|v| v as f32).unwrap_or(0.0);
     let max_tokens = req["max_tokens"].as_u64().unwrap_or(1024) as usize;
     let seed = req["seed"].as_u64().unwrap_or(42);
     let streaming = req["stream"].as_bool().unwrap_or(false);
@@ -210,7 +211,7 @@ fn handle_chat(
             &serde_json::json!({"error": {"message": "prompt exceeds context"}}),
         );
     }
-    let mut sampler = engine::Sampler::new(temp, top_p, 0.0, seed);
+    let mut sampler = engine::Sampler::new(temp, top_p, min_p, seed);
     let id = format!("chatcmpl-{request_id}");
 
     if streaming {
