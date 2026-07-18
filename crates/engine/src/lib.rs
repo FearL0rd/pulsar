@@ -747,6 +747,12 @@ mod real {
     pub struct Prof {
         pub sync: std::time::Duration,
         pub resolve: std::time::Duration,
+        /// D2H of router_selected / pred_selected inside resolve
+        pub resolve_d2h: std::time::Duration,
+        /// distinct/offsets/wants/tier placement list building
+        pub resolve_lists: std::time::Duration,
+        /// host LFU ensure_with wall minus nested h2d (disk wait + cache hits)
+        pub resolve_host: std::time::Duration,
         pub h2d: std::time::Duration,
         /// CPU expert lane wall time after the stage-A overlap (mid
         /// quantize + down-proj fan-out + join)
@@ -758,12 +764,17 @@ mod real {
     impl Prof {
         pub fn report(&self) -> String {
             let s = |d: std::time::Duration| d.as_secs_f64();
+            let accounted = self.resolve_d2h + self.resolve_lists + self.resolve_host + self.h2d;
+            let other = self.resolve.saturating_sub(accounted);
             format!(
-                "gpu-wait {:.2}s, resolve {:.2}s (h2d {:.2}s, disk/host {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
+                "gpu-wait {:.2}s, resolve {:.2}s (d2h {:.2}s, lists {:.2}s, host {:.2}s, h2d {:.2}s, other {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
                 s(self.sync),
                 s(self.resolve),
+                s(self.resolve_d2h),
+                s(self.resolve_lists),
+                s(self.resolve_host),
                 s(self.h2d),
-                s(self.resolve) - s(self.h2d),
+                s(other),
                 s(self.cpu),
                 s(self.tail),
                 self.calls
@@ -934,6 +945,10 @@ mod real {
         /// per slot: (touch count at admission, offset, group); offset
         /// u64::MAX = free; group u32::MAX = ungrouped singleton
         meta: Vec<(u64, u64, u32)>,
+        /// free slot indices (O(1) take; rebuild not required)
+        free_list: Vec<u32>,
+        /// occupied slots with group == u32::MAX (singleton admits only)
+        ungrouped: u32,
         /// global (touch count, slab len) per requested offset, cached or not
         touch: std::collections::HashMap<u64, (u64, u64)>,
         next_group: u32,
@@ -949,6 +964,8 @@ mod real {
                 slab_bytes,
                 map: std::collections::HashMap::with_capacity(slots),
                 meta: vec![(0, u64::MAX, u32::MAX); slots],
+                free_list: (0..slots as u32).collect(),
+                ungrouped: 0,
                 touch: std::collections::HashMap::new(),
                 next_group: 1,
                 hits: 0,
@@ -962,10 +979,16 @@ mod real {
 
         fn free_slot(&mut self, slot: u32) {
             let off = self.meta[slot as usize].1;
-            if off != u64::MAX {
-                self.map.remove(&off);
+            if off == u64::MAX {
+                return; // already free
             }
+            let g = self.meta[slot as usize].2;
+            if g == u32::MAX {
+                self.ungrouped = self.ungrouped.saturating_sub(1);
+            }
+            self.map.remove(&off);
             self.meta[slot as usize] = (0, u64::MAX, u32::MAX);
+            self.free_list.push(slot);
         }
 
         /// Free `slot` and every other slot sharing its group (whole triple).
@@ -1018,6 +1041,9 @@ mod real {
         /// admit. Breaking triples filled VRAM with incomplete experts and
         /// collapsed slab hit rate 72% -> 53% (measured). Triple groups are
         /// only replaced by `maybe_insert_triple`.
+        ///
+        /// After warm fill the pool is usually all triples: free_list empty
+        /// and ungrouped==0 → O(1) early-out (stage path).
         fn maybe_insert(
             &mut self,
             offset: u64,
@@ -1027,34 +1053,38 @@ mod real {
             if let Some(slot) = self.map.get(&offset).copied() {
                 return Ok(Some(self.slot_ptr(slot)));
             }
+            // O(1): nothing singleton-admittable left (warm pool is all triples)
+            if self.free_list.is_empty() && self.ungrouped == 0 {
+                return Ok(None);
+            }
             let freq = self.touch.get(&offset).map(|t| t.0).unwrap_or(0);
-            let slot = match self.meta.iter().position(|m| m.1 == u64::MAX) {
-                Some(free) => free as u32,
-                None => {
-                    // only steal UNGROUPED slots (group == u32::MAX)
-                    let Some((victim, vmeta)) = self
-                        .meta
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, m)| {
-                            m.1 != u64::MAX && m.2 == u32::MAX && !in_use.contains(&m.1)
-                        })
-                        .min_by_key(|(_, m)| m.0)
-                    else {
-                        // pool is all warm triples - leave them; stage instead
-                        return Ok(None);
-                    };
-                    if vmeta.0 >= freq {
-                        return Ok(None);
-                    }
-                    let victim = victim as u32;
-                    self.free_slot(victim);
-                    victim
+            let slot = if let Some(free) = self.free_list.pop() {
+                free
+            } else {
+                // only steal UNGROUPED slots (group == u32::MAX)
+                let Some((victim, vmeta)) = self
+                    .meta
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| {
+                        m.1 != u64::MAX && m.2 == u32::MAX && !in_use.contains(&m.1)
+                    })
+                    .min_by_key(|(_, m)| m.0)
+                else {
+                    return Ok(None);
+                };
+                if vmeta.0 >= freq {
+                    return Ok(None);
                 }
+                let victim = victim as u32;
+                self.free_slot(victim); // pushes victim onto free_list
+                self.free_list.pop().ok_or("free_list empty after free_slot")?
             };
+            debug_assert_eq!(self.meta[slot as usize].1, u64::MAX);
             let base = slot as usize * self.slab_bytes;
             self.pool.write(base, payload)?;
             self.meta[slot as usize] = (freq, offset, u32::MAX);
+            self.ungrouped += 1;
             self.map.insert(offset, slot);
             Ok(Some(self.slot_ptr(slot)))
         }
@@ -1084,16 +1114,7 @@ mod real {
                 .map(|(off, _)| self.touch.get(off).map(|t| t.0).unwrap_or(0))
                 .sum();
             // free slots already available
-            let mut free: Vec<u32> = self
-                .meta
-                .iter()
-                .enumerate()
-                .filter(|(_, m)| m.1 == u64::MAX)
-                .map(|(i, _)| i as u32)
-                .collect();
-            // evict coldest freeable groups until we have enough free slots
-            while free.len() < need.len() {
-                // candidate slots: occupied, not in_use, rank by freq
+            while self.free_list.len() < need.len() {
                 let mut cands: Vec<(u32, u64, u32)> = self
                     .meta
                     .iter()
@@ -1106,7 +1127,6 @@ mod real {
                 }
                 cands.sort_by_key(|c| c.1);
                 let (victim, vfreq, _) = cands[0];
-                // group heat = sum of member freqs; compare to incoming heat
                 let g = self.meta[victim as usize].2;
                 let group_heat: u64 = if g == u32::MAX {
                     vfreq
@@ -1121,21 +1141,15 @@ mod real {
                     return Ok(None);
                 }
                 self.free_group_of(victim);
-                free = self
-                    .meta
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, m)| m.1 == u64::MAX)
-                    .map(|(i, _)| i as u32)
-                    .collect();
             }
             let gid = self.next_group;
             self.next_group = self.next_group.wrapping_add(1).max(1);
             for (j, (i, off, payload)) in need.iter().enumerate() {
-                let slot = free[j];
+                let slot = self.free_list.pop().ok_or("triple admit: free_list empty")?;
                 let base = slot as usize * self.slab_bytes;
                 self.pool.write(base, payload)?;
                 let freq = self.touch.get(off).map(|t| t.0).unwrap_or(0);
+                debug_assert_eq!(self.meta[slot as usize].1, u64::MAX);
                 self.meta[slot as usize] = (freq, *off, gid);
                 self.map.insert(*off, slot);
                 ptrs[*i] = self.slot_ptr(slot);
@@ -4197,13 +4211,19 @@ mod real {
                         kernels::sync()?;
                         st.prof.sync += t_sync.elapsed();
                         let t_resolve = std::time::Instant::now();
+                        let t_d2h = std::time::Instant::now();
                         let selected = st
                             .router_selected
                             .read_i32(n_tok as usize * s.n_expert_used as usize)?;
-                        if let Some((_, _, next_exps)) = &next_moe {
-                            let pred = st.pred_selected.read_i32(s.n_expert_used as usize)?;
+                        let pred_ids = if next_moe.is_some() {
+                            Some(st.pred_selected.read_i32(s.n_expert_used as usize)?)
+                        } else {
+                            None
+                        };
+                        st.prof.resolve_d2h += t_d2h.elapsed();
+                        if let (Some((_, _, next_exps)), Some(pred)) = (&next_moe, &pred_ids) {
                             let mut reads = Vec::with_capacity(3 * pred.len());
-                            for &e in &pred {
+                            for &e in pred {
                                 if e < 0 || e as u32 >= s.n_expert {
                                     continue;
                                 }
@@ -4282,6 +4302,7 @@ mod real {
                         while let Ok((off, slab)) = st.prefetcher.done_rx.try_recv() {
                             st.store.absorb(off, slab);
                         }
+                        let t_lists = std::time::Instant::now();
                         // gate/up/down may use different quants (K-quant
                         // recipes put ffn_down a tier higher); staging
                         // slots are strided by the largest of the three
@@ -4305,43 +4326,43 @@ mod real {
                             }
                         };
                         let off_of = |t: &ExpertTensor, le: u64| t.abs_offset + le * t.expert_bytes;
-                        // resident-tier experts compute on their own card;
-                        // they are never fetched, cached, or staged here.
-                        // Sink ids resolve into the tier too (their census
-                        // heat ranks them first at placement) - the bool
-                        // says which launch pair serves them.
-                        let tier_of = |e: i32| -> Option<(usize, ExpertPtrs, bool)> {
+                        // resolve tier placement once per distinct expert
+                        // (was recomputed in cpu/offsets/ptrs loops)
+                        let mut tier_place: std::collections::HashMap<
+                            i32,
+                            (usize, ExpertPtrs, bool),
+                        > = std::collections::HashMap::with_capacity(distinct.len());
+                        for &e in &distinct {
                             let is_sink = e as u32 >= s.n_expert;
                             let [g3, u3, d3] = slabs_of(e as u32);
                             let g = off_of(g3.0, g3.1);
-                            // resident MTP experts beat a tier copy (same
-                            // device as the compute, no partial gather)
                             if !is_sink
                                 && self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&g))
                             {
-                                return None;
+                                continue;
                             }
-                            st.tiers.iter().enumerate().find_map(|(ti, t)| {
+                            if let Some(place) = st.tiers.iter().enumerate().find_map(|(ti, t)| {
                                 let gate = *t.map.get(&g)?;
-                                Some((ti, ExpertPtrs {
-                                    gate,
-                                    up: byte_off(
-                                        *t.map.get(&off_of(u3.0, u3.1))?,
-                                        if is_sink { 0 } else { *fused_up_off },
-                                    ),
-                                    down: *t.map.get(&off_of(d3.0, d3.1))?,
-                                }, is_sink))
-                            })
-                        };
-                        // CPU expert lane (PULSAR_CPU=1): iq2_xxs experts
-                        // whose three slabs all sit in the host cache (and
-                        // none in VRAM) never cross PCIe - the worker pool
-                        // dots them from store memory under the GPU resolve
-                        // and a ~20KB f32 partial joins moe_out after the
-                        // tier gather. Decode-shaped batches only: prefill
-                        // amortizes each upload across the whole chunk, so
-                        // the GPU wins there. Float order differs from the
-                        // single-kernel path (same drift class as tiers).
+                                Some((
+                                    ti,
+                                    ExpertPtrs {
+                                        gate,
+                                        up: byte_off(
+                                            *t.map.get(&off_of(u3.0, u3.1))?,
+                                            if is_sink { 0 } else { *fused_up_off },
+                                        ),
+                                        down: *t.map.get(&off_of(d3.0, d3.1))?,
+                                    },
+                                    is_sink,
+                                ))
+                            }) {
+                                tier_place.insert(e, place);
+                            }
+                        }
+                        let tier_of =
+                            |e: i32| -> Option<(usize, ExpertPtrs, bool)> { tier_place.get(&e).copied() };
+                        // CPU expert lane (PULSAR_CPU=1): host-cache-hit
+                        // experts compute on CPU; decode-shaped batches only.
                         let cpu_on = st.cpu_pool.is_some()
                             && n_tok <= 8
                             && !st.unified
@@ -4372,10 +4393,6 @@ mod real {
                                 let [g3, u3, d3] = slabs_of(e as u32);
                                 let (go, uo, dno) =
                                     (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
-                                // host-cached => CPU lane, even when a slab
-                                // also sits in dev_cache: exclusion made
-                                // ownership a first-touch race, bistable
-                                // run to run (GLM oscillated 1.6-2.8).
                                 if self
                                     .mtp
                                     .as_ref()
@@ -4396,8 +4413,10 @@ mod real {
                             st.store.pinned = pins;
                         }
                         if !lane.is_empty() {
+                            let t_cpu_d2h = std::time::Instant::now();
                             let rw = st.router_weights.read_f32(n_tok as usize * n_used)?;
                             let normed_h = st.normed.read_f32(n_tok as usize * ne)?;
+                            st.prof.resolve_d2h += t_cpu_d2h.elapsed();
                             let pool = st.cpu_pool.as_ref().unwrap();
                             cpu_guard = Some(cpu_tier::WaitGuard {
                                 pool,
@@ -4408,8 +4427,6 @@ mod real {
                             Vec::with_capacity(3 * distinct.len());
                         for &e in &distinct {
                             if tier_of(e).is_some() {
-                                // keep the census warm for resident slabs
-                                // or their heat freezes at placement time
                                 for (t, le) in slabs_of(e as u32) {
                                     let off = off_of(t, le);
                                     st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
@@ -4417,10 +4434,6 @@ mod real {
                                 continue;
                             }
                             if lane.idx.contains_key(&e) {
-                                // CPU-lane experts: no fetch, no upload,
-                                // and NO census touch - bumping their heat
-                                // gets them VRAM-seeded at next load, which
-                                // churns the cache equilibrium run to run.
                                 continue;
                             }
                             for (t, le) in slabs_of(e as u32) {
@@ -4428,8 +4441,6 @@ mod real {
                                     offset: off_of(t, le),
                                     len: t.expert_bytes,
                                 };
-                                // fused gate_up: gate and up share a slab -
-                                // one read serves both
                                 if offsets.last().map(|l: &stream::Read| l.offset) != Some(r.offset) {
                                     offsets.push(r);
                                 }
@@ -4438,8 +4449,6 @@ mod real {
                         let in_use: Vec<u64> = offsets.iter().map(|r| r.offset).collect();
                         let mut wants = Vec::new();
                         for r in &offsets {
-                            // MTP draft-layer experts are fully resident on
-                            // the primary - never cached, never fetched
                             if let Some(mt) = &self.mtp {
                                 if let Some(&po) = mt.res_map.get(&r.offset) {
                                     resolved.insert(r.offset, mt.res_pool.ptr_at(po));
@@ -4447,8 +4456,6 @@ mod real {
                                 }
                             }
                             if resolved.contains_key(&r.offset) {
-                                // cross-layer staging hit — bump heat only
-                                // (do NOT count as vram-cache hit)
                                 st.dev_cache
                                     .touch
                                     .entry(r.offset)
@@ -4467,10 +4474,8 @@ mod real {
                                 None => wants.push(*r),
                             }
                         }
+                        st.prof.resolve_lists += t_lists.elapsed();
                         // Host LFU first; H2D overlaps remaining disk reads.
-                        // Runtime admits are cheap single-slab (triple packing
-                        // is done at warm-load only — per-layer triple scans
-                        // burned ~6s of CPU on a 7k-slot pool).
                         let mut stage_base = std::collections::HashMap::new();
                         let mut stage_total = 0usize;
                         for r in &wants {
@@ -4484,7 +4489,7 @@ mod real {
                         let async_h2d = st.async_expert_h2d;
                         let mut h2d = std::time::Duration::ZERO;
                         let mut async_queued = false;
-                        // place borrows: resolve host payloads into cache/stage
+                        let t_host = std::time::Instant::now();
                         {
                             let dev_cache = &mut st.dev_cache;
                             let staging = &mut st.staging;
@@ -4521,6 +4526,9 @@ mod real {
                                 Ok(())
                             })?;
                         }
+                        let ensure_elapsed = t_host.elapsed();
+                        // host bucket = ensure wall minus nested h2d copies
+                        st.prof.resolve_host += ensure_elapsed.saturating_sub(h2d);
                         if async_queued {
                             let t = std::time::Instant::now();
                             st.expert_h2d.record()?;
