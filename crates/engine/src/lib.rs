@@ -1406,6 +1406,8 @@ mod real {
         pub fn supported(quant: u32) -> bool {
             [
                 kernels::QUANT_IQ2_XXS,
+                kernels::QUANT_IQ2_XS,
+                kernels::QUANT_IQ3_XXS,
                 kernels::QUANT_Q2_K,
                 kernels::QUANT_Q3_K,
                 kernels::QUANT_Q4_K,
@@ -1415,6 +1417,12 @@ mod real {
 
         pub fn dot(quant: u32, row: &[u8], xq: &quant::cpu_dot::Q8KRow, n: usize) -> f32 {
             match quant {
+                q if q == kernels::QUANT_IQ2_XS => {
+                    quant::cpu_dot::vec_dot_iq2_xs_q8_k(row, xq, n)
+                }
+                q if q == kernels::QUANT_IQ3_XXS => {
+                    quant::cpu_dot::vec_dot_iq3_xxs_q8_k(row, xq, n)
+                }
                 q if q == kernels::QUANT_Q2_K => quant::cpu_dot::vec_dot_q2_k_q8_k(row, xq, n),
                 q if q == kernels::QUANT_Q3_K => quant::cpu_dot::vec_dot_q3_k_q8_k(row, xq, n),
                 q if q == kernels::QUANT_Q4_K => quant::cpu_dot::vec_dot_q4_k_q8_k(row, xq, n),
