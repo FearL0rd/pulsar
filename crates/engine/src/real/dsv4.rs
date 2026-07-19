@@ -725,6 +725,17 @@ fn indexer_allowed(q: &mut [f32], weights: &[f32], idx_cache: &[f32], n_comp: us
 
 /* ---- forward ------------------------------------------------------------ */
 
+
+    /// task #39 probe: fnv hash of `n` f32 rows in `buf` (PULSAR_L0_LOG).
+    fn l0_hash(buf: &kernels::DeviceBuf, n: usize) -> u64 {
+        let v = buf.read_f32(n).unwrap_or_default();
+        let mut h = 0u64;
+        for x in v {
+            h = h.wrapping_mul(1099511628211).wrapping_add(x.to_bits() as u64);
+        }
+        h
+    }
+
 impl Model {
     /// V4 forward: sequential single-token steps (rows = 0 or 1).
     pub(super) fn forward_dsv4(&self, st: &mut State, tokens: &[u32], pos0: u32, rows: u32) -> Result<Option<Vec<f32>>> {
@@ -996,6 +1007,10 @@ impl Model {
                 1.0 / (s.head_dim as f32).sqrt(),
             )?;
         }
+        if std::env::var_os("PULSAR_L0_LOG").is_some() && il <= 2 && (2046..2051).contains(&pos0) {
+            kernels::sync()?;
+            eprintln!("stage L{il} @{pos0} t={t} heads={:x}", l0_hash(&st.heads, q_dim as usize));
+        }
         // ---- batched tail: un-rope, grouped out, hc_post
         kernels::dsv4_rope_tail(&mut st.heads, t, s.n_head, s.head_dim, s.rot_dim, pos0, &rope, true)?;
         let rank = 1024usize;
@@ -1042,6 +1057,10 @@ impl Model {
         }
         kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
         self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 3, t)?;
+        if std::env::var_os("PULSAR_L0_LOG").is_some() && il <= 2 && (2046..2051).contains(&pos0) {
+            kernels::sync()?;
+            eprintln!("stage L{il} @{pos0} t={t} moe={:x} shexp={:x} sel={:?}", l0_hash(&st.moe_out, s.n_embd as usize), l0_hash(&st.shared_out, s.n_embd as usize), &selected[..s.n_expert_used.min(8) as usize]);
+        }
         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, t * s.n_embd)?;
         self.dsv4_hc_post(rt, &st.ffn_out, true, t)?;
         Ok(())
