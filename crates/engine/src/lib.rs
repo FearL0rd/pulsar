@@ -2448,6 +2448,27 @@ mod real {
                 // qwen35: the whole non-expert stack is ~2GB - resident
                 (Family::Qwen35, _) => env_budget.unwrap_or(i64::MAX),
             };
+            // No-attn-GPU Mla: an oversized budget OOMs the load instead
+            // of degrading (measured: 8GB+ on a 16GB primary fails at
+            // cudaMalloc mid-upload). Clamp to free VRAM minus what the
+            // capacity solver, KV, and scratch still need. The 6GB
+            // default is already the feasible top on a 16GB card; per-
+            // tensor placement has no headroom beyond this clamp because
+            // every attn byte is read exactly once per token (flat value).
+            if attn_dev.is_none() && shape.family == Family::Mla && attn_vram_budget < i64::MAX {
+                if let Ok((free, _)) = kernels::mem_info(primary) {
+                    let cap = (free as i64) - (5i64 << 30);
+                    if cap > 0 && attn_vram_budget > cap {
+                        eprintln!(
+                            "pulsar: attn VRAM budget clamped {:.1} -> {:.1}GB (free {:.1}GB)",
+                            attn_vram_budget as f64 / 1e9,
+                            cap as f64 / 1e9,
+                            free as f64 / 1e9
+                        );
+                        attn_vram_budget = cap;
+                    }
+                }
+            }
             // small Mla attn tensors always go pinned (not worth budget) -
             // except on a dedicated attn GPU, where everything is resident
             let mut no_budget: i64 = if attn_dev.is_some() { i64::MAX } else { 0 };
