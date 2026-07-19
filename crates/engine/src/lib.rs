@@ -5026,12 +5026,6 @@ mod real {
                 let t0 = std::time::Instant::now();
                 model.mtp_prefill_fill(st, (j + 1) as u32, pos)?;
                 t_fill += t0.elapsed();
-                if timing && emitted % 64 == 0 {
-                    eprintln!(
-                        "mtp timing @{emitted}: draft {:.2}s verify {:.2}s refwd {:.2}s fill {:.2}s",
-                        t_draft.as_secs_f64(), t_verify.as_secs_f64(), t_refwd.as_secs_f64(), t_fill.as_secs_f64()
-                    );
-                }
                 pos += (j + 1) as u32;
                 next = argmax(&all[j * v..(j + 1) * v]);
 
@@ -5045,6 +5039,12 @@ mod real {
                     on_token(d);
                     emitted += 1;
                 }
+            }
+            if timing {
+                eprintln!(
+                    "mtp timing: draft {:.2}s verify {:.2}s refwd {:.2}s fill {:.2}s over {emitted} tokens",
+                    t_draft.as_secs_f64(), t_verify.as_secs_f64(), t_refwd.as_secs_f64(), t_fill.as_secs_f64()
+                );
             }
             return Ok(pos);
         }
