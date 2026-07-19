@@ -593,6 +593,9 @@ pub(super) struct LayerRt {
     /// device indexer compressed cache [cap][n_idx_dim] (read back to
     /// the host only when top-k selection fires, past 512 comp rows)
     idx_cache: DeviceBuf,
+    /// host mirror of idx_cache (appended per emit): selection reads it
+    /// instead of re-reading the whole device cache per token
+    idx_cache_host: Vec<f32>,
     pub n_idx_comp: u32,
 }
 
@@ -606,7 +609,9 @@ pub(super) struct Dsv4Rt {
     low: DeviceBuf,     // [n_out_group*rank] grouped-out low; idx-q scratch
     comp_kv: DeviceBuf, // [max width] compressor projections
     comp_sc: DeviceBuf,
-    idx_w: DeviceBuf,  // [n_idx_head] indexer proj
+    idx_kv: DeviceBuf, // [T][idx width] indexer-lane projections
+    idx_sc: DeviceBuf,
+    idx_w: DeviceBuf,  // [T][n_idx_head] indexer proj
     allowed: DeviceBuf, // [comp cap] u8 visibility mask
     /// device Sinkhorn coefficient buffers [6*n_hc] (attn / ffn halves)
     coef_attn: DeviceBuf,
@@ -637,6 +642,7 @@ impl Dsv4Rt {
                 } else {
                     4
                 })?,
+                idx_cache_host: Vec::new(),
                 n_idx_comp: 0,
             });
         }
@@ -650,7 +656,9 @@ impl Dsv4Rt {
             low: DeviceBuf::alloc(T_MAX * (s.n_out_group * rank).max(s.n_idx_head * s.n_idx_dim) as usize * 4)?,
             comp_kv: DeviceBuf::alloc(T_MAX * 2 * s.head_dim as usize * 4)?,
             comp_sc: DeviceBuf::alloc(T_MAX * 2 * s.head_dim as usize * 4)?,
-            idx_w: DeviceBuf::alloc(s.n_idx_head.max(1) as usize * 4)?,
+            idx_kv: DeviceBuf::alloc(T_MAX * 2 * s.n_idx_dim.max(1) as usize * 4)?,
+            idx_sc: DeviceBuf::alloc(T_MAX * 2 * s.n_idx_dim.max(1) as usize * 4)?,
+            idx_w: DeviceBuf::alloc(T_MAX * s.n_idx_head.max(1) as usize * 4)?,
             allowed: DeviceBuf::alloc(max_ratio_cap)?,
             coef_attn: DeviceBuf::alloc(T_MAX * 6 * s.n_hc as usize * 4)?,
             coef_ffn: DeviceBuf::alloc(T_MAX * 6 * s.n_hc as usize * 4)?,
@@ -668,6 +676,7 @@ impl Dsv4Rt {
             }
             l.n_comp = 0;
             l.n_idx_comp = 0;
+            l.idx_cache_host.clear();
         }
         Ok(())
     }
@@ -697,17 +706,19 @@ fn indexer_allowed(q: &mut [f32], weights: &[f32], idx_cache: &[f32], n_comp: us
         }
         *sc = s;
     }
+    // top-k by (score desc, index asc): identical set to the repeated
+    // strict-argmax it replaces (which picked the earliest max each
+    // round), O(n log n) instead of O(top_k * n)
+    let mut order: Vec<u32> = (0..n_comp as u32).collect();
+    order.sort_unstable_by(|&a, &b| {
+        scores[b as usize]
+            .partial_cmp(&scores[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
     let mut allowed = vec![0u8; n_comp];
-    for _ in 0..top_k {
-        let mut best = 0usize;
-        let mut best_score = NEG_INF;
-        for (c, &s) in scores.iter().enumerate() {
-            if allowed[c] == 0 && s > best_score {
-                best = c;
-                best_score = s;
-            }
-        }
-        allowed[best] = 1;
+    for &c in &order[..top_k] {
+        allowed[c as usize] = 1;
     }
     Some(allowed)
 }
@@ -742,10 +753,10 @@ impl Model {
         let mut last_t = 1usize;
         for chunk in tokens.chunks(T_MAX) {
             let t = chunk.len();
-            // the batched path assumes no indexer masking inside the
-            // chunk (fires past 512 comp rows = ctx > 2048); past that
-            // boundary fall to single-token steps
-            let t = if (pos + t as u32) / 4 > s.n_idx_topk { 1 } else { t };
+            // per-token visibility masks are computed inside the layer
+            // eval, so chunks stay batched at any depth (the old
+            // single-token fallback past 512 comp rows made deep prefill
+            // run at decode speed - 4x slower at 13K)
             for sub in chunk.chunks(t) {
                 let t = sub.len();
                 let ids: Vec<i32> = sub.iter().map(|&x| x as i32).collect();
@@ -851,10 +862,27 @@ impl Model {
             kernels::matmul_q8_0(&mut rt.comp_sc, &comp.gate_w, &st.normed, s.n_embd, comp.width, t)?;
         }
 
-        // ---- per-token interleave: ring append -> comp step -> attend.
-        // LOAD-BEARING: batched ring appends would clobber earlier
-        // tokens' windows (ring cap 128 < chunk span + window).
-        let mut use_mask = false;
+        // indexer lane: projections batched; queries/weights read back
+        // once per chunk when selection can fire inside it
+        let mut idx_q_host: Vec<f32> = Vec::new();
+        let mut idx_w_host: Vec<f32> = Vec::new();
+        if let Some(idx) = &w.idx {
+            kernels::matmul_q8_0(&mut rt.idx_kv, &idx.comp.kv_w, &st.normed, s.n_embd, idx.comp.width, t)?;
+            kernels::matmul_q8_0(&mut rt.idx_sc, &idx.comp.gate_w, &st.normed, s.n_embd, idx.comp.width, t)?;
+            let may_select = rt.layers[il].n_idx_comp + t + 1 > s.n_idx_topk;
+            if may_select {
+                kernels::matmul_q8_0(&mut rt.low, &idx.q_b, &st.q_rank_norm, s.n_lora_q, s.n_idx_head * s.n_idx_dim, t)?;
+                kernels::matmul_f32(&mut rt.idx_w, &idx.proj, &st.normed, s.n_embd, s.n_idx_head, t)?;
+                idx_q_host = rt.low.read_f32(t as usize * (s.n_idx_head * s.n_idx_dim) as usize)?;
+                idx_w_host = rt.idx_w.read_f32(t as usize * s.n_idx_head as usize)?;
+            }
+        }
+
+        // ---- per-token interleave: ring append -> comp steps ->
+        // selection -> attend. LOAD-BEARING: batched ring appends would
+        // clobber earlier tokens' windows (ring cap 128 < chunk span +
+        // window), and each token's visibility mask depends on the
+        // indexer cache state AT ITS OWN position.
         for i in 0..t as usize {
             let pos = pos0 + i as u32;
             let n_raw = (pos + 1).min(s.n_swa);
@@ -880,6 +908,52 @@ impl Model {
                     lrt.n_comp += 1;
                 }
             }
+            // indexer comp step for THIS token (host mirror appended on
+            // emit so selection never re-reads the whole device cache)
+            if let Some(idx) = &w.idx {
+                let lrt = &mut rt.layers[il];
+                let lane = lrt.idx.as_mut().ok_or("indexer state missing")?;
+                kernels::dsv4_comp_step(
+                    &mut lane.st_kv, &mut lane.st_sc,
+                    &mut lrt.idx_cache, lrt.n_idx_comp as usize * s.n_idx_dim as usize * 4,
+                    &rt.idx_kv, &rt.idx_sc, i * idx.comp.width as usize * 4,
+                    &idx.comp.ape, &idx.comp.norm,
+                    idx.comp.width, s.n_idx_dim, lane.ratio, pos, emit, true, eps, &rope,
+                )?;
+                if emit {
+                    lrt.n_idx_comp += 1;
+                    let nd = s.n_idx_dim as usize;
+                    let row = lrt.idx_cache.read_f32_at((lrt.n_idx_comp as usize - 1) * nd, nd)?;
+                    lrt.idx_cache_host.extend_from_slice(&row);
+                }
+            }
+            // visibility mask for THIS token once the compressed set
+            // exceeds the top-k budget
+            let mut masked = false;
+            if w.idx.is_some() && !idx_q_host.is_empty() {
+                let lrt = &rt.layers[il];
+                if lrt.n_idx_comp > s.n_idx_topk {
+                    let qw = (s.n_idx_head * s.n_idx_dim) as usize;
+                    let nh = s.n_idx_head as usize;
+                    let q = &mut idx_q_host[i * qw..(i + 1) * qw];
+                    let wgt = &idx_w_host[i * nh..(i + 1) * nh];
+                    if let Some(mask) = indexer_allowed(
+                        q,
+                        wgt,
+                        &lrt.idx_cache_host,
+                        lrt.n_idx_comp as usize,
+                        nh,
+                        s.n_idx_dim as usize,
+                        s.n_idx_topk as usize,
+                        pos,
+                        &rope,
+                        s.rot_dim as usize,
+                    ) {
+                        rt.allowed.write(0, &mask)?;
+                        masked = true;
+                    }
+                }
+            }
             let n_comp = rt.layers[il].n_comp;
             kernels::dsv4_attention_at(
                 &mut st.heads,
@@ -890,86 +964,13 @@ impl Model {
                 n_raw,
                 (n_comp > 0).then_some(&st.vcache[il]),
                 n_comp,
-                None,
+                if masked { Some(&rt.allowed) } else { None },
                 &w.sinks,
                 s.n_head,
                 s.head_dim,
                 1.0 / (s.head_dim as f32).sqrt(),
             )?;
         }
-        // indexer lane: projections batched, steps per token (its cache
-        // feeds SELECTION only, which the chunk gate keeps inactive for
-        // batched chunks; single-token steps handle the masked regime)
-        if let Some(idx) = &w.idx {
-            kernels::matmul_q8_0(&mut rt.comp_kv, &idx.comp.kv_w, &st.normed, s.n_embd, idx.comp.width, t)?;
-            kernels::matmul_q8_0(&mut rt.comp_sc, &idx.comp.gate_w, &st.normed, s.n_embd, idx.comp.width, t)?;
-            for i in 0..t as usize {
-                let pos = pos0 + i as u32;
-                let emit = (pos + 1) % w.ratio == 0;
-                let lrt = &mut rt.layers[il];
-                let lane = lrt.idx.as_mut().ok_or("indexer state missing")?;
-                let (cache, n_idx) = (&mut lrt.idx_cache, lrt.n_idx_comp);
-                kernels::dsv4_comp_step(
-                    &mut lane.st_kv, &mut lane.st_sc,
-                    cache, n_idx as usize * s.n_idx_dim as usize * 4,
-                    &rt.comp_kv, &rt.comp_sc, i * idx.comp.width as usize * 4,
-                    &idx.comp.ape, &idx.comp.norm,
-                    idx.comp.width, s.n_idx_dim, lane.ratio, pos, emit, true, eps, &rope,
-                )?;
-                if emit {
-                    lrt.n_idx_comp += 1;
-                }
-            }
-            // top-k selection: single-token regime only (t == 1 past
-            // the 2048 boundary, enforced by the chunk gate)
-            if t == 1 && rt.layers[il].n_idx_comp > s.n_idx_topk {
-                let pos = pos0;
-                kernels::matmul_q8_0(&mut rt.low, &idx.q_b, &st.q_rank_norm, s.n_lora_q, s.n_idx_head * s.n_idx_dim, 1)?;
-                kernels::matmul_f32(&mut rt.idx_w, &idx.proj, &st.normed, s.n_embd, s.n_idx_head, 1)?;
-                kernels::sync()?;
-                let mut q = rt.low.read_f32((s.n_idx_head * s.n_idx_dim) as usize)?;
-                let weights = rt.idx_w.read_f32(s.n_idx_head as usize)?;
-                let lrt = &rt.layers[il];
-                let idx_cache_host = lrt
-                    .idx_cache
-                    .read_f32(lrt.n_idx_comp as usize * s.n_idx_dim as usize)?;
-                if let Some(mask) = indexer_allowed(
-                    &mut q,
-                    &weights,
-                    &idx_cache_host,
-                    lrt.n_idx_comp as usize,
-                    s.n_idx_head as usize,
-                    s.n_idx_dim as usize,
-                    s.n_idx_topk as usize,
-                    pos,
-                    &rope,
-                    s.rot_dim as usize,
-                ) {
-                    rt.allowed.write(0, &mask)?;
-                    use_mask = true;
-                }
-            }
-        }
-        if use_mask {
-            // masked single-token attention re-runs with the selection
-            // (the unmasked pass above already wrote heads; rerun row 0)
-            let n_raw = (pos0 + 1).min(s.n_swa);
-            let n_comp = rt.layers[il].n_comp;
-            kernels::dsv4_attention(
-                &mut st.heads,
-                &st.q,
-                &st.kcache[il],
-                n_raw,
-                (n_comp > 0).then_some(&st.vcache[il]),
-                n_comp,
-                Some(&rt.allowed),
-                &w.sinks,
-                s.n_head,
-                s.head_dim,
-                1.0 / (s.head_dim as f32).sqrt(),
-            )?;
-        }
-
         // ---- batched tail: un-rope, grouped out, hc_post
         kernels::dsv4_rope_tail(&mut st.heads, t, s.n_head, s.head_dim, s.rot_dim, pos0, &rope, true)?;
         let rank = 1024usize;

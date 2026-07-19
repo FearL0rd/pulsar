@@ -460,6 +460,13 @@ mod real {
             Ok(v)
         }
 
+        /// Read `n` f32s starting at element offset `off`.
+        pub fn read_f32_at(&self, off: usize, n: usize) -> Result<Vec<f32>> {
+            let mut v = vec![0f32; n];
+            self.read(off * 4, as_bytes_mut(&mut v))?;
+            Ok(v)
+        }
+
         pub fn read_i32(&self, n: usize) -> Result<Vec<i32>> {
             let mut v = vec![0i32; n];
             self.read(0, as_bytes_mut(&mut v))?;
