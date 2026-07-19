@@ -2791,13 +2791,19 @@ __global__ static void matmul_kqw_tokens_kernel(
     #pragma unroll
     for (int t = 0; t < TT; t++) acc[t] = 0.0f;
     for (uint32_t b = 0; b < in_blocks; b++) {
-        /* decode the weight word once; only the dp4a runs per token */
+        /* decode the weight word once; only the dp4a runs per token.
+         * Compile-time unroll with an early exit keeps acc[] in
+         * registers - a runtime trip count spills it to local memory. */
         const typename WDOT::Prep p = WDOT::prepare(wr, b, lane);
-        for (uint32_t t = 0; t < n_tok; t++) {
+        #pragma unroll
+        for (int t = 0; t < TT; t++) {
+            if ((uint32_t)t >= n_tok) break;
             acc[t] += WDOT::apply(p, xq + (uint64_t)t * in_blocks, b, lane);
         }
     }
-    for (uint32_t t = 0; t < n_tok; t++) {
+    #pragma unroll
+    for (int t = 0; t < TT; t++) {
+        if ((uint32_t)t >= n_tok) break;
         float a = acc[t];
         #pragma unroll
         for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
