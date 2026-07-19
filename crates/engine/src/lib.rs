@@ -4113,6 +4113,15 @@ mod real {
             self.layer_dev.get(il).copied().unwrap_or(self.layer_dev[0])
         }
 
+        /// True when the forward carries recurrent state beyond the KV
+        /// cache (dsv4 compressor/HC lanes, qwen35 GDN, inkling
+        /// shortconv). A prefix-cache may only APPEND to the forwarded
+        /// stream for these; pure-KV families can rewind and overwrite.
+        pub fn recurrent_state(&self) -> bool {
+            matches!(self.shape.family, Family::Dsv4 | Family::Qwen35)
+                || self.shape.sconv_k > 1
+        }
+
         /// lm-head over the first `k` rows of st.normed into st.logits.
         fn head_logits(&self, st: &mut State, k: u32) -> Result {
             let s = self.shape;

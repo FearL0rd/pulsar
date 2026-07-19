@@ -68,6 +68,9 @@ fn run() -> engine::Result {
     eprintln!("pulsar-serve: listening on http://{host}:{port}/v1");
 
     let mut request_id = 0u64;
+    // token ids fully forwarded into the engine (KV + recurrent state
+    // consistent with them); the next request prefills only its suffix
+    let mut hist: Vec<u32> = Vec::new();
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -115,6 +118,7 @@ fn run() -> engine::Result {
                     &model_name,
                     default_temp,
                     request_id,
+                    &mut hist,
                 ),
                 _ => respond_json(
                     &mut stream,
@@ -186,6 +190,7 @@ fn handle_chat(
     model_name: &str,
     default_temp: f32,
     request_id: u64,
+    hist: &mut Vec<u32>,
 ) -> engine::Result {
     use std::io::Write;
 
@@ -214,6 +219,36 @@ fn handle_chat(
     let mut sampler = engine::Sampler::new(temp, top_p, min_p, seed);
     let id = format!("chatcmpl-{request_id}");
 
+    // Prefix cache: skip re-prefilling whatever the engine already holds.
+    // Chat transcripts APPEND, so the common case reuses everything up to
+    // the new turn (and the constant system prompt survives across
+    // sessions while the server stays up). Recurrent-state families may
+    // only extend the exact forwarded stream; pure-KV families can rewind
+    // to the divergence and overwrite. Speculative modes rewrite KV in
+    // ways this bookkeeping does not model - caching disables itself.
+    let cache_ok = model.mtp_depth == 0
+        && std::env::var_os("PULSAR_NGRAM").is_none()
+        && std::env::var_os("PULSAR_NO_PREFIX_CACHE").is_none();
+    let mut common = 0usize;
+    if cache_ok {
+        common = hist.iter().zip(prompt.iter()).take_while(|(a, b)| a == b).count();
+        let recurrent = model.recurrent_state();
+        if recurrent && common < hist.len() {
+            common = 0; // divergence: recurrent state is past it
+        }
+        if common == prompt.len() {
+            // fully-cached prompt still needs one forward for logits
+            common = if recurrent { 0 } else { common - 1 };
+        }
+    }
+    if common == 0 {
+        hist.clear(); // pos0 == 0 resets recurrent state in the engine
+    } else {
+        eprintln!("pulsar-serve: {id}: prefix cache hit, {common}/{} tokens reused", prompt.len());
+    }
+    let stop_seen = std::cell::Cell::new(None::<u32>);
+    let mut emitted: Vec<u32> = Vec::new();
+
     if streaming {
         write!(
             stream,
@@ -225,13 +260,20 @@ fn handle_chat(
         engine::generate(
             model,
             st,
-            &prompt,
-            0,
+            &prompt[common..],
+            common as u32,
             &mut sampler,
             max_tokens,
-            |t| markers.is_stop(t),
+            |t| {
+                let s = markers.is_stop(t);
+                if s {
+                    stop_seen.set(Some(t));
+                }
+                s
+            },
             |t| {
                 n_out += 1;
+                emitted.push(t);
                 bytes.extend_from_slice(&tok.decode(&[t]));
                 let valid = match std::str::from_utf8(&bytes) {
                     Ok(s) => s.len(),
@@ -257,19 +299,31 @@ fn handle_chat(
         let _ = write!(stream, "data: {fin}\n\ndata: [DONE]\n\n");
         let _ = stream.flush();
         eprintln!("pulsar-serve: {id}: {} prompt + {n_out} completion tokens (streamed)", prompt.len());
+        if cache_ok {
+            *hist = prompt;
+            hist.extend(&emitted);
+            hist.extend(stop_seen.get());
+        }
     } else {
         let mut out: Vec<u8> = Vec::new();
         let mut n_out = 0usize;
         engine::generate(
             model,
             st,
-            &prompt,
-            0,
+            &prompt[common..],
+            common as u32,
             &mut sampler,
             max_tokens,
-            |t| markers.is_stop(t),
+            |t| {
+                let s = markers.is_stop(t);
+                if s {
+                    stop_seen.set(Some(t));
+                }
+                s
+            },
             |t| {
                 n_out += 1;
+                emitted.push(t);
                 out.extend_from_slice(&tok.decode(&[t]));
             },
         )?;
@@ -288,6 +342,11 @@ fn handle_chat(
         });
         eprintln!("pulsar-serve: {id}: {} prompt + {n_out} completion tokens", prompt.len());
         respond_json(stream, 200, &json)?;
+        if cache_ok {
+            *hist = prompt;
+            hist.extend(&emitted);
+            hist.extend(stop_seen.get());
+        }
     }
     Ok(())
 }
