@@ -1756,58 +1756,93 @@ struct dot_q4_K {
  * the caller warp-reduces once per row. */
 
 struct wdot_q4_K {
-    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+    /* per-(block, lane) weight decode, done ONCE per block however many
+     * tokens ride the tile */
+    struct Prep {
+        uint32_t vlo, vhi;
+        float d, dmin;
+        int sc1, sc2, m1, m2;
+        uint32_t j, wi;
+    };
+    __device__ __forceinline__ static Prep prepare(const char *row, uint32_t b, uint32_t lane) {
         const block_q4_K *x = (const block_q4_K *)row + b;
-        const block_q8_K *y = xq + b;
-        const float d = f16_to_f32(x->d) * y->d;
-        const float dmin = f16_to_f32(x->dmin) * y->d;
+        Prep p;
         /* qs = 32 words; lane w -> chunk j = w/8 (64 values), word w%8.
          * low nibbles pair with q8[j*64 + 4*(w%8)], high with +32. */
-        const uint32_t j = lane >> 3, wi = (lane & 7u) << 2;
-        const uint32_t v = *(const uint32_t *)(x->qs + 32 * j + wi);
-        const int8_t *q8 = y->qs + 64 * j;
+        p.j = lane >> 3;
+        p.wi = (lane & 7u) << 2;
+        const uint32_t v = *(const uint32_t *)(x->qs + 32 * p.j + p.wi);
+        p.vlo = v & 0x0f0f0f0fu;
+        p.vhi = (v >> 4) & 0x0f0f0f0fu;
+        p.d = f16_to_f32(x->d);
+        p.dmin = f16_to_f32(x->dmin);
         uint8_t sc1, m1, sc2, m2;
-        k4_scale_min(2 * j, x->scales, &sc1, &m1);
-        k4_scale_min(2 * j + 1, x->scales, &sc2, &m2);
-        const int s1 = __dp4a((int)(v & 0x0f0f0f0fu), *(const int32_t *)(q8 + wi), 0);
-        const int s2 = __dp4a((int)((v >> 4) & 0x0f0f0f0fu), *(const int32_t *)(q8 + 32 + wi), 0);
-        float acc = d * (float)((int)sc1 * s1 + (int)sc2 * s2);
+        k4_scale_min(2 * p.j, x->scales, &sc1, &m1);
+        k4_scale_min(2 * p.j + 1, x->scales, &sc2, &m2);
+        p.sc1 = sc1; p.m1 = m1; p.sc2 = sc2; p.m2 = m2;
+        return p;
+    }
+    __device__ __forceinline__ static float apply(const Prep &p, const block_q8_K *y, uint32_t b, uint32_t lane) {
+        const block_q8_K *yb = y + b;
+        const int8_t *q8 = yb->qs + 64 * p.j;
+        const int s1 = __dp4a((int)p.vlo, *(const int32_t *)(q8 + p.wi), 0);
+        const int s2 = __dp4a((int)p.vhi, *(const int32_t *)(q8 + 32 + p.wi), 0);
+        float acc = p.d * yb->d * (float)(p.sc1 * s1 + p.sc2 * s2);
         if ((lane & 7u) == 0) {
             /* one lane per chunk carries the min term */
-            acc -= dmin * (float)((int)m1 * (y->bsums[4 * j] + y->bsums[4 * j + 1]) +
-                                  (int)m2 * (y->bsums[4 * j + 2] + y->bsums[4 * j + 3]));
+            acc -= p.dmin * yb->d *
+                   (float)(p.m1 * (yb->bsums[4 * p.j] + yb->bsums[4 * p.j + 1]) +
+                           p.m2 * (yb->bsums[4 * p.j + 2] + yb->bsums[4 * p.j + 3]));
         }
         return acc;
+    }
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+        return apply(prepare(row, b, lane), xq, b, lane);
     }
 };
 
 struct wdot_q6_K {
-    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+    struct Prep {
+        int32_t va, vb;
+        float d;
+        int sca, scb;
+        uint32_t off_a; /* q8 byte offset of the va word */
+    };
+    __device__ __forceinline__ static Prep prepare(const char *row, uint32_t b, uint32_t lane) {
         const block_q6_K *x = (const block_q6_K *)row + b;
-        const block_q8_K *y = xq + b;
-        const float d = f16_to_f32(x->d) * y->d;
         /* lane -> (chunk j of 128 values, i in {0,4..28}, low/high pair) */
         const uint32_t j = lane >> 4, i = (lane & 7u) << 2, hi = (lane >> 3) & 1u;
         /* block_q6_K is 210 bytes - rows are only 2-aligned, so the
          * quant words go through the byte loader (q8_K stays 4-aligned) */
         const uint8_t *ql = x->ql + 64 * j;
         const uint32_t h = load_u32_bytes(x->qh + 32 * j + i);
-        const int8_t *q8 = y->qs + 128 * j + 64 * hi;
         const int8_t *sc = x->scales + 8 * j + 4 * hi;
         const uint32_t lo0 = load_u32_bytes(ql + i);
         const uint32_t lo1 = load_u32_bytes(ql + 32 + i);
         const uint32_t sub = i >> 4;
-        int32_t va, vb;
+        Prep p;
         if (hi == 0) {
-            va = __vsub4((int)((lo0 & 0x0f0f0f0fu) | (((h >> 0) & 0x03030303u) << 4)), 0x20202020);
-            vb = __vsub4((int)((lo1 & 0x0f0f0f0fu) | (((h >> 2) & 0x03030303u) << 4)), 0x20202020);
+            p.va = __vsub4((int)((lo0 & 0x0f0f0f0fu) | (((h >> 0) & 0x03030303u) << 4)), 0x20202020);
+            p.vb = __vsub4((int)((lo1 & 0x0f0f0f0fu) | (((h >> 2) & 0x03030303u) << 4)), 0x20202020);
         } else {
-            va = __vsub4((int)(((lo0 >> 4) & 0x0f0f0f0fu) | (((h >> 4) & 0x03030303u) << 4)), 0x20202020);
-            vb = __vsub4((int)(((lo1 >> 4) & 0x0f0f0f0fu) | (((h >> 6) & 0x03030303u) << 4)), 0x20202020);
+            p.va = __vsub4((int)(((lo0 >> 4) & 0x0f0f0f0fu) | (((h >> 4) & 0x03030303u) << 4)), 0x20202020);
+            p.vb = __vsub4((int)(((lo1 >> 4) & 0x0f0f0f0fu) | (((h >> 6) & 0x03030303u) << 4)), 0x20202020);
         }
-        const int sa = __dp4a(va, *(const int32_t *)(q8 + i), 0);
-        const int sb = __dp4a(vb, *(const int32_t *)(q8 + 32 + i), 0);
-        return d * (float)((int)sc[0 + sub] * sa + (int)sc[2 + sub] * sb);
+        p.d = f16_to_f32(x->d);
+        p.sca = sc[0 + sub];
+        p.scb = sc[2 + sub];
+        p.off_a = 128 * j + 64 * hi + i;
+        return p;
+    }
+    __device__ __forceinline__ static float apply(const Prep &p, const block_q8_K *y, uint32_t b, uint32_t lane) {
+        const block_q8_K *yb = y + b;
+        const int8_t *q8 = yb->qs + p.off_a;
+        const int sa = __dp4a(p.va, *(const int32_t *)(q8), 0);
+        const int sb = __dp4a(p.vb, *(const int32_t *)(q8 + 32), 0);
+        return p.d * yb->d * (float)(p.sca * sa + p.scb * sb);
+    }
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+        return apply(prepare(row, b, lane), xq, b, lane);
     }
 };
 
@@ -2756,9 +2791,10 @@ __global__ static void matmul_kqw_tokens_kernel(
     #pragma unroll
     for (int t = 0; t < TT; t++) acc[t] = 0.0f;
     for (uint32_t b = 0; b < in_blocks; b++) {
+        /* decode the weight word once; only the dp4a runs per token */
+        const typename WDOT::Prep p = WDOT::prepare(wr, b, lane);
         for (uint32_t t = 0; t < n_tok; t++) {
-            /* weight loads inside WDOT::block CSE across the token loop */
-            acc[t] += WDOT::block(wr, xq + (uint64_t)t * in_blocks, b, lane);
+            acc[t] += WDOT::apply(p, xq + (uint64_t)t * in_blocks, b, lane);
         }
     }
     for (uint32_t t = 0; t < n_tok; t++) {
