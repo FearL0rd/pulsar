@@ -991,6 +991,19 @@ impl Model {
                 }
             }
             let n_comp = rt.layers[il].n_comp;
+            if std::env::var_os("PULSAR_L0_LOG").is_some() && il == 0 && i == 0 && (2046..2051).contains(&pos) {
+                kernels::sync()?;
+                let hd = s.head_dim as usize;
+                let kc = st.kcache[il].read_f32_at((pos % s.n_swa) as usize * hd, hd)?;
+                let vc = st.vcache[il].read_f32_at((n_comp as usize - 1) * hd, hd)?;
+                let hh = |v: &[f32]| v.iter().fold(0u64, |h, x| h.wrapping_mul(1099511628211).wrapping_add(x.to_bits() as u64));
+                eprintln!(
+                    "attin L{il} @{pos} t={t} q={:x} v={:x} ring={:x} comp_last={:x} n_raw={n_raw} n_comp={n_comp}",
+                    l0_hash(&st.q, q_dim as usize),
+                    l0_hash(&st.v, s.head_dim as usize),
+                    hh(&kc), hh(&vc)
+                );
+            }
             kernels::dsv4_attention_at(
                 &mut st.heads,
                 i * q_dim as usize * 4,
