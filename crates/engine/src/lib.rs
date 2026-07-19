@@ -2499,7 +2499,10 @@ mod real {
                         }))
                     }
                     Family::Qwen35 => {
-                        let is_attn = (il + 1) % shape.full_attn_interval == 0;
+                        // probe, don't pattern-match: the nextn/MTP layer
+                        // (blk.n_exec) is full attention regardless of the
+                        // every-4th interval
+                        let is_attn = gguf.tensor(&t("attn_q.weight")).is_some();
                         Attn::Qwen35(Box::new(Qwen35W {
                             attn: if is_attn {
                                 Some(Qwen35Attn {
