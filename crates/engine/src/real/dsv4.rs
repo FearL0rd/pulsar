@@ -756,7 +756,15 @@ impl Model {
             // per-token visibility masks are computed inside the layer
             // eval, so chunks stay batched at any depth (the old
             // single-token fallback past 512 comp rows made deep prefill
-            // run at decode speed - 4x slower at 13K)
+            // run at decode speed - 4x slower at 13K).
+            // PULSAR_DEEP_SINGLE=1 restores the fallback (debug A/B).
+            let t = if std::env::var_os("PULSAR_DEEP_SINGLE").is_some()
+                && (pos + t as u32) / 4 > s.n_idx_topk
+            {
+                1
+            } else {
+                t
+            };
             for sub in chunk.chunks(t) {
                 let t = sub.len();
                 let ids: Vec<i32> = sub.iter().map(|&x| x as i32).collect();
@@ -949,6 +957,10 @@ impl Model {
                         &rope,
                         s.rot_dim as usize,
                     ) {
+                        if std::env::var_os("PULSAR_MASK_LOG").is_some() {
+                            let h: u64 = mask.iter().enumerate().filter(|(_, &m)| m == 1).map(|(c, _)| c as u64 * 2654435761).fold(0u64, u64::wrapping_add);
+                            eprintln!("mask L{il} @{pos} n={} h={h:x}", mask.len());
+                        }
                         rt.allowed.write(0, &mask)?;
                         masked = true;
                     }
