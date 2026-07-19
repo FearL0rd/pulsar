@@ -163,14 +163,37 @@ fn encode_messages(
     m: &tokenizer::ChatMarkers,
     messages: &[serde_json::Value],
 ) -> Vec<u32> {
+    // content arrives as a plain string OR an array of typed blocks
+    // (Claude Code / Anthropic-translated clients send
+    // [{type:"text", text:...}, ...]); a string-only read silently
+    // dropped the whole system prompt for those clients
+    fn text_of(content: &serde_json::Value) -> String {
+        match content {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .map(|b| {
+                    if let Some(t) = b["text"].as_str() {
+                        t.to_string()
+                    } else if b["type"].as_str() == Some("tool_result") {
+                        text_of(&b["content"])
+                    } else {
+                        String::new()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        }
+    }
     let mut ids: Vec<u32> = m.prologue();
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("");
-        let content = msg["content"].as_str().unwrap_or("");
+        let content = text_of(&msg["content"]);
         match role {
-            "system" => ids.extend(m.render_system(tok, content)),
-            "user" => ids.extend(m.render_user(tok, content)),
-            "assistant" => ids.extend(m.render_assistant_history(tok, content)),
+            "system" => ids.extend(m.render_system(tok, &content)),
+            "user" => ids.extend(m.render_user(tok, &content)),
+            "assistant" => ids.extend(m.render_assistant_history(tok, &content)),
             _ => {}
         }
     }
