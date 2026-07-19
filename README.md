@@ -78,7 +78,15 @@ is the int8-MMA path the MoE verify unions already use).
 DeepSeek-V4-Flash runs its state machines (sliding-window ring,
 streaming KV compressor, Sinkhorn hyper-connection gates) fully on
 device and prefills in batched 16-token chunks (~26 tok/s prefill
-with the CPU lane, 2026-07-19 re-measure; one router readback and one expert union per
+with the CPU lane at shallow positions; past ~2K context the indexer
+top-k engages and the batched path used to fall back to single-token
+steps, decaying prefill to decode speed ~8 tok/s. PULSAR_DEEP_BATCH=1
+keeps deep chunks batched with per-token visibility masks - a 3.4K
+prompt drops 249s to 137s, larger prompts save proportionally more.
+Opt-in for now: the batched deep path diverges from single-stepping by
+a small float delta that is verified drift-scale (masks and the
+single-step mode are bit-faithful to the old build) but not yet
+root-caused; pulsar-serve sets it. one router readback and one expert union per
 chunk-layer, with the per-token ring/compressor/attention interleave
 preserved bit-exactly). Long-context retrieval verified by needle
 recall at 2.4k ctx through compressed rows.
