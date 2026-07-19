@@ -39,6 +39,7 @@ Gen5 NVMe.
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
 | Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 22GB (Q4_K_XL) | **51.8 tok/s** | – |
+| ThinkingCap-Qwen3.6-27B (dense) | 27B | 27B | 16GB (Q4_K_M) | **18.3 tok/s** (27.5 w/ nextn MTP) | – |
 | DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **8.0 tok/s** (11.4 w/ CPU lane) | – |
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **5.3 tok/s** (7.0 w/ CPU lane) | 0.64–0.70 |
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **5.3 tok/s** (6.4 w/ CPU lane) | – |
@@ -58,6 +59,21 @@ compute-bound, not streaming-bound.
 † Measured before the n=64 standardization and not yet re-run (model deleted
 to free disk); the sustained rate is likely a little lower than shown, as
 GLM-5.2's re-measurement confirmed (2.0 -> 1.7).
+
+ThinkingCap-27B is pulsar's first fully-dense arch and runs a different
+mode entirely: no streaming, no tiers - the model fits across both
+cards, so each layer's whole stack (attention or Gated DeltaNet, KV,
+FFN triple) is resident on ONE owner card in native K-quant, evaluated
+with warp-cooperative Q4_K/Q6_K matmuls on q8_K activations, and the
+residual stream crosses cards twice per 16-token chunk. Speculative
+decode rides the model's own nextn/MTP layer (`PULSAR_MTP=1`, depth via
+`PULSAR_MTP_DEPTH`, 85% acceptance at depth 3 on greedy); verify rounds
+snapshot the recurrent GDN state, since unlike KV rows a delta-rule
+state can't be overwritten after a rejected draft. The port went 9.7 ->
+18.3 tok/s base (27.5 with MTP) in one arc: per-layer card ownership,
+K-quant-native attention, a warp token tile so verify/prefill rows
+share one weight read (ncu: L1-bound at 94%, DRAM 28% - the next lever
+is the int8-MMA path the MoE verify unions already use).
 
 DeepSeek-V4-Flash runs its state machines (sliding-window ring,
 streaming KV compressor, Sinkhorn hyper-connection gates) fully on
