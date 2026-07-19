@@ -417,23 +417,29 @@ mod real {
         quant: u32,
     }
 
+    /// gguf tensor type -> kernel quant code (expert-dot coverage).
+    fn quant_code(ty: TensorType) -> Option<u32> {
+        Some(match ty {
+            TensorType::IQ2XXS => kernels::QUANT_IQ2_XXS,
+            TensorType::Q2K => kernels::QUANT_Q2_K,
+            TensorType::Q4K => kernels::QUANT_Q4_K,
+            TensorType::Q5K => kernels::QUANT_Q5_K,
+            TensorType::Q6K => kernels::QUANT_Q6_K,
+            TensorType::Q3K => kernels::QUANT_Q3_K,
+            TensorType::IQ2XS => kernels::QUANT_IQ2_XS,
+            TensorType::IQ3XXS => kernels::QUANT_IQ3_XXS,
+            TensorType::Q4_0 => kernels::QUANT_Q4_0,
+            TensorType::Q5_1 => kernels::QUANT_Q5_1,
+            TensorType::Q8_0 => kernels::QUANT_Q8_0,
+            TensorType::IQ4XS => kernels::QUANT_IQ4_XS,
+            _ => return None,
+        })
+    }
+
     impl ExpertTensor {
         fn new(g: &Gguf, t: &TensorInfo, n_expert: u32) -> Result<ExpertTensor> {
-            let quant = match t.ty {
-                TensorType::IQ2XXS => kernels::QUANT_IQ2_XXS,
-                TensorType::Q2K => kernels::QUANT_Q2_K,
-                TensorType::Q4K => kernels::QUANT_Q4_K,
-                TensorType::Q5K => kernels::QUANT_Q5_K,
-                TensorType::Q6K => kernels::QUANT_Q6_K,
-                TensorType::Q3K => kernels::QUANT_Q3_K,
-                TensorType::IQ2XS => kernels::QUANT_IQ2_XS,
-                TensorType::IQ3XXS => kernels::QUANT_IQ3_XXS,
-                TensorType::Q4_0 => kernels::QUANT_Q4_0,
-                TensorType::Q5_1 => kernels::QUANT_Q5_1,
-                TensorType::Q8_0 => kernels::QUANT_Q8_0,
-                TensorType::IQ4XS => kernels::QUANT_IQ4_XS,
-                other => return Err(format!("{}: unsupported expert type {other:?}", t.name).into()),
-            };
+            let quant = quant_code(t.ty)
+                .ok_or_else(|| format!("{}: unsupported expert type {:?}", t.name, t.ty))?;
             let row_elems = t.dims[0];
             let rows_per_expert = t.dims[1];
             let row_bytes = t.ty.row_bytes(row_elems).unwrap();
@@ -462,11 +468,26 @@ mod real {
         (p as *const u8).wrapping_add(off as usize) as *const std::ffi::c_void
     }
 
+    /// A resident K-quant matmul weight (matmul_kq path).
+    struct KqW {
+        w: DeviceBuf,
+        row_bytes: u64,
+        quant: u32,
+    }
+
     enum Ffn {
         Dense {
             gate: DeviceBuf,
             up: DeviceBuf,
             down: DeviceBuf,
+        },
+        /// Dense qwen35 (27B): the whole FFN triple resident on the
+        /// layer's owning card in native K-quant - no expert machinery,
+        /// no tiers, no streaming (the model fits in combined VRAM).
+        DenseKq {
+            gate: KqW,
+            up: KqW,
+            down: KqW,
         },
         Moe {
             gate_inp: DeviceBuf,
@@ -695,6 +716,10 @@ mod real {
         /// every token, so residency is the one job a bandwidth-crippled
         /// PCIe link can still do: only activations cross per layer.
         pub attn_dev: Option<i32>,
+        /// Per-exec-layer owner device (dense split); all-primary
+        /// everywhere else. Weights, KV, and GDN state live on the owner
+        /// and the layer evals there.
+        layer_dev: Vec<i32>,
         mtp: Option<MtpLayer>,
         /// Draft-chain depth (PULSAR_MTP_DEPTH, default 3): tokens
         /// speculated per round, verified together in one forward.
@@ -1765,6 +1790,18 @@ mod real {
         Ok(DeviceBuf::from_bytes(&read_tensor_bytes(file, g, name)?)?)
     }
 
+    /// K-quant tensor -> resident device bytes + the matmul_kq metadata.
+    fn upload_kq(file: &VFile, g: &Gguf, name: &str) -> Result<KqW> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        let quant = quant_code(t.ty)
+            .ok_or_else(|| format!("{name}: unsupported K-quant type {:?}", t.ty))?;
+        Ok(KqW {
+            w: upload(file, g, name)?,
+            row_bytes: t.ty.row_bytes(t.dims[0]).unwrap(),
+            quant,
+        })
+    }
+
     /// f16 tensor -> host f32 (deepseek4 ships router/HC/compressor
     /// weights as f16; small ones convert to f32 for matmul_f32).
     fn read_f16_as_f32(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<f32>> {
@@ -1988,6 +2025,70 @@ mod real {
                 eprintln!("pulsar: attn weights + KV resident on CUDA device {d}");
             }
 
+            // Dense qwen35 on 2+ cards: whole-layer ownership. The model
+            // fits in combined VRAM, so a layer's full stack (attn/GDN +
+            // KV + FFN triple) is resident on ONE card and the residual
+            // stream crosses once per boundary per chunk - the per-layer
+            // tier round trips it replaces were ~55ms of a 103ms token.
+            // Split point balances per-token weight reads; the lm head
+            // (read every token) counts on the primary's side.
+            // PULSAR_SPLIT=<n> forces n leading layers on the primary,
+            // PULSAR_SPLIT=off keeps everything on one card.
+            let qwen35_dense = shape.family == Family::Qwen35 && shape.n_expert == 1;
+            let mut layer_dev = vec![primary; shape.n_exec_layer as usize];
+            if qwen35_dense
+                && kernels::device_count() > 1
+                && std::env::var("PULSAR_SPLIT").ok().as_deref() != Some("off")
+            {
+                let second = (0..kernels::device_count())
+                    .filter(|&d| d != primary)
+                    .max_by_key(|&d| kernels::mem_info(d).map(|(f, _)| f).unwrap_or(0))
+                    .unwrap();
+                let lbytes: Vec<u64> = (0..shape.n_exec_layer)
+                    .map(|il| {
+                        let p = format!("blk.{il}.");
+                        gguf.tensors
+                            .iter()
+                            .filter(|t| t.name.starts_with(&p))
+                            .filter_map(|t| t.byte_size())
+                            .sum()
+                    })
+                    .collect();
+                let head: u64 = gguf.tensor("output.weight").and_then(|t| t.byte_size()).unwrap_or(0);
+                // ponytail: fixed 1.5 primary-bandwidth factor (5060 Ti vs
+                // 4060 Ti VRAM bw); probe real bandwidths if a box needs it
+                let bw0 = 1.5f64;
+                let n0 = match std::env::var("PULSAR_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) => n.min(lbytes.len()),
+                    None => {
+                        let total: u64 = lbytes.iter().sum();
+                        let mut acc = 0u64;
+                        let mut best = (f64::MAX, lbytes.len());
+                        for n in 0..=lbytes.len() {
+                            let t0 = (head + acc) as f64 / bw0;
+                            let t1 = (total - acc) as f64;
+                            let worst = t0.max(t1);
+                            if worst < best.0 {
+                                best = (worst, n);
+                            }
+                            if n < lbytes.len() {
+                                acc += lbytes[n];
+                            }
+                        }
+                        best.1
+                    }
+                };
+                for d in layer_dev.iter_mut().skip(n0) {
+                    *d = second;
+                }
+                let b1: u64 = lbytes[n0..].iter().sum();
+                eprintln!(
+                    "pulsar: dense split: layers 0..{n0} on device {primary}, {n0}..{} on device {second} ({:.1}GB)",
+                    lbytes.len(),
+                    b1 as f64 / 1e9
+                );
+            }
+
             // Mla: spend a VRAM budget on the two big per-layer attn
             // tensors (attn_output ~107MB, q_b ~36MB on GLM-5.2) - they are
             // 80%+ of the per-token pinned-host read traffic. Gqa attn is
@@ -2137,6 +2238,17 @@ mod real {
                         up: upload(&file, &gguf, &t("ffn_up.weight"))?,
                         down: upload(&file, &gguf, &t("ffn_down.weight"))?,
                     }
+                } else if shape.family == Family::Qwen35
+                    && gguf.tensor(&t("ffn_gate_exps.weight")).is_none()
+                {
+                    // dense qwen35 (27B): the FFN triple resident in
+                    // native K-quant on whatever device is current (the
+                    // layer's owner under the dense split)
+                    Ffn::DenseKq {
+                        gate: upload_kq(&file, &gguf, &t("ffn_gate.weight"))?,
+                        up: upload_kq(&file, &gguf, &t("ffn_up.weight"))?,
+                        down: upload_kq(&file, &gguf, &t("ffn_down.weight"))?,
+                    }
                 } else {
                     let exps = |suffix: &str| -> Result<ExpertTensor> {
                         let name = t(suffix);
@@ -2161,29 +2273,18 @@ mod real {
                     // 0..n_ff are gate, n_ff..2n_ff are up. One slab per
                     // expert serves both (up = gate ptr + fused_up_off).
                     let fused = gguf.tensor(&t("ffn_gate_up_exps.weight")).is_some();
-                    // qwen35-dense: plain ffn_gate/up/down ARE the single
-                    // expert (native K-quant bytes, tiered like any expert)
-                    let dense_ffn = !fused && gguf.tensor(&t("ffn_gate_exps.weight")).is_none();
                     let (gate_exps, up_exps, fused_up_off) = if fused {
                         let g = exps("ffn_gate_up_exps.weight")?;
                         let off = g.row_bytes * shape.n_ff_exp as u64;
                         let u = g.clone();
                         (g, u, off)
-                    } else if dense_ffn {
-                        (exps("ffn_gate.weight")?, exps("ffn_up.weight")?, 0)
                     } else {
                         (exps("ffn_gate_exps.weight")?, exps("ffn_up_exps.weight")?, 0)
                     };
                     Ffn::Moe {
                         // deepseek4 ships the router f16; matmul_f32
                         // wants f32 (router precision drives selection)
-                        gate_inp: if dense_ffn {
-                            // one expert, no router - dummy buffer, the
-                            // qwen35 ffn half bypasses selection entirely
-                            let mut z = DeviceBuf::alloc(4)?;
-                            kernels::zero(&mut z, 4)?;
-                            z
-                        } else if dsv4_arch {
+                        gate_inp: if dsv4_arch {
                             upload_f16_as_f32(&file, &gguf, &t("ffn_gate_inp.weight"))?
                         } else {
                             upload(&file, &gguf, &t("ffn_gate_inp.weight"))?
@@ -2217,11 +2318,7 @@ mod real {
                         },
                         gate_exps,
                         up_exps,
-                        down_exps: if dense_ffn {
-                            exps("ffn_down.weight")?
-                        } else {
-                            exps("ffn_down_exps.weight")?
-                        },
+                        down_exps: exps("ffn_down_exps.weight")?,
                         fused_up_off,
                         down_scale: if gguf.tensor(&t("ffn_down_exps.scale")).is_some() {
                             Some(upload(&file, &gguf, &t("ffn_down_exps.scale"))?)
@@ -2506,8 +2603,11 @@ mod real {
 
             let mut layers = Vec::with_capacity(shape.n_exec_layer as usize);
             for il in 0..shape.n_exec_layer {
+                // dense split: the whole layer uploads to its owner
+                kernels::set_device(layer_dev[il as usize])?;
                 layers.push(load_layer(il, &mut attn_vram_budget, &mut no_budget)?);
             }
+            kernels::set_device(primary)?;
 
             // MTP/nextn layer (PULSAR_MTP=1 opt-in): one extra transformer
             // block fed by eh_proj([enorm(embed(token)); hnorm(hidden)]),
@@ -2635,6 +2735,7 @@ mod real {
                 output,
                 layers,
                 attn_dev,
+                layer_dev,
                 mtp,
                 mtp_depth,
                 output_kq,
@@ -2715,6 +2816,11 @@ mod real {
         triples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         sink_triples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         triples.extend(sink_triples);
+        if triples.is_empty() {
+            // fully-resident model (DenseKq): a tier would just grab the
+            // free VRAM its own layers need
+            return Ok(Vec::new());
+        }
 
         let file = VFile::open(&m.shards)?;
         let mut tiers = Vec::new();
@@ -3140,7 +3246,13 @@ mod real {
             let mut kcache = Vec::new();
             let mut vcache = Vec::new();
             let n_kv_slots = s.n_exec_layer as usize + usize::from(m.mtp.is_some());
+            let dense_split = m.layer_dev.iter().any(|&d| d != primary);
             for i in 0..n_kv_slots {
+                if dense_split {
+                    // dense split: KV lives with its layer (MTP slot ->
+                    // primary, where the tail runs)
+                    kernels::set_device(m.layer_dev.get(i).copied().unwrap_or(primary))?;
+                }
                 // per-layer geometry (gemma4): a SWA layer's cache is its
                 // own kv width, not the Shape max
                 let (kb, vb) = if s.family == Family::Qwen35 {
@@ -3178,6 +3290,9 @@ mod real {
                 }
                 kcache.push(k);
                 vcache.push(v);
+            }
+            if dense_split {
+                kernels::set_device(primary)?;
             }
             let q = f32s(mb * s.n_head * s.head_dim.max(s.qk_dim()))?;
             let heads = f32s(mb * s.heads_dim().max(s.n_head * s.head_dim))?;
@@ -3401,7 +3516,9 @@ mod real {
             // the pool; family-constant defaults OOM'd three models in one
             // week. Env knobs still win - the solver only fills what's
             // unset (PULSAR_DEV_CACHE_GB, PULSAR_BATCH).
-            if !st.unified {
+            // max_slab == 0: no streamed experts anywhere (DenseKq
+            // resident model) - skip the budget grab and the warm census
+            if !st.unified && max_slab > 0 {
                 let dev_env = std::env::var("PULSAR_DEV_CACHE_GB")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
@@ -3469,7 +3586,7 @@ mod real {
             }
 
             let t0 = std::time::Instant::now();
-            let warmed = st.load_warm(m)?;
+            let warmed = if max_slab > 0 { st.load_warm(m)? } else { 0 };
             if warmed > 0 {
                 eprintln!(
                     "pulsar: warm start: {warmed} slabs in {:.1}s",
@@ -3607,6 +3724,12 @@ mod real {
             let out = st.logits.read_f32(k as usize * s.n_vocab as usize)?;
             st.prof.tail += t_tail.elapsed();
             Ok(Some(out))
+        }
+
+        /// Owner device of exec layer `il` (out of range - e.g. the MTP
+        /// slot - falls back to layer 0's device, the primary).
+        pub(crate) fn layer_dev(&self, il: usize) -> i32 {
+            self.layer_dev.get(il).copied().unwrap_or(self.layer_dev[0])
         }
 
         /// lm-head over the first `k` rows of st.normed into st.logits.
@@ -3866,6 +3989,11 @@ mod real {
                 // ffn
                 kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, n_tok, eps)?;
                 match &l.ffn {
+                    // qwen35 (the only DenseKq family) never reaches the
+                    // shared eval path
+                    Ffn::DenseKq { .. } => {
+                        return Err("DenseKq layer in the shared eval path".into())
+                    }
                     Ffn::Dense { gate, up, down } => {
                         kernels::matmul_q8_0(&mut st.gate_act, gate, &st.normed, s.n_embd, s.n_ff_dense, n_tok)?;
                         kernels::matmul_q8_0(&mut st.up_act, up, &st.normed, s.n_embd, s.n_ff_dense, n_tok)?;

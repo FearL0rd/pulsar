@@ -35,12 +35,14 @@ fn argmax(row: &[f32]) -> u32 {
     best as u32
 }
 
-/// Per-GDN-layer device state.
+/// Per-GDN-layer device state (on the layer's owner card).
 struct GdnState {
     /// delta-rule state [ssm_v_heads][ssm_state][ssm_state]
     s: DeviceBuf,
     /// conv window [ssm_conv_k - 1][conv_dim]
     conv: DeviceBuf,
+    /// owner device (dense split; primary elsewhere)
+    dev: i32,
 }
 
 /// DFlash runtime state riding on Qwen35Rt (allocated on first use).
@@ -64,9 +66,139 @@ struct DflashRt {
     layer_ids: Vec<usize>,
 }
 
+/// Second-card copies of every activation/scratch buffer the layer
+/// eval touches, for the dense split (Model.layer_dev): swapped into
+/// State/Qwen35Rt at the ownership boundary so eval_qwen35_layer runs
+/// unchanged, then swapped back for the tail. The residual stream
+/// crosses cards exactly twice per chunk.
+struct DenseBank {
+    dev: i32,
+    /// first layer owned by dev (layers split contiguously)
+    first: usize,
+    // State halves
+    cur: DeviceBuf,
+    normed: DeviceBuf,
+    attn_out: DeviceBuf,
+    after_attn: DeviceBuf,
+    q: DeviceBuf,
+    k: DeviceBuf,
+    v: DeviceBuf,
+    heads: DeviceBuf,
+    xq: DeviceBuf,
+    gate_act: DeviceBuf,
+    up_act: DeviceBuf,
+    ffn_mid: DeviceBuf,
+    midq: DeviceBuf,
+    ffn_out: DeviceBuf,
+    // Qwen35Rt scratch halves
+    qkv: DeviceBuf,
+    conv_out: DeviceBuf,
+    z: DeviceBuf,
+    gq: DeviceBuf,
+    gk: DeviceBuf,
+    gv: DeviceBuf,
+    small: DeviceBuf,
+    g: DeviceBuf,
+    beta: DeviceBuf,
+    gdn_o: DeviceBuf,
+    gdn_tmp: DeviceBuf,
+    qfull: DeviceBuf,
+    gate: DeviceBuf,
+}
+
+impl DenseBank {
+    fn new(m: &Model) -> Result<Option<DenseBank>> {
+        let s = m.shape;
+        let primary = kernels::get_device();
+        let Some(first) = m.layers.iter().enumerate().position(|(il, _)| m.layer_dev(il) != primary)
+        else {
+            return Ok(None);
+        };
+        let dev = m.layer_dev(first);
+        let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
+        let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
+        let conv_dim = 2 * key_dim + value_dim;
+        let n_ff = s.n_ff_exp as usize;
+        let n_embd = s.n_embd as usize;
+        kernels::set_device(dev)?;
+        let f32s = |n: usize| DeviceBuf::alloc(n * 4);
+        let q8k = |n: usize| {
+            DeviceBuf::alloc(n / kernels::Q8_K_BLOCK_ELEMS * kernels::Q8_K_BLOCK_BYTES)
+        };
+        let b = DenseBank {
+            dev,
+            first,
+            cur: f32s(T_MAX * n_embd)?,
+            normed: f32s(T_MAX * n_embd)?,
+            attn_out: f32s(T_MAX * n_embd)?,
+            after_attn: f32s(T_MAX * n_embd)?,
+            q: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
+            k: f32s(T_MAX * (s.n_head_kv * s.head_dim) as usize)?,
+            v: f32s(T_MAX * (s.n_head_kv * s.head_dim) as usize)?,
+            heads: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
+            xq: q8k(T_MAX * n_embd)?,
+            gate_act: f32s(T_MAX * n_ff)?,
+            up_act: f32s(T_MAX * n_ff)?,
+            ffn_mid: f32s(T_MAX * n_ff)?,
+            midq: q8k(T_MAX * n_ff)?,
+            ffn_out: f32s(T_MAX * n_embd)?,
+            qkv: f32s(T_MAX * conv_dim)?,
+            conv_out: f32s(T_MAX * conv_dim)?,
+            z: f32s(T_MAX * value_dim)?,
+            gq: f32s(T_MAX * key_dim)?,
+            gk: f32s(T_MAX * key_dim)?,
+            gv: f32s(T_MAX * value_dim)?,
+            small: f32s(T_MAX * s.ssm_v_heads as usize)?,
+            g: f32s(T_MAX * s.ssm_v_heads as usize)?,
+            beta: f32s(T_MAX * s.ssm_v_heads as usize)?,
+            gdn_o: f32s(T_MAX * value_dim)?,
+            gdn_tmp: f32s(T_MAX * value_dim)?,
+            qfull: f32s(T_MAX * 2 * (s.n_head * s.head_dim) as usize)?,
+            gate: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
+        };
+        kernels::set_device(primary)?;
+        Ok(Some(b))
+    }
+
+    /// Exchange the eval buffers with State/Qwen35Rt (call with the bank
+    /// taken OUT of rt). Symmetric: calling it twice restores the wiring.
+    fn swap(&mut self, st: &mut State, rt_scratch: &mut Qwen35Rt) {
+        use std::mem::swap;
+        swap(&mut self.cur, &mut st.cur);
+        swap(&mut self.normed, &mut st.normed);
+        swap(&mut self.attn_out, &mut st.attn_out);
+        swap(&mut self.after_attn, &mut st.after_attn);
+        swap(&mut self.q, &mut st.q);
+        swap(&mut self.k, &mut st.k);
+        swap(&mut self.v, &mut st.v);
+        swap(&mut self.heads, &mut st.heads);
+        swap(&mut self.xq, &mut st.xq);
+        swap(&mut self.gate_act, &mut st.gate_act);
+        swap(&mut self.up_act, &mut st.up_act);
+        swap(&mut self.ffn_mid, &mut st.ffn_mid);
+        swap(&mut self.midq, &mut st.midq);
+        swap(&mut self.ffn_out, &mut st.ffn_out);
+        swap(&mut self.qkv, &mut rt_scratch.qkv);
+        swap(&mut self.conv_out, &mut rt_scratch.conv_out);
+        swap(&mut self.z, &mut rt_scratch.z);
+        swap(&mut self.gq, &mut rt_scratch.gq);
+        swap(&mut self.gk, &mut rt_scratch.gk);
+        swap(&mut self.gv, &mut rt_scratch.gv);
+        swap(&mut self.small, &mut rt_scratch.small);
+        swap(&mut self.g, &mut rt_scratch.g);
+        swap(&mut self.beta, &mut rt_scratch.beta);
+        swap(&mut self.gdn_o, &mut rt_scratch.gdn_o);
+        swap(&mut self.gdn_tmp, &mut rt_scratch.gdn_tmp);
+        swap(&mut self.qfull, &mut rt_scratch.qfull);
+        swap(&mut self.gate, &mut rt_scratch.gate);
+    }
+}
+
 /// qwen35 runtime: GDN states + scratch sized for T_MAX-token chunks.
 pub(super) struct Qwen35Rt {
     states: Vec<Option<GdnState>>,
+    /// dense-split second-card buffers (None single-card)
+    bank: Option<DenseBank>,
     qkv: DeviceBuf,      // [T][conv_dim] raw projection
     conv_out: DeviceBuf, // [T][conv_dim] conv+silu, layout [q|k|v] per row
     z: DeviceBuf,        // [T][value_dim]
@@ -87,6 +219,7 @@ pub(super) struct Qwen35Rt {
 impl Qwen35Rt {
     pub fn new(m: &Model) -> Result<Qwen35Rt> {
         let s = m.shape;
+        let primary = kernels::get_device();
         let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
         let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
         let conv_dim = 2 * key_dim + value_dim;
@@ -95,6 +228,8 @@ impl Qwen35Rt {
             if (il + 1) % s.full_attn_interval == 0 {
                 states.push(None);
             } else {
+                let dev = m.layer_dev(il as usize);
+                kernels::set_device(dev)?;
                 let sbytes = s.ssm_v_heads as usize
                     * s.ssm_state as usize
                     * s.ssm_state as usize
@@ -103,14 +238,18 @@ impl Qwen35Rt {
                 let mut st = GdnState {
                     s: DeviceBuf::alloc(sbytes)?,
                     conv: DeviceBuf::alloc(cbytes)?,
+                    dev,
                 };
                 kernels::zero(&mut st.s, sbytes)?;
                 kernels::zero(&mut st.conv, cbytes)?;
                 states.push(Some(st));
             }
         }
+        kernels::set_device(primary)?;
+        let bank = DenseBank::new(m)?;
         let f32s = |n: usize| DeviceBuf::alloc(n * 4);
         Ok(Qwen35Rt {
+            bank,
             states,
             qkv: f32s(T_MAX * conv_dim)?,
             conv_out: f32s(T_MAX * conv_dim)?,
@@ -131,17 +270,25 @@ impl Qwen35Rt {
     }
 
     fn reset(&mut self) -> Result {
+        let primary = kernels::get_device();
         for st in self.states.iter_mut().flatten() {
+            kernels::set_device(st.dev)?;
             let (sb, cb) = (st.s.bytes(), st.conv.bytes());
             kernels::zero(&mut st.s, sb)?;
             kernels::zero(&mut st.conv, cb)?;
         }
+        kernels::set_device(primary)?;
         Ok(())
     }
 
     fn enable_dflash(&mut self, m: &Model, layer_ids: Vec<usize>) -> Result {
         if self.dflash.is_some() {
             return Ok(());
+        }
+        if self.bank.is_some() {
+            // the capture ring lives on the primary; scatter from
+            // second-card layers would cross devices mid-eval
+            return Err("dflash is not supported with the dense split (PULSAR_SPLIT=off)".into());
         }
         let s = m.shape;
         let feat_w = layer_ids.len() * s.n_embd as usize;
@@ -449,24 +596,55 @@ impl Model {
         }
         // chunked batched forward; `rows` logits must come from ONE
         // final chunk (callers keep verify blocks <= T_MAX)
+        let primary = kernels::get_device();
+        let mut bank = rt.bank.take();
+        let n0 = bank.as_ref().map_or(self.layers.len(), |b| b.first);
         let mut pos = pos0;
         let mut last_t = 0u32;
-        for chunk in tokens.chunks(T_MAX) {
+        let mut run = |st: &mut State, rt: &mut Qwen35Rt, chunk: &[u32], pos: u32| -> Result {
             let t = chunk.len() as u32;
             let ids: Vec<i32> = chunk.iter().map(|&x| x as i32).collect();
             st.tok.write(0, kernels::as_bytes(&ids))?;
             kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, t)?;
-            for (il, l) in self.layers.iter().enumerate() {
+            let dbg = std::env::var_os("PULSAR_DEBUG_L2").is_some();
+            for (il, l) in self.layers.iter().take(n0).enumerate() {
                 self.eval_qwen35_layer(st, rt, il, l, pos, t)?;
-                if std::env::var_os("PULSAR_DEBUG_L2").is_some() {
+                if dbg {
                     let a = st.after_attn.read_f32(4)?;
                     let v = st.cur.read_f32(4)?;
                     eprintln!("L{il}: attn {:?} cur {:?}", &a[..2], &v[..2]);
                 }
             }
-            pos += t;
-            last_t = t;
+            if let Some(b) = &mut bank {
+                // hop 1: residual over to the second card (issued with
+                // the producer current, so the consumer's launches order
+                // after it), then run its layers on its own buffers
+                let bytes = (t * s.n_embd) as usize * 4;
+                kernels::copy_across(&mut b.cur, &st.cur, bytes)?;
+                b.swap(st, rt);
+                kernels::set_device(b.dev)?;
+                for (il, l) in self.layers.iter().enumerate().skip(n0) {
+                    self.eval_qwen35_layer(st, rt, il, l, pos, t)?;
+                    if dbg {
+                        let a = st.after_attn.read_f32(4)?;
+                        let v = st.cur.read_f32(4)?;
+                        eprintln!("L{il}: attn {:?} cur {:?}", &a[..2], &v[..2]);
+                    }
+                }
+                // hop 2 back: after the swap b.cur is the card-1 buffer
+                // holding the final residual
+                b.swap(st, rt);
+                kernels::copy_across(&mut st.cur, &b.cur, bytes)?;
+                kernels::set_device(primary)?;
+            }
+            Ok(())
+        };
+        for chunk in tokens.chunks(T_MAX) {
+            run(st, rt, chunk, pos)?;
+            pos += chunk.len() as u32;
+            last_t = chunk.len() as u32;
         }
+        rt.bank = bank;
         if rows == 0 {
             return Ok(None);
         }
@@ -590,30 +768,35 @@ impl Model {
         }
         kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, t * s.n_embd)?;
 
-        // ---- MoE (pre-norm residual)
+        // ---- FFN (pre-norm residual)
         kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, t, eps)?;
+        if let Ffn::DenseKq { gate, up, down } = &l.ffn {
+            // dense 27B: resident K-quant triple, no experts, no syncs
+            kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
+            kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, s.n_ff_exp, t, gate.row_bytes, gate.quant)?;
+            kernels::matmul_kq(&mut st.up_act, &up.w, &st.xq, s.n_embd, s.n_ff_exp, t, up.row_bytes, up.quant)?;
+            kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * s.n_ff_exp, 0.0, 1.0, 0)?;
+            kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, s.n_ff_exp, t)?;
+            kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, s.n_ff_exp, s.n_embd, t, down.row_bytes, down.quant)?;
+            kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
+            return Ok(());
+        }
         let Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, .. } = &l.ffn else {
             return Err("qwen35 layer without MoE ffn".into());
         };
-        if s.n_expert > 1 {
-            kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, t)?;
-            kernels::router_select(
-                &mut st.router_selected,
-                &mut st.router_weights,
-                &st.router_logits,
-                probs_b,
-                s.n_expert,
-                s.n_expert_used,
-                s.expert_weight_scale,
-                t,
-                1, // softmax mode
-                0,
-            )?;
-        } else {
-            // dense-as-one-expert (qwen35 27B): expert 0, weight 1.0
-            let ones = vec![1.0f32; t as usize];
-            st.router_weights.write(0, kernels::as_bytes(&ones))?;
-        }
+        kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, t)?;
+        kernels::router_select(
+            &mut st.router_selected,
+            &mut st.router_weights,
+            &st.router_logits,
+            probs_b,
+            s.n_expert,
+            s.n_expert_used,
+            s.expert_weight_scale,
+            t,
+            1, // softmax mode
+            0,
+        )?;
         if let Some((sg, su, sd)) = shexp {
             kernels::matmul_q8_0(&mut st.gate_act, sg, &st.normed, s.n_embd, s.n_ff_exp, t)?;
             kernels::matmul_q8_0(&mut st.up_act, su, &st.normed, s.n_embd, s.n_ff_exp, t)?;
@@ -626,11 +809,7 @@ impl Model {
         }
         kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
         kernels::sync()?;
-        let selected = if s.n_expert > 1 {
-            st.router_selected.read_i32((t * s.n_expert_used) as usize)?
-        } else {
-            vec![0i32; t as usize]
-        };
+        let selected = st.router_selected.read_i32((t * s.n_expert_used) as usize)?;
         self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 0, t)?;
         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, t * s.n_embd)?;
         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
