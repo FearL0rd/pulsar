@@ -4708,7 +4708,11 @@ mod real {
                                 }
                                 continue;
                             }
-                            if lane.idx.contains_key(&e) {
+                            // PULSAR_CPU_VERIFY: fetch lane experts anyway
+                            // so a full-pointer GPU pass can cross-check
+                            // the lane partial (task #38 instrument)
+                            let verify = std::env::var_os("PULSAR_CPU_VERIFY").is_some() && n_tok == 1;
+                            if lane.idx.contains_key(&e) && !verify {
                                 continue;
                             }
                             for (t, le) in slabs_of(e as u32) {
@@ -4839,7 +4843,23 @@ mod real {
                         };
                         let mut tier_slots = vec![0u64; st.tiers.len()];
                         let mut tier_slots_sink = vec![0u64; st.tiers.len()];
+                        let verify = std::env::var_os("PULSAR_CPU_VERIFY").is_some() && n_tok == 1;
+                        // verify: lane experts with REAL pointers, everything
+                        // else NULL - isolates the lane set's GPU partial
+                        let mut vptrs: Vec<ExpertPtrs> = Vec::new();
                         for (si, &e) in selected.iter().enumerate() {
+                            if verify {
+                                vptrs.push(if e >= 0 && lane.idx.contains_key(&e) && tier_of(e).is_none() {
+                                    let [g3, u3, d3] = slabs_of(e as u32);
+                                    ExpertPtrs {
+                                        gate: resolved[&off_of(g3.0, g3.1)],
+                                        up: byte_off(resolved[&off_of(u3.0, u3.1)], *fused_up_off),
+                                        down: resolved[&off_of(d3.0, d3.1)],
+                                    }
+                                } else {
+                                    ExpertPtrs::NULL
+                                });
+                            }
                             if e < 0 || e as u32 >= s.n_expert + sink_n {
                                 ptrs.push(ExpertPtrs::NULL);
                                 continue;
@@ -4976,6 +4996,26 @@ mod real {
                             }
                             kernels::set_device(primary)?;
                             active.push((ti, tier_slots[ti] > 0, sink_hits > 0));
+                        }
+
+                        // PULSAR_CPU_VERIFY: GPU-compute the LANE experts
+                        // alone (vptrs) and stash the partial; compared
+                        // against the lane's CPU partial at the join
+                        let mut verify_gpu: Option<Vec<f32>> = None;
+                        if verify && !lane.is_empty() {
+                            st.expert_ptrs.write(0, kernels::as_bytes(&vptrs))?;
+                            kernels::moe_pair_swiglu(
+                                &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
+                                s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, s.moe_act_op,
+                            )?;
+                            kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                            kernels::moe_down(
+                                &mut st.moe_out, &st.expert_ptrs, &st.midq,
+                                s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+                            )?;
+                            kernels::sync()?;
+                            verify_gpu = Some(st.moe_out.read_f32((n_tok * s.n_embd) as usize)?);
+                            st.expert_ptrs.write(0, kernels::as_bytes(&ptrs))?;
                         }
 
                         // routed experts: activations quantized to q8_K,
@@ -5144,6 +5184,22 @@ mod real {
                             let t_cpu = std::time::Instant::now();
                             let pool = st.cpu_pool.as_ref().unwrap();
                             let acc = lane.finish(pool, n_tok as usize);
+                            if let Some(gpu) = &verify_gpu {
+                                let mut dmax = 0f32;
+                                let mut gmax = 0f32;
+                                for (i, (&g, &c)) in gpu.iter().zip(acc.iter()).enumerate() {
+                                    let d = (g - c).abs();
+                                    if d > dmax {
+                                        dmax = d;
+                                    }
+                                    let _ = i;
+                                    gmax = gmax.max(g.abs());
+                                }
+                                eprintln!(
+                                    "lane-verify L{il}: n={} max|gpu-cpu|={dmax:.5} max|gpu|={gmax:.5}",
+                                    lane.idx.len()
+                                );
+                            }
                             st.store.pinned.clear();
                             st.cpu_hits += lane.idx.len() as u64;
                             st.prof.cpu += t_cpu.elapsed();
