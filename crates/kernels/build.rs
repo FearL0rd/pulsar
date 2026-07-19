@@ -23,6 +23,13 @@ fn main() {
     let archs = std::env::var("PULSAR_CUDA_ARCH").unwrap_or_else(|_| "61,75,80,86,89".into());
     let mut build = cc::Build::new();
     build.cuda(true).flag("-O3").flag("--use_fast_math");
+    // Per-thread default stream: <<<>>> launches go to the calling
+    // thread's stream instead of the legacy NULL stream, which makes
+    // them CAPTURABLE into CUDA graphs (the legacy stream cannot begin
+    // capture). Pulsar launches all compute from one thread, so intra-
+    // thread ordering is unchanged; the async copy paths already use
+    // explicit streams with event ordering.
+    build.flag("--default-stream=per-thread");
     // nvcc rejects host compilers newer than its toolkit supports (e.g.
     // CUDA 12.0 caps at gcc 12 while distro c++ is gcc 13). Probe a tiny
     // compile with candidate ccbins and take the first one nvcc accepts.

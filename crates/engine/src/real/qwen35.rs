@@ -213,6 +213,14 @@ pub(super) struct Qwen35Rt {
     states: Vec<Option<GdnState>>,
     /// dense-split second-card buffers (None single-card)
     bank: Option<DenseBank>,
+    /// CUDA graphs for GDN layer runs, keyed by (rows, first layer).
+    /// GDN layers have no position inputs (recurrent state, no rope/KV)
+    /// and the dense path is pure kernel launches, so a run's chain is
+    /// static across tokens; attention layers stay outside (their
+    /// split-K grid is derived from pos on the host). PULSAR_GRAPHS=0
+    /// disables.
+    graphs: std::collections::HashMap<(u32, usize), kernels::Graph>,
+    graphs_on: bool,
     qkv: DeviceBuf,      // [T][conv_dim] raw projection
     conv_out: DeviceBuf, // [T][conv_dim] conv+silu, layout [q|k|v] per row
     z: DeviceBuf,        // [T][value_dim]
@@ -264,8 +272,12 @@ impl Qwen35Rt {
         kernels::set_device(primary)?;
         let bank = DenseBank::new(m)?;
         let f32s = |n: usize| DeviceBuf::alloc(n * 4);
+        let graphs_on = std::env::var("PULSAR_GRAPHS").ok().as_deref() != Some("0")
+            && m.layers.iter().any(|l| matches!(l.ffn, super::Ffn::DenseKq { .. }));
         Ok(Qwen35Rt {
             bank,
+            graphs: std::collections::HashMap::new(),
+            graphs_on,
             states,
             qkv: f32s(T_MAX * conv_dim)?,
             conv_out: f32s(T_MAX * conv_dim)?,
@@ -658,15 +670,7 @@ impl Model {
             let ids: Vec<i32> = chunk.iter().map(|&x| x as i32).collect();
             st.tok.write(0, kernels::as_bytes(&ids))?;
             kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, t)?;
-            let dbg = std::env::var_os("PULSAR_DEBUG_L2").is_some();
-            for (il, l) in self.layers.iter().take(n0).enumerate() {
-                self.eval_qwen35_layer(st, rt, il, l, pos, t)?;
-                if dbg {
-                    let a = st.after_attn.read_f32(4)?;
-                    let v = st.cur.read_f32(4)?;
-                    eprintln!("L{il}: attn {:?} cur {:?}", &a[..2], &v[..2]);
-                }
-            }
+            self.eval_qwen35_span(st, rt, 0, n0, pos, t)?;
             if let Some(b) = &mut bank {
                 // hop 1: residual over to the second card (issued with
                 // the producer current, so the consumer's launches order
@@ -675,14 +679,7 @@ impl Model {
                 kernels::copy_across(&mut b.cur, &st.cur, bytes)?;
                 b.swap(st, rt);
                 kernels::set_device(b.dev)?;
-                for (il, l) in self.layers.iter().enumerate().skip(n0) {
-                    self.eval_qwen35_layer(st, rt, il, l, pos, t)?;
-                    if dbg {
-                        let a = st.after_attn.read_f32(4)?;
-                        let v = st.cur.read_f32(4)?;
-                        eprintln!("L{il}: attn {:?} cur {:?}", &a[..2], &v[..2]);
-                    }
-                }
+                self.eval_qwen35_span(st, rt, n0, self.layers.len(), pos, t)?;
                 // hop 2 back: after the swap b.cur is the card-1 buffer
                 // holding the final residual
                 b.swap(st, rt);
@@ -710,6 +707,56 @@ impl Model {
         self.head_logits(st, k)?;
         kernels::sync()?;
         Ok(Some(st.logits.read_f32(k as usize * s.n_vocab as usize)?))
+    }
+
+    /// Eval layers [lo, hi) on the current device. Runs of GDN+DenseKq
+    /// layers replay as CUDA graphs: no position inputs, no host work -
+    /// one launch instead of ~22 per layer. Attention layers (and any
+    /// debug/prof mode) launch plain.
+    fn eval_qwen35_span(&self, st: &mut State, rt: &mut Qwen35Rt, lo: usize, hi: usize, pos: u32, t: u32) -> Result {
+        let dbg = std::env::var_os("PULSAR_DEBUG_L2").is_some()
+            || std::env::var_os("PULSAR_DENSE_PROF").is_some();
+        let graphable = |il: usize| {
+            let l = &self.layers[il];
+            matches!(&l.attn, Attn::Qwen35(w) if w.gdn.is_some())
+                && matches!(l.ffn, Ffn::DenseKq { .. })
+        };
+        let mut graphs = std::mem::take(&mut rt.graphs);
+        let mut il = lo;
+        let r = (|| -> Result {
+            while il < hi {
+                if rt.graphs_on && !dbg && graphable(il) {
+                    let mut end = il + 1;
+                    while end < hi && graphable(end) {
+                        end += 1;
+                    }
+                    let key = (t, il);
+                    if !graphs.contains_key(&key) {
+                        let (lo2, hi2) = (il, end);
+                        let g = kernels::Graph::capture(|| {
+                            for j in lo2..hi2 {
+                                self.eval_qwen35_layer(st, rt, j, &self.layers[j], pos, t)?;
+                            }
+                            Ok(())
+                        })?;
+                        graphs.insert(key, g);
+                    }
+                    graphs[&key].launch()?;
+                    il = end;
+                } else {
+                    self.eval_qwen35_layer(st, rt, il, &self.layers[il], pos, t)?;
+                    if std::env::var_os("PULSAR_DEBUG_L2").is_some() {
+                        let a = st.after_attn.read_f32(4)?;
+                        let v = st.cur.read_f32(4)?;
+                        eprintln!("L{il}: attn {:?} cur {:?}", &a[..2], &v[..2]);
+                    }
+                    il += 1;
+                }
+            }
+            Ok(())
+        })();
+        rt.graphs = graphs;
+        r
     }
 
     pub(super) fn eval_qwen35_layer(&self, st: &mut State, rt: &mut Qwen35Rt, il: usize, l: &LayerW, pos: u32, t: u32) -> Result {

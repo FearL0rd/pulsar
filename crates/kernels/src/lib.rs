@@ -541,6 +541,72 @@ mod real {
     }
 
     extern "C" {
+        fn cudaStreamBeginCapture(stream: *mut c_void, mode: u32) -> i32;
+        fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> i32;
+        fn cudaGraphInstantiateWithFlags(exec: *mut *mut c_void, graph: *mut c_void, flags: u64) -> i32;
+        fn cudaGraphLaunch(exec: *mut c_void, stream: *mut c_void) -> i32;
+        fn cudaGraphDestroy(graph: *mut c_void) -> i32;
+        fn cudaGraphExecDestroy(exec: *mut c_void) -> i32;
+    }
+
+    /// The calling thread's default stream (kernels compile with
+    /// --default-stream=per-thread, so <<<>>> launches land here and are
+    /// capturable; the legacy NULL stream cannot begin capture).
+    const STREAM_PER_THREAD: *mut c_void = 0x2 as *mut c_void;
+    /// cudaStreamCaptureModeThreadLocal: only THIS thread's illegal
+    /// calls invalidate the capture (background copy threads unaffected).
+    const CAPTURE_THREAD_LOCAL: u32 = 1;
+
+    /// An instantiated CUDA graph: a recorded launch chain replayed with
+    /// one API call. Capture and launch with the SAME device current
+    /// (single-device graphs).
+    pub struct Graph {
+        exec: *mut c_void,
+    }
+
+    unsafe impl Send for Graph {}
+
+    impl Graph {
+        /// Record every kernel the closure launches on this thread's
+        /// default stream into a graph (nothing executes during capture)
+        /// and instantiate it. On closure error the capture is unwound.
+        pub fn capture<F: FnOnce() -> Result>(f: F) -> Result<Graph> {
+            ensure_device();
+            check_rt(
+                unsafe { cudaStreamBeginCapture(STREAM_PER_THREAD, CAPTURE_THREAD_LOCAL) },
+                "graph begin capture",
+            )?;
+            let r = f();
+            let mut graph = std::ptr::null_mut();
+            let end = check_rt(
+                unsafe { cudaStreamEndCapture(STREAM_PER_THREAD, &mut graph) },
+                "graph end capture",
+            );
+            r?;
+            end?;
+            let mut exec = std::ptr::null_mut();
+            let inst = check_rt(
+                unsafe { cudaGraphInstantiateWithFlags(&mut exec, graph, 0) },
+                "graph instantiate",
+            );
+            unsafe { cudaGraphDestroy(graph) };
+            inst?;
+            Ok(Graph { exec })
+        }
+
+        /// Replay the recorded chain on this thread's default stream.
+        pub fn launch(&self) -> Result {
+            check_rt(unsafe { cudaGraphLaunch(self.exec, STREAM_PER_THREAD) }, "graph launch")
+        }
+    }
+
+    impl Drop for Graph {
+        fn drop(&mut self) {
+            unsafe { cudaGraphExecDestroy(self.exec) };
+        }
+    }
+
+    extern "C" {
         fn cudaStreamCreateWithFlags(s: *mut *mut c_void, flags: u32) -> i32;
         fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32, stream: *mut c_void) -> i32;
         fn cudaEventCreateWithFlags(e: *mut *mut c_void, flags: u32) -> i32;
