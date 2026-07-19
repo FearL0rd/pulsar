@@ -54,6 +54,9 @@ struct GdnState {
     conv: DeviceBuf,
     /// owner device (dense split; primary elsewhere)
     dev: i32,
+    /// pre-verify snapshots for nextn-MTP rounds (lazy, on `dev`)
+    snap_s: Option<DeviceBuf>,
+    snap_conv: Option<DeviceBuf>,
 }
 
 /// DFlash runtime state riding on Qwen35Rt (allocated on first use).
@@ -250,6 +253,8 @@ impl Qwen35Rt {
                     s: DeviceBuf::alloc(sbytes)?,
                     conv: DeviceBuf::alloc(cbytes)?,
                     dev,
+                    snap_s: None,
+                    snap_conv: None,
                 };
                 kernels::zero(&mut st.s, sbytes)?;
                 kernels::zero(&mut st.conv, cbytes)?;
@@ -278,6 +283,42 @@ impl Qwen35Rt {
             shg: f32s(T_MAX)?,
             dflash: None,
         })
+    }
+
+    /// Snapshot every GDN state (nextn-MTP verify rounds; buffers live
+    /// beside their state, so the copies never cross cards).
+    pub(super) fn gdn_snapshot(&mut self) -> Result {
+        let primary = kernels::get_device();
+        for gs in self.states.iter_mut().flatten() {
+            kernels::set_device(gs.dev)?;
+            if gs.snap_s.is_none() {
+                gs.snap_s = Some(DeviceBuf::alloc(gs.s.bytes())?);
+                gs.snap_conv = Some(DeviceBuf::alloc(gs.conv.bytes())?);
+            }
+            let ss = gs.snap_s.as_mut().unwrap();
+            kernels::copy_d2d(ss, 0, &gs.s, 0, gs.s.bytes())?;
+            let sc = gs.snap_conv.as_mut().unwrap();
+            kernels::copy_d2d(sc, 0, &gs.conv, 0, gs.conv.bytes())?;
+        }
+        kernels::set_device(primary)?;
+        Ok(())
+    }
+
+    /// Restore the last gdn_snapshot (partial MTP acceptance).
+    pub(super) fn gdn_restore(&mut self) -> Result {
+        let primary = kernels::get_device();
+        for gs in self.states.iter_mut().flatten() {
+            let (Some(ss), Some(sc)) = (&gs.snap_s, &gs.snap_conv) else {
+                return Err("gdn_restore without a snapshot".into());
+            };
+            kernels::set_device(gs.dev)?;
+            let n = gs.s.bytes();
+            kernels::copy_d2d(&mut gs.s, 0, ss, 0, n)?;
+            let n = gs.conv.bytes();
+            kernels::copy_d2d(&mut gs.conv, 0, sc, 0, n)?;
+        }
+        kernels::set_device(primary)?;
+        Ok(())
     }
 
     fn reset(&mut self) -> Result {
@@ -671,7 +712,7 @@ impl Model {
         Ok(Some(st.logits.read_f32(k as usize * s.n_vocab as usize)?))
     }
 
-    fn eval_qwen35_layer(&self, st: &mut State, rt: &mut Qwen35Rt, il: usize, l: &LayerW, pos: u32, t: u32) -> Result {
+    pub(super) fn eval_qwen35_layer(&self, st: &mut State, rt: &mut Qwen35Rt, il: usize, l: &LayerW, pos: u32, t: u32) -> Result {
         let s = self.shape;
         let eps = s.rms_eps;
         let Attn::Qwen35(w) = &l.attn else {

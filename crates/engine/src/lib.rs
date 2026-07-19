@@ -3302,8 +3302,9 @@ mod real {
                 // per-layer geometry (gemma4): a SWA layer's cache is its
                 // own kv width, not the Shape max
                 let (kb, vb) = if s.family == Family::Qwen35 {
-                    // only full-attention layers hold KV
-                    if (i as u32 + 1) % s.full_attn_interval == 0 {
+                    // only full-attention layers hold KV; the nextn/MTP
+                    // draft slot is a full-attention layer too
+                    if i == s.n_exec_layer as usize || (i as u32 + 1) % s.full_attn_interval == 0 {
                         (k_bytes, v_bytes)
                     } else {
                         (4, 4)
@@ -4777,7 +4778,22 @@ mod real {
                 kernels::copy_d2d(&mut st.mtp_x, i * 2 * row + row, &st.mtp_h, i * row, row)?;
             }
             kernels::matmul_q8_0(&mut st.cur, &mtp.eh_proj, &st.mtp_x, 2 * s.n_embd, s.n_embd, n_tok)?;
-            self.eval_layer(st, self.layers.len(), &mtp.layer, n_tok, pos0, primary)
+            self.mtp_eval_layer(st, n_tok, pos0, primary)
+        }
+
+        /// Eval the MTP draft layer over st.cur (family dispatch: the
+        /// hybrid families have their own layer graphs).
+        fn mtp_eval_layer(&self, st: &mut State, n_tok: u32, pos0: u32, primary: i32) -> Result {
+            let mtp = self.mtp.as_ref().ok_or("mtp layer missing")?;
+            match self.shape.family {
+                Family::Qwen35 => {
+                    let mut rt = st.qwen35.take().ok_or("qwen35 state missing")?;
+                    let r = self.eval_qwen35_layer(st, &mut rt, self.layers.len(), &mtp.layer, pos0, n_tok);
+                    st.qwen35 = Some(rt);
+                    r
+                }
+                _ => self.eval_layer(st, self.layers.len(), &mtp.layer, n_tok, pos0, primary),
+            }
         }
 
         /// One MTP pass: embed `token` at `pos` against st.mtp_hidden,
@@ -4810,7 +4826,7 @@ mod real {
             kernels::copy_d2d(&mut st.mtp_x, 0, &st.mtp_e, 0, row)?;
             kernels::copy_d2d(&mut st.mtp_x, row, &st.mtp_h, 0, row)?;
             kernels::matmul_q8_0(&mut st.cur, &mtp.eh_proj, &st.mtp_x, 2 * s.n_embd, s.n_embd, 1)?;
-            self.eval_layer(st, self.layers.len(), &mtp.layer, 1, pos, primary)
+            self.mtp_eval_layer(st, 1, pos, primary)
         }
     }
 
@@ -4829,7 +4845,16 @@ mod real {
         let spec = model.mtp.is_some() && sampler.is_greedy();
         let mut pos = pos0;
         let mut logits = None;
-        for chunk in prompt.chunks(st.max_batch() as usize) {
+        // qwen35 MTP prefill: the draft-layer scratch is 16-row and the
+        // qwen35 forward leaves only its LAST 16-row chunk in st.cur, so
+        // the fill pass needs outer chunks capped to match (the forward
+        // is internally 16-chunked anyway - same work either way)
+        let chunk_cap = if spec && model.shape.family == Family::Qwen35 {
+            16
+        } else {
+            st.max_batch() as usize
+        };
+        for chunk in prompt.chunks(chunk_cap) {
             logits = model.forward_batch(st, chunk, pos, true)?;
             if spec {
                 model.mtp_prefill_fill(st, chunk.len() as u32, pos)?;
@@ -4951,6 +4976,17 @@ mod real {
                 // union expert fetch is what makes the extra rows cheap.
                 // Greedy acceptance keeps the stream identical to plain
                 // greedy decode.
+                //
+                // Recurrent families (qwen35 GDN): verify advances the
+                // delta-rule/conv state over the WHOLE chain, and unlike
+                // KV rows a recurrent state can't be overwritten next
+                // round. Snapshot first; full acceptance means the state
+                // is exactly right (free), partial acceptance restores
+                // and re-forwards the accepted prefix.
+                let recurrent = model.shape.family == Family::Qwen35;
+                if recurrent {
+                    st.qwen35.as_mut().ok_or("qwen35 state missing")?.gdn_snapshot()?;
+                }
                 let all = model
                     .forward_rows(st, &chain, pos, (k + 1) as u32)?
                     .ok_or("no verify logits")?;
@@ -4958,6 +4994,12 @@ mod real {
                 while j < k && argmax(&all[j * v..(j + 1) * v]) == chain[j + 1] {
                     st.mtp_accepted += 1;
                     j += 1;
+                }
+                if recurrent && j < k {
+                    st.qwen35.as_mut().ok_or("qwen35 state missing")?.gdn_restore()?;
+                    // no logits; leaves st.cur/st.tok holding exactly the
+                    // accepted rows for the fill pass below
+                    model.forward_batch(st, &chain[..=j], pos, false)?;
                 }
                 if debug {
                     let nans = all.iter().filter(|x| !x.is_finite()).count();
