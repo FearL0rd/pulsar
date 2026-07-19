@@ -23,9 +23,10 @@ use kernels::DeviceBuf;
 /// quantize once per distinct input).
 fn matw(out: &mut DeviceBuf, w: &MatW, x: &DeviceBuf, xq: &DeviceBuf, in_dim: u32, out_dim: u32, t: u32) -> Result {
     match w {
-        MatW::Q8(b) => kernels::matmul_q8_0(out, b, x, in_dim, out_dim, t),
-        MatW::Kq(k) => kernels::matmul_kq(out, &k.w, xq, in_dim, out_dim, t, k.row_bytes, k.quant),
+        MatW::Q8(b) => kernels::matmul_q8_0(out, b, x, in_dim, out_dim, t)?,
+        MatW::Kq(k) => kernels::matmul_kq(out, &k.w, xq, in_dim, out_dim, t, k.row_bytes, k.quant)?,
     }
+    Ok(())
 }
 
 /// Verify/prefill chunk width (DFlash block size; also the register
