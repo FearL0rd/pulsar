@@ -5051,9 +5051,14 @@ mod real {
                                     let mid = st.moe_mid.read_f32(s.n_expert_used as usize * s.n_ff_exp as usize)?;
                                     let base = slot * s.n_ff_exp as usize;
                                     let rw2 = st.router_weights.read_f32(n_used)?;
+                                    // activation cross-check: gpu xq block-0
+                                    // scale vs a fresh host quantize of normed
+                                    let xq_d = st.xq.read_f32(1)?[0];
+                                    let nh = st.normed.read_f32(8)?;
+                                    let hq = quant::cpu_dot::quantize_row_q8_k(&st.normed.read_f32(s.n_embd as usize)?);
                                     eprintln!(
-                                        "verify L30 slot {slot} e={}: gpu mid {:?} rw {:?} lane {:?}",
-                                        selected[slot], &mid[base..base + 4], &rw2[..n_used.min(12)], lane.dbg()
+                                        "verify L30 slot {slot} e={}: gpu mid {:?} xq.d={xq_d:.6} host q8.d={:.6} normed {:?} rw {:?} lane {:?}",
+                                        selected[slot], &mid[base..base + 4], hq.d[0], &nh[..4], &rw2[..n_used.min(12)], lane.dbg()
                                     );
                                 }
                             }
