@@ -1788,12 +1788,14 @@ struct wdot_q6_K {
         const float d = f16_to_f32(x->d) * y->d;
         /* lane -> (chunk j of 128 values, i in {0,4..28}, low/high pair) */
         const uint32_t j = lane >> 4, i = (lane & 7u) << 2, hi = (lane >> 3) & 1u;
+        /* block_q6_K is 210 bytes - rows are only 2-aligned, so the
+         * quant words go through the byte loader (q8_K stays 4-aligned) */
         const uint8_t *ql = x->ql + 64 * j;
-        const uint32_t h = *(const uint32_t *)(x->qh + 32 * j + i);
+        const uint32_t h = load_u32_bytes(x->qh + 32 * j + i);
         const int8_t *q8 = y->qs + 128 * j + 64 * hi;
         const int8_t *sc = x->scales + 8 * j + 4 * hi;
-        const uint32_t lo0 = *(const uint32_t *)(ql + i);
-        const uint32_t lo1 = *(const uint32_t *)(ql + 32 + i);
+        const uint32_t lo0 = load_u32_bytes(ql + i);
+        const uint32_t lo1 = load_u32_bytes(ql + 32 + i);
         const uint32_t sub = i >> 4;
         int32_t va, vb;
         if (hi == 0) {
