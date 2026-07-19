@@ -5187,17 +5187,22 @@ mod real {
                             if let Some(gpu) = &verify_gpu {
                                 let mut dmax = 0f32;
                                 let mut gmax = 0f32;
+                                let mut cmax = 0f32;
+                                let mut at = 0usize;
                                 for (i, (&g, &c)) in gpu.iter().zip(acc.iter()).enumerate() {
                                     let d = (g - c).abs();
                                     if d > dmax {
                                         dmax = d;
                                     }
-                                    let _ = i;
-                                    gmax = gmax.max(g.abs());
+                                    if g.abs() > gmax {
+                                        gmax = g.abs();
+                                        at = i;
+                                    }
+                                    cmax = cmax.max(c.abs());
                                 }
                                 eprintln!(
-                                    "lane-verify L{il}: n={} max|gpu-cpu|={dmax:.5} max|gpu|={gmax:.5}",
-                                    lane.idx.len()
+                                    "lane-verify L{il}: n={} max|gpu-cpu|={dmax:.5} max|gpu|={gmax:.5} max|cpu|={cmax:.5} at[{at}] gpu={:.5} cpu={:.5}",
+                                    lane.idx.len(), gpu[at], acc[at]
                                 );
                             }
                             st.store.pinned.clear();
