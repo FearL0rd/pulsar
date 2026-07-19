@@ -77,8 +77,8 @@ is the int8-MMA path the MoE verify unions already use).
 
 DeepSeek-V4-Flash runs its state machines (sliding-window ring,
 streaming KV compressor, Sinkhorn hyper-connection gates) fully on
-device and prefills in batched 16-token chunks (~14 tok/s prefill,
-2.7x the first port; one router readback and one expert union per
+device and prefills in batched 16-token chunks (~26 tok/s prefill
+with the CPU lane, 2026-07-19 re-measure; one router readback and one expert union per
 chunk-layer, with the per-token ring/compressor/attention interleave
 preserved bit-exactly). Long-context retrieval verified by needle
 recall at 2.4k ctx through compressed rows.
