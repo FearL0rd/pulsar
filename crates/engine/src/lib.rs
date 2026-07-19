@@ -1573,6 +1573,8 @@ mod real {
         pub fn supported(quant: u32) -> bool {
             [
                 kernels::QUANT_IQ2_XXS,
+                kernels::QUANT_IQ2_XS,
+                kernels::QUANT_IQ3_XXS,
                 kernels::QUANT_Q2_K,
                 kernels::QUANT_Q3_K,
                 kernels::QUANT_Q4_K,
@@ -1582,6 +1584,12 @@ mod real {
 
         pub fn dot(quant: u32, row: &[u8], xq: &quant::cpu_dot::Q8KRow, n: usize) -> f32 {
             match quant {
+                q if q == kernels::QUANT_IQ2_XS => {
+                    quant::cpu_dot::vec_dot_iq2_xs_q8_k(row, xq, n)
+                }
+                q if q == kernels::QUANT_IQ3_XXS => {
+                    quant::cpu_dot::vec_dot_iq3_xxs_q8_k(row, xq, n)
+                }
                 q if q == kernels::QUANT_Q2_K => quant::cpu_dot::vec_dot_q2_k_q8_k(row, xq, n),
                 q if q == kernels::QUANT_Q3_K => quant::cpu_dot::vec_dot_q3_k_q8_k(row, xq, n),
                 q if q == kernels::QUANT_Q4_K => quant::cpu_dot::vec_dot_q4_k_q8_k(row, xq, n),
@@ -4384,6 +4392,15 @@ mod real {
                             s.moe_act_op,
                         );
                         let mut cpu_guard: Option<cpu_tier::WaitGuard> = None;
+                        // PULSAR_CPU_STEAL=0: leave dev-cache-resident
+                        // experts to the GPU. Right call on boxes where
+                        // warm VRAM coverage is high and the CPU is weak
+                        // (a V100 user measured the lane net-negative
+                        // there); default 1 = deterministic CPU ownership
+                        // of host-cached experts, which is what stabilizes
+                        // the cache ecology on high-miss boxes like mine.
+                        let cpu_steal =
+                            std::env::var("PULSAR_CPU_STEAL").ok().as_deref() != Some("0");
                         if cpu_on {
                             let mut pins = Vec::new();
                             for &e in &distinct {
@@ -4393,6 +4410,19 @@ mod real {
                                 let [g3, u3, d3] = slabs_of(e as u32);
                                 let (go, uo, dno) =
                                     (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
+                                // PULSAR_CPU_STEAL=0: leave VRAM-resident experts
+                                // on the GPU (weak-CPU / high-coverage boxes).
+                                if !cpu_steal
+                                    && (st.dev_cache.map.contains_key(&go)
+                                        || st.dev_cache.map.contains_key(&uo)
+                                        || st.dev_cache.map.contains_key(&dno))
+                                {
+                                    continue;
+                                }
+                                // host-cached => CPU lane, even when a slab
+                                // also sits in dev_cache: exclusion made
+                                // ownership a first-touch race, bistable
+                                // run to run (GLM oscillated 1.6-2.8).
                                 if self
                                     .mtp
                                     .as_ref()

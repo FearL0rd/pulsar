@@ -240,6 +240,119 @@ pub fn vec_dot_q4_k_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
     total
 }
 
+/// iq2_xs: 74 bytes per 256 - f16 d, 32 u16 qs (low 9 bits = row in the
+/// 512-entry grid, high 7 = ksigns index), 8 scale bytes (two 4-bit
+/// scales per 32-group). Mirrors dev_dot_iq2_xs_q8_K_block, with the
+/// group sums kept integer (exact) instead of the GPU's f32 running sum.
+pub const IQ2_XS_BLOCK_BYTES: usize = 2 + 64 + 8;
+/// iq3_xxs: 98 bytes per 256 - f16 d, 64 grid bytes (4 values each via
+/// the 256-entry u32 grid), then 8 u32 of 4x7-bit ksigns + 4-bit scale.
+/// Scale is applied in f32 per group: db = d * (0.5 + s) * 0.5.
+pub const IQ3_XXS_BLOCK_BYTES: usize = 2 + 96;
+
+pub fn vec_dot_iq2_xs_q8_k(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { avx2::vec_dot_iq2xs(row, x, n) };
+    }
+    vec_dot_iq2_xs_q8_k_scalar(row, x, n)
+}
+
+pub fn vec_dot_iq2_xs_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+    let nb = n / QK_K;
+    debug_assert!(row.len() >= nb * IQ2_XS_BLOCK_BYTES);
+    let grid = &crate::cpu_dot_tables::IQ2XS_GRID;
+    let mut total = 0f32;
+    for ibl in 0..nb {
+        let blk = &row[ibl * IQ2_XS_BLOCK_BYTES..(ibl + 1) * IQ2_XS_BLOCK_BYTES];
+        let xd = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let q8 = &x.qs[ibl * QK_K..(ibl + 1) * QK_K];
+        let mut bsum = 0i32;
+        for g in 0..8 {
+            let sc = blk[66 + g];
+            let (ls1, ls2) = ((2 * (sc & 0x0f) + 1) as i32, (2 * (sc >> 4) + 1) as i32);
+            let mut s1 = 0i32;
+            let mut s2 = 0i32;
+            for j in 0..4 {
+                let q = u16::from_le_bytes([blk[2 + 2 * (4 * g + j)], blk[3 + 2 * (4 * g + j)]]);
+                let gr = grid[(q & 511) as usize].to_le_bytes();
+                let sm = sign_mask((q >> 9) as u32);
+                let q8k = &q8[32 * g + 8 * j..32 * g + 8 * j + 8];
+                let mut acc = 0i32;
+                for i in 0..8 {
+                    let w = if (sm >> i) & 1 == 1 {
+                        -(gr[i] as i8 as i32)
+                    } else {
+                        gr[i] as i8 as i32
+                    };
+                    acc += w * q8k[i] as i32;
+                }
+                if j < 2 {
+                    s1 += acc;
+                } else {
+                    s2 += acc;
+                }
+            }
+            bsum += ls1 * s1 + ls2 * s2;
+        }
+        total += 0.125 * xd * x.d[ibl] * bsum as f32;
+    }
+    total
+}
+
+pub fn vec_dot_iq3_xxs_q8_k(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { avx2::vec_dot_iq3xxs(row, x, n) };
+    }
+    vec_dot_iq3_xxs_q8_k_scalar(row, x, n)
+}
+
+pub fn vec_dot_iq3_xxs_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+    let nb = n / QK_K;
+    debug_assert!(row.len() >= nb * IQ3_XXS_BLOCK_BYTES);
+    let grid = &crate::cpu_dot_tables::IQ3XXS_GRID;
+    let mut total = 0f32;
+    for ibl in 0..nb {
+        let blk = &row[ibl * IQ3_XXS_BLOCK_BYTES..(ibl + 1) * IQ3_XXS_BLOCK_BYTES];
+        let xd = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let q8 = &x.qs[ibl * QK_K..(ibl + 1) * QK_K];
+        let mut sumf = 0f32;
+        for g in 0..8 {
+            let aux = u32::from_le_bytes([
+                blk[66 + 4 * g],
+                blk[67 + 4 * g],
+                blk[68 + 4 * g],
+                blk[69 + 4 * g],
+            ]);
+            let db = xd * (0.5 + (aux >> 28) as f32) * 0.5;
+            let mut sumi = 0i32;
+            for j in 0..4 {
+                let sm = sign_mask((aux >> (7 * j)) & 127);
+                let g0 = grid[blk[2 + 8 * g + 2 * j] as usize].to_le_bytes();
+                let g1 = grid[blk[2 + 8 * g + 2 * j + 1] as usize].to_le_bytes();
+                let q8k = &q8[32 * g + 8 * j..32 * g + 8 * j + 8];
+                for i in 0..4 {
+                    let w0 = if (sm >> i) & 1 == 1 {
+                        -(g0[i] as i8 as i32)
+                    } else {
+                        g0[i] as i8 as i32
+                    };
+                    let w1 = if (sm >> (4 + i)) & 1 == 1 {
+                        -(g1[i] as i8 as i32)
+                    } else {
+                        g1[i] as i8 as i32
+                    };
+                    sumi += w0 * q8k[i] as i32 + w1 * q8k[4 + i] as i32;
+                }
+            }
+            sumf += db * sumi as f32;
+        }
+        total += x.d[ibl] * sumf;
+    }
+    total
+}
+
 /// AVX2 path: one ymm per 32-value sub-block. Grid bytes are unsigned
 /// magnitudes (<= 43), signs applied to q8 via a +-1 byte table and
 /// sign_epi8, then maddubs (max pair sum 2*43*127 < i16::MAX, no
@@ -268,6 +381,108 @@ mod avx2 {
         t
     }
     static KSIGNS64: [u64; 128] = build_ksigns64();
+
+    /// iq2_xs: same shape as the iq2_xxs kernel, but the grid row and
+    /// sign index both come from one u16 (low 9 / high 7 bits) and the
+    /// two 4-bit scales split across the ymm's 128-bit halves.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vec_dot_iq2xs(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+        let nb = n / QK_K;
+        debug_assert!(row.len() >= nb * IQ2_XS_BLOCK_BYTES);
+        let grid = &crate::cpu_dot_tables::IQ2XS_GRID;
+        let ones = _mm256_set1_epi16(1);
+        let mut total = 0f32;
+        for ibl in 0..nb {
+            let blk = row.as_ptr().add(ibl * IQ2_XS_BLOCK_BYTES);
+            let xd = f16_to_f32(u16::from_le_bytes([*blk, *blk.add(1)]));
+            let q8 = x.qs.as_ptr().add(ibl * QK_K);
+            let mut acc = _mm256_setzero_si256();
+            for g in 0..8 {
+                let sc = *blk.add(66 + g);
+                let q: [u16; 4] = std::array::from_fn(|j| {
+                    u16::from_le_bytes([*blk.add(2 + 2 * (4 * g + j)), *blk.add(3 + 2 * (4 * g + j))])
+                });
+                let gv = _mm256_set_epi64x(
+                    grid[(q[3] & 511) as usize] as i64,
+                    grid[(q[2] & 511) as usize] as i64,
+                    grid[(q[1] & 511) as usize] as i64,
+                    grid[(q[0] & 511) as usize] as i64,
+                );
+                let sv = _mm256_set_epi64x(
+                    KSIGNS64[(q[3] >> 9) as usize] as i64,
+                    KSIGNS64[(q[2] >> 9) as usize] as i64,
+                    KSIGNS64[(q[1] >> 9) as usize] as i64,
+                    KSIGNS64[(q[0] >> 9) as usize] as i64,
+                );
+                let q8v = _mm256_loadu_si256(q8.add(32 * g) as *const __m256i);
+                let d16 = _mm256_maddubs_epi16(gv, _mm256_sign_epi8(q8v, sv));
+                let d32 = _mm256_madd_epi16(d16, ones);
+                let lsv = _mm256_set_m128i(
+                    _mm_set1_epi32((2 * (sc >> 4) + 1) as i32),
+                    _mm_set1_epi32((2 * (sc & 0x0f) + 1) as i32),
+                );
+                acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d32, lsv));
+            }
+            let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+            let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
+            let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
+            let bsum = _mm_cvtsi128_si32(s);
+            total += 0.125 * xd * *x.d.get_unchecked(ibl) * bsum as f32;
+        }
+        total
+    }
+
+    /// iq3_xxs: grid rows are u32s of 4 magnitudes; the per-group scale
+    /// is float ((0.5 + s) * 0.5), applied after an exact integer hsum so
+    /// scalar and SIMD stay bitwise-identical.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vec_dot_iq3xxs(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+        let nb = n / QK_K;
+        debug_assert!(row.len() >= nb * IQ3_XXS_BLOCK_BYTES);
+        let grid = &crate::cpu_dot_tables::IQ3XXS_GRID;
+        let ones = _mm256_set1_epi16(1);
+        let mut total = 0f32;
+        for ibl in 0..nb {
+            let blk = row.as_ptr().add(ibl * IQ3_XXS_BLOCK_BYTES);
+            let xd = f16_to_f32(u16::from_le_bytes([*blk, *blk.add(1)]));
+            let q8 = x.qs.as_ptr().add(ibl * QK_K);
+            let mut sumf = 0f32;
+            for g in 0..8 {
+                let aux = u32::from_le_bytes([
+                    *blk.add(66 + 4 * g),
+                    *blk.add(67 + 4 * g),
+                    *blk.add(68 + 4 * g),
+                    *blk.add(69 + 4 * g),
+                ]);
+                let db = xd * (0.5 + (aux >> 28) as f32) * 0.5;
+                let qg: [u32; 8] =
+                    std::array::from_fn(|k| grid[*blk.add(2 + 8 * g + k) as usize]);
+                let gv = _mm256_set_epi32(
+                    qg[7] as i32, qg[6] as i32, qg[5] as i32, qg[4] as i32,
+                    qg[3] as i32, qg[2] as i32, qg[1] as i32, qg[0] as i32,
+                );
+                let sv = _mm256_set_epi64x(
+                    KSIGNS64[((aux >> 21) & 127) as usize] as i64,
+                    KSIGNS64[((aux >> 14) & 127) as usize] as i64,
+                    KSIGNS64[((aux >> 7) & 127) as usize] as i64,
+                    KSIGNS64[(aux & 127) as usize] as i64,
+                );
+                let q8v = _mm256_loadu_si256(q8.add(32 * g) as *const __m256i);
+                let d16 = _mm256_maddubs_epi16(gv, _mm256_sign_epi8(q8v, sv));
+                let d32 = _mm256_madd_epi16(d16, ones);
+                let s = _mm_add_epi32(
+                    _mm256_castsi256_si128(d32),
+                    _mm256_extracti128_si256(d32, 1),
+                );
+                let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
+                let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
+                let sumi = _mm_cvtsi128_si32(s);
+                sumf += db * sumi as f32;
+            }
+            total += *x.d.get_unchecked(ibl) * sumf;
+        }
+        total
+    }
 
     /// q3_K: qu = lo2 | (hbit << 2) is unsigned 0..7 for maddubs; the
     /// implied -4 folds out exactly as 4 * sc[g] * bsums16[g], subtracted
@@ -709,6 +924,95 @@ mod tests {
         assert!(rel < 1e-4, "q4k dot {got} vs reference {reference} (rel {rel})");
         let simd = vec_dot_q4_k_q8_k(&row, &xq, n);
         assert_eq!(simd.to_bits(), got.to_bits(), "q4k simd {simd} vs scalar {got}");
+    }
+
+    #[test]
+    fn iq2xs_dot_matches_dequant_and_scalar() {
+        let n = 5120;
+        let mut st = 555u64;
+        let nb = n / QK_K;
+        let mut row = vec![0u8; nb * IQ2_XS_BLOCK_BYTES];
+        for b in row.iter_mut() {
+            *b = (lcg(&mut st) * 127.0 + 128.0) as u8;
+        }
+        for ibl in 0..nb {
+            row[ibl * IQ2_XS_BLOCK_BYTES + 1] &= 0x3b;
+        }
+        let act: Vec<f32> = (0..n).map(|_| lcg(&mut st)).collect();
+        let xq = quantize_row_q8_k(&act);
+        let got = vec_dot_iq2_xs_q8_k_scalar(&row, &xq, n);
+        let grid = &crate::cpu_dot_tables::IQ2XS_GRID;
+        let mut reference = 0f64;
+        for ibl in 0..nb {
+            let blk = &row[ibl * IQ2_XS_BLOCK_BYTES..(ibl + 1) * IQ2_XS_BLOCK_BYTES];
+            let xd = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
+            for g in 0..8 {
+                let sc = blk[66 + g];
+                for j in 0..4 {
+                    let q = u16::from_le_bytes([blk[2 + 2 * (4 * g + j)], blk[3 + 2 * (4 * g + j)]]);
+                    let gr = grid[(q & 511) as usize].to_le_bytes();
+                    let sm = sign_mask((q >> 9) as u32);
+                    let ls = if j < 2 { 2 * (sc & 0x0f) + 1 } else { 2 * (sc >> 4) + 1 } as f64;
+                    for i in 0..8 {
+                        let w = gr[i] as i8 as f64 * if (sm >> i) & 1 == 1 { -1.0 } else { 1.0 };
+                        let idx = ibl * QK_K + 32 * g + 8 * j + i;
+                        reference += 0.125 * xd * ls * w
+                            * (xq.d[idx / QK_K] as f64 * xq.qs[idx] as f64);
+                    }
+                }
+            }
+        }
+        let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
+        assert!(rel < 1e-4, "iq2xs dot {got} vs reference {reference} (rel {rel})");
+        let simd = vec_dot_iq2_xs_q8_k(&row, &xq, n);
+        assert_eq!(simd.to_bits(), got.to_bits(), "iq2xs simd {simd} vs scalar {got}");
+    }
+
+    #[test]
+    fn iq3xxs_dot_matches_dequant_and_scalar() {
+        let n = 5120;
+        let mut st = 777u64;
+        let nb = n / QK_K;
+        let mut row = vec![0u8; nb * IQ3_XXS_BLOCK_BYTES];
+        for b in row.iter_mut() {
+            *b = (lcg(&mut st) * 127.0 + 128.0) as u8;
+        }
+        for ibl in 0..nb {
+            row[ibl * IQ3_XXS_BLOCK_BYTES + 1] &= 0x3b;
+        }
+        let act: Vec<f32> = (0..n).map(|_| lcg(&mut st)).collect();
+        let xq = quantize_row_q8_k(&act);
+        let got = vec_dot_iq3_xxs_q8_k_scalar(&row, &xq, n);
+        let grid = &crate::cpu_dot_tables::IQ3XXS_GRID;
+        let mut reference = 0f64;
+        for ibl in 0..nb {
+            let blk = &row[ibl * IQ3_XXS_BLOCK_BYTES..(ibl + 1) * IQ3_XXS_BLOCK_BYTES];
+            let xd = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])) as f64;
+            for g in 0..8 {
+                let aux = u32::from_le_bytes([
+                    blk[66 + 4 * g], blk[67 + 4 * g], blk[68 + 4 * g], blk[69 + 4 * g],
+                ]);
+                let db = xd * (0.5 + (aux >> 28) as f64) * 0.5;
+                for j in 0..4 {
+                    let sm = sign_mask((aux >> (7 * j)) & 127);
+                    let g0 = grid[blk[2 + 8 * g + 2 * j] as usize].to_le_bytes();
+                    let g1 = grid[blk[2 + 8 * g + 2 * j + 1] as usize].to_le_bytes();
+                    for i in 0..4 {
+                        let idx = ibl * QK_K + 32 * g + 8 * j + i;
+                        let w0 = g0[i] as i8 as f64 * if (sm >> i) & 1 == 1 { -1.0 } else { 1.0 };
+                        reference += db * w0 * (xq.d[idx / QK_K] as f64 * xq.qs[idx] as f64);
+                        let idx1 = idx + 4;
+                        let w1 =
+                            g1[i] as i8 as f64 * if (sm >> (4 + i)) & 1 == 1 { -1.0 } else { 1.0 };
+                        reference += db * w1 * (xq.d[idx1 / QK_K] as f64 * xq.qs[idx1] as f64);
+                    }
+                }
+            }
+        }
+        let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
+        assert!(rel < 1e-4, "iq3xxs dot {got} vs reference {reference} (rel {rel})");
+        let simd = vec_dot_iq3_xxs_q8_k(&row, &xq, n);
+        assert_eq!(simd.to_bits(), got.to_bits(), "iq3xxs simd {simd} vs scalar {got}");
     }
 
     /// bsum is exact integer math in both paths and the float ops run in
