@@ -2866,7 +2866,7 @@ extern "C" int pulsar_matmul_kq(
     /* multi-token batches (MTP/DFlash verify, chunked prefill) tile
      * tokens over one weight read; q4_K/q6_K ride the warp-cooperative
      * dots for any 2..16 rows */
-    if (n_tok >= 2u && n_tok <= 16u && !getenv("PULSAR_KQW_OFF")) {
+    if (n_tok >= 2u && n_tok <= 16u) {
         dim3 tgrid((out_dim + 3u) / 4u, 1, 1);
         /* smallest register-budget tile that fits n_tok */
         #define PULSAR_KQW_T(WDOT)                                             \
@@ -2885,31 +2885,10 @@ extern "C" int pulsar_matmul_kq(
                             (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes); \
                 return cuda_ok(cudaGetLastError(), "matmul_kqw_tokens launch"); \
             } while (0)
-        /* 9..16 rows: two TT<=8 launches beat one TT16 launch (acc[16]
-         * + the decode temporaries crater occupancy) unless
-         * PULSAR_KQW16=1 forces the single launch for comparison */
-        if (n_tok > 8u && !getenv("PULSAR_KQW16")) {
-            const uint32_t half = n_tok / 2u;
-            const uint32_t rest = n_tok - half;
-            const block_q8_K *xq2 = (const block_q8_K *)xq_dev + (uint64_t)half * in_blocks;
-            float *out2 = (float *)out_dev + (uint64_t)half * out_dim;
-            #define PULSAR_KQW_H(WDOT)                                         \
-                do {                                                           \
-                    matmul_kqw_tokens_kernel<WDOT, 8><<<tgrid, block>>>(       \
-                            (float *)out_dev, (const char *)w_dev,             \
-                            (const block_q8_K *)xq_dev, in_blocks, out_dim, half, row_bytes); \
-                    matmul_kqw_tokens_kernel<WDOT, 8><<<tgrid, block>>>(       \
-                            out2, (const char *)w_dev,                         \
-                            xq2, in_blocks, out_dim, rest, row_bytes);         \
-                    return cuda_ok(cudaGetLastError(), "matmul_kqw_tokens launch"); \
-                } while (0)
-            switch (quant) {
-            case PULSAR_QUANT_Q4_K: PULSAR_KQW_H(wdot_q4_K);
-            case PULSAR_QUANT_Q6_K: PULSAR_KQW_H(wdot_q6_K);
-            default: break;
-            }
-            #undef PULSAR_KQW_H
-        }
+        /* measured on prefill chunks: one TT16 launch beats two TT8
+         * launches (weight re-read costs more than the register tile);
+         * the kernel sits at the L1/LSU floor of the coalesced q8
+         * loads, not on occupancy - ncu: L1 94%, DRAM 28%, 56 regs */
         switch (quant) {
         case PULSAR_QUANT_Q4_K: PULSAR_KQW_T(wdot_q4_K);
         case PULSAR_QUANT_Q6_K: PULSAR_KQW_T(wdot_q6_K);
