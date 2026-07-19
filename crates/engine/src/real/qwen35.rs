@@ -511,10 +511,20 @@ impl Model {
         }
 
         kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, t, eps)?;
+        let dbg = il == 0 && std::env::var_os("PULSAR_DEBUG_L2").is_some();
+        if dbg {
+            eprintln!("  embd {:?} normed {:?}", &st.cur.read_f32(2)?, &st.normed.read_f32(2)?);
+        }
 
         if let Some(gdn) = &w.gdn {
             // ---- Gated DeltaNet (recurrences loop inside the launches)
             kernels::matmul_q8_0(&mut rt.qkv, &gdn.wqkv, &st.normed, s.n_embd, conv_dim, t)?;
+            if dbg {
+                eprintln!("  qkv {:?} z {:?}", &rt.qkv.read_f32(2)?, {
+                    kernels::matmul_q8_0(&mut rt.z, &gdn.wz, &st.normed, s.n_embd, value_dim, t)?;
+                    rt.z.read_f32(2)?
+                });
+            }
             kernels::matmul_q8_0(&mut rt.z, &gdn.wz, &st.normed, s.n_embd, value_dim, t)?;
             // g/beta coefficients fully on-device (no host readbacks)
             kernels::matmul_f32(&mut rt.g, &gdn.alpha_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
@@ -543,6 +553,13 @@ impl Model {
                 &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.g, &rt.beta,
                 s.ssm_v_heads, s.ssm_k_heads, s.ssm_state, t,
             )?;
+            if dbg {
+                eprintln!(
+                    "  conv {:?} gq {:?} g {:?} beta {:?} gdn_o {:?}",
+                    &rt.conv_out.read_f32(2)?, &rt.gq.read_f32(2)?,
+                    &rt.g.read_f32(2)?, &rt.beta.read_f32(2)?, &rt.gdn_o.read_f32(2)?
+                );
+            }
             kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * s.ssm_v_heads, s.ssm_state, eps)?;
             kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * value_dim, 0.0, 1.0, 0)?;
             kernels::matmul_q8_0(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, value_dim, s.n_embd, t)?;
