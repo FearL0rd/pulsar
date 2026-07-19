@@ -5063,13 +5063,17 @@ mod real {
                                     // offline ground truth: dump the gate
                                     // slab (host cache bytes) + normed f32
                                     let e = selected[slot];
-                                    let [g3, _, _] = slabs_of(e as u32);
+                                    let [g3, u3, _] = slabs_of(e as u32);
                                     if let Some((p, len)) = st.store.peek_ptr(off_of(g3.0, g3.1)) {
                                         let bytes = unsafe { std::slice::from_raw_parts(p, len) };
                                         let _ = std::fs::write("/tmp/lane_gate.bin", bytes);
                                         let normed_all = st.normed.read_f32(s.n_embd as usize)?;
                                         let _ = std::fs::write("/tmp/lane_normed.bin", kernels::as_bytes(&normed_all));
                                         eprintln!("dumped gate slab ({len}B) + normed for e={e}, row_bytes={}", g3.0.row_bytes);
+                                    }
+                                    if let Some((p, len)) = st.store.peek_ptr(off_of(u3.0, u3.1)) {
+                                        let bytes = unsafe { std::slice::from_raw_parts(p, len) };
+                                        let _ = std::fs::write("/tmp/lane_up.bin", bytes);
                                     }
                                 }
                             }
