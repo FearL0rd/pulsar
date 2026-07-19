@@ -1575,8 +1575,9 @@ mod real {
                         let u_row = unsafe { std::slice::from_raw_parts(up_.get(), self.grb) };
                         let g = dot(self.gq, g_row, &self.xqs[0], self.ne);
                         let u = dot(self.gq, u_row, &self.xqs[0], self.ne);
+                        let gs = quant::cpu_dot::vec_dot_iq2_xxs_q8_k_scalar(g_row, &self.xqs[0], self.ne);
                         eprintln!(
-                            "lane dbg ci={ci} gq={} act={} g={g:.5} u={u:.5} w={:.5} mid0={:.6}",
+                            "lane dbg ci={ci} gq={} act={} g={g:.5} g_scalar={gs:.5} u={u:.5} w={:.5} mid0={:.6}",
                             self.gq, self.act_op,
                             pairs.first().map(|p| p.1).unwrap_or(0.0),
                             glu(g, u, self.act_op) * pairs.first().map(|p| p.1).unwrap_or(0.0)
