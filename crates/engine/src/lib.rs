@@ -1734,6 +1734,125 @@ mod real {
         p.into()
     }
 
+    /// Built-in {layer, expert} warm seed for a first run with no census
+    /// yet (idea borrowed from ds4's ds4_streaming_hotlist_*.inc, MIT).
+    /// Generated offline by `hotlist-gen` from a machine that has run the
+    /// model; keyed by layer/expert index instead of byte offset, so it
+    /// survives requantized ggufs and works on a fresh clone.
+    fn builtin_hotlist(family: Family) -> Option<&'static str> {
+        Some(match family {
+            Family::Mla => include_str!("../hotlists/mla.hotlist"),
+            Family::Gqa => include_str!("../hotlists/gqa.hotlist"),
+            Family::Dsv4 => include_str!("../hotlists/dsv4.hotlist"),
+            Family::Qwen35 => include_str!("../hotlists/qwen35.hotlist"),
+            _ => return None,
+        })
+    }
+
+    /// Parse a hotlist into the same offset-keyed heat map a census
+    /// produces. Header `# n_layer=L n_expert=E` must match the model
+    /// (a family can host several models; a mismatched seed is skipped
+    /// rather than misapplied). Lines: `<layer> <expert> <count>` for
+    /// routed experts, `<layer> s<idx> <count>` for sink/shexp banks.
+    fn hotlist_heat(
+        m: &Model,
+        text: &str,
+        heat: &mut std::collections::HashMap<u64, (u64, u64)>,
+    ) {
+        let mut lines = text.lines();
+        let Some(header) = lines.next() else { return };
+        let field = |k: &str| {
+            header
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix(k))
+                .and_then(|v| v.parse::<u64>().ok())
+        };
+        // n_expert discriminates models within a family (GLM 256 vs Kimi
+        // 384, qwen35 MoE 128 vs dense 1); per-line .get() bounds-checks
+        // the layer index, so a stale n_layer only wastes lines.
+        if field("n_expert=") != Some(m.shape.n_expert as u64) {
+            return;
+        }
+        for line in lines {
+            let mut it = line.split_whitespace();
+            let (Some(l), Some(e), Some(c)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            let Ok(layer) = l.parse::<usize>() else { continue };
+            let Ok(count) = c.parse::<u64>() else { continue };
+            let Some(Ffn::Moe { gate_exps, up_exps, down_exps, sink, .. }) =
+                m.layers.get(layer).map(|lw| &lw.ffn)
+            else {
+                continue;
+            };
+            let slabs: Option<[(u64, u64); 3]> = if let Some(se) = e.strip_prefix('s') {
+                let Ok(idx) = se.parse::<u64>() else { continue };
+                sink.as_ref().filter(|_| idx < m.shape.n_shexp_sink as u64).map(|sk| {
+                    [&sk[0], &sk[1], &sk[2]]
+                        .map(|t| (t.abs_offset + idx * t.expert_bytes, t.expert_bytes))
+                })
+            } else {
+                let Ok(idx) = e.parse::<u64>() else { continue };
+                (idx < m.shape.n_expert as u64).then(|| {
+                    [gate_exps, up_exps, down_exps]
+                        .map(|t| (t.abs_offset + idx * t.expert_bytes, t.expert_bytes))
+                })
+            };
+            if let Some(slabs) = slabs {
+                for (off, len) in slabs {
+                    heat.insert(off, (count, len));
+                }
+            }
+        }
+    }
+
+    /// Invert a model's census back to quantization-independent
+    /// {layer, expert} heat and render it as hotlist text (the input
+    /// format of `hotlist_heat`). Header-only: parses the gguf tensor
+    /// table without touching the GPU, so it runs while a server owns
+    /// the cards. Sink/shexp banks are not emitted (no census-bearing
+    /// model uses them). Offline tool path: see `hotlist-gen`.
+    pub fn hotlist_text(path: &Path) -> Result<String> {
+        let (_shards, g) = parse_header(path)?;
+        let meta_u = |k: &str| g.arch_meta(k).and_then(|v| v.as_u64());
+        let n_expert = meta_u("expert_count").ok_or("hotlist: no expert_count")?;
+        let n_layer = meta_u("block_count").ok_or("hotlist: no block_count")?;
+        let census: std::collections::HashMap<u64, u64> =
+            read_census(path).into_iter().map(|(off, _, count)| (off, count)).collect();
+        if census.is_empty() {
+            return Err("hotlist: no census (.warm) next to the model - run it once first".into());
+        }
+        let mut rows: Vec<(u64, String)> = Vec::new();
+        for li in 0..n_layer {
+            let slabs: Option<Vec<(u64, u64)>> = ["gate", "up", "down"]
+                .iter()
+                .map(|kind| {
+                    let t = g.tensor(&format!("blk.{li}.ffn_{kind}_exps.weight"))?;
+                    let eb = t.byte_size()? / n_expert;
+                    Some((g.data_offset + t.offset, eb))
+                })
+                .collect();
+            let Some(slabs) = slabs else { continue };
+            for e in 0..n_expert {
+                let h: u64 = slabs
+                    .iter()
+                    .filter_map(|(base, eb)| census.get(&(base + e * eb)))
+                    .sum();
+                if h > 0 {
+                    rows.push((h, format!("{li} {e} {h}")));
+                }
+            }
+        }
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        rows.truncate(4096);
+        let mut out = format!("# n_layer={n_layer} n_expert={n_expert}\n");
+        for (_, line) in rows {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
     /// How many header bytes to read before parsing; grows on Truncated.
     const HEAD_READ_START: usize = 32 << 20;
 
@@ -3049,8 +3168,19 @@ mod real {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let census: std::collections::HashMap<u64, u64> =
+        let mut census: std::collections::HashMap<u64, u64> =
             read_census(&m.path).into_iter().map(|(off, _, count)| (off, count)).collect();
+        if census.is_empty() {
+            // first run: rank tiers from the built-in hotlist seed too
+            // (same fallback load_warm uses for the caches)
+            if std::env::var_os("PULSAR_NO_HOTLIST").is_none() {
+                if let Some(text) = builtin_hotlist(m.shape.family) {
+                    let mut heat = std::collections::HashMap::new();
+                    hotlist_heat(m, text, &mut heat);
+                    census = heat.into_iter().map(|(off, (count, _len))| (off, count)).collect();
+                }
+            }
+        }
         if census.is_empty() {
             eprintln!("pulsar: no warm census yet - expert tiers idle until the next run");
             return Ok(Vec::new());
@@ -3459,16 +3589,33 @@ mod real {
         /// (gate+up+down colocated so a hit never leaves a sibling on disk),
         /// the next tier into the host cache, touch counts seeded for admission.
         fn load_warm(&mut self, m: &Model) -> Result<usize> {
-            let Ok(bytes) = std::fs::read(warm_path(&m.path)) else {
-                return Ok(0);
-            };
             let mut heat: std::collections::HashMap<u64, (u64, u64)> =
-                std::collections::HashMap::with_capacity(bytes.len() / 24);
-            for c in bytes.chunks_exact(24) {
-                let off = u64::from_le_bytes(c[0..8].try_into().unwrap());
-                let len = u64::from_le_bytes(c[8..16].try_into().unwrap());
-                let count = u64::from_le_bytes(c[16..24].try_into().unwrap());
-                heat.insert(off, (count, len));
+                std::collections::HashMap::new();
+            if let Ok(bytes) = std::fs::read(warm_path(&m.path)) {
+                heat.reserve(bytes.len() / 24);
+                for c in bytes.chunks_exact(24) {
+                    let off = u64::from_le_bytes(c[0..8].try_into().unwrap());
+                    let len = u64::from_le_bytes(c[8..16].try_into().unwrap());
+                    let count = u64::from_le_bytes(c[16..24].try_into().unwrap());
+                    heat.insert(off, (count, len));
+                }
+            } else if let Some(text) = builtin_hotlist(m.shape.family)
+                .filter(|_| std::env::var_os("PULSAR_NO_HOTLIST").is_none())
+            {
+                // first run on a fresh machine: seed from the built-in
+                // hotlist so tiers/cache start warm instead of idling
+                // until the second run; the real census replaces it on
+                // save_warm.
+                hotlist_heat(m, text, &mut heat);
+                if !heat.is_empty() {
+                    eprintln!(
+                        "pulsar: no census yet - warm set seeded from built-in hotlist ({} slabs)",
+                        heat.len()
+                    );
+                }
+            }
+            if heat.is_empty() {
+                return Ok(0);
             }
             let in_tier =
                 |off: u64| self.tiers.iter().any(|t| t.map.contains_key(&off));

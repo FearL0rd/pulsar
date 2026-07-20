@@ -258,6 +258,15 @@ sidecar (a popularity census of expert slabs); every later run bulk-loads
 the hot set in a few seconds, and expert tiers (spare GPUs) fill from the
 same census, so the second run is the fast one.
 
+When no census exists yet, the engine seeds the warm set and tier
+placement from a built-in per-family hotlist (`crates/engine/hotlists/`,
+generated from real routing censuses with the `hotlist-gen` tool, keyed
+by layer/expert index so it survives requantized ggufs). Measured on
+Qwen3.6-35B: first-run decode 19.2 to 25.1 tok/s, with the resident tier
+active from token one. The real census replaces the seed on exit;
+`PULSAR_NO_HOTLIST=1` restores the plain cold start. Idea borrowed from
+the static streaming hotlists in antirez's ds4 (MIT).
+
 ### CLI flags
 
 | flag | meaning |
