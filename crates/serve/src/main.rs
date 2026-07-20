@@ -321,7 +321,7 @@ fn handle_chat(
     }
     if prompt.len() as u32 + 2 >= st.ctx() {
         eprintln!(
-            "pulsar-serve: {id}: rejected, prompt {} tokens vs ctx {}",
+            "pulsar-serve: req {request_id}: rejected, prompt {} tokens vs ctx {}",
             prompt.len(),
             st.ctx()
         );
