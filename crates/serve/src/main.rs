@@ -471,6 +471,16 @@ fn handle_chat(
         )?;
         ka_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = ka_thread.join();
+        // flush the marker holdback: without this a reply shorter than
+        // the <tool_call> window streams as empty
+        if !tool_phase.get() && !bytes.is_empty() && !send_err.get() {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let chunk = serde_json::json!({
+                "id": id, "object": "chat.completion.chunk", "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}],
+            });
+            let _ = write!(stream, "data: {chunk}\n\n").and_then(|_| stream.flush());
+        }
         let full = String::from_utf8_lossy(&tok.decode(&emitted)).into_owned();
         let (_, calls) = extract_tool_calls(&full);
         for (ci, (name, args)) in calls.iter().enumerate() {
