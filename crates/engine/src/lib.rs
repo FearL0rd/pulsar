@@ -5386,6 +5386,7 @@ mod real {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         model: &Model,
         st: &mut State,
@@ -5395,6 +5396,30 @@ mod real {
         max_tokens: usize,
         stop: impl Fn(u32) -> bool,
         mut on_token: impl FnMut(u32),
+    ) -> Result<u32> {
+        generate_cancellable(model, st, prompt, pos0, sampler, max_tokens, stop, on_token_shim(&mut on_token), || false)
+    }
+
+    fn on_token_shim(f: &mut impl FnMut(u32)) -> impl FnMut(u32) + '_ {
+        move |t| f(t)
+    }
+
+    /// generate() with a cancel probe checked between prefill chunks and
+    /// decode tokens: a server whose client disconnected mid-prefill can
+    /// abandon the work instead of computing minutes of tokens for
+    /// nobody. Returns the position reached; state/KV stay consistent
+    /// with everything forwarded so far.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_cancellable(
+        model: &Model,
+        st: &mut State,
+        prompt: &[u32],
+        pos0: u32,
+        sampler: &mut Sampler,
+        max_tokens: usize,
+        stop: impl Fn(u32) -> bool,
+        mut on_token: impl FnMut(u32),
+        cancel: impl Fn() -> bool,
     ) -> Result<u32> {
         // MTP speculative decode is greedy-only: acceptance compares the
         // draft against the verified argmax, which IS greedy sampling.
@@ -5410,10 +5435,22 @@ mod real {
         } else {
             st.max_batch() as usize
         };
+        let prof_chunks = std::env::var_os("PULSAR_PROFILE").is_some();
         for chunk in prompt.chunks(chunk_cap) {
+            if cancel() {
+                return Ok(pos);
+            }
+            let t0 = std::time::Instant::now();
             logits = model.forward_batch(st, chunk, pos, true)?;
             if spec {
                 model.mtp_prefill_fill(st, chunk.len() as u32, pos)?;
+            }
+            if prof_chunks {
+                eprintln!(
+                    "pulsar: prefill chunk @{pos} len {} in {:.2}s",
+                    chunk.len(),
+                    t0.elapsed().as_secs_f64()
+                );
             }
             pos += chunk.len() as u32;
         }
@@ -5603,6 +5640,9 @@ mod real {
         }
 
         for _ in 0..max_tokens {
+            if cancel() {
+                return Ok(pos);
+            }
             let next = sampler.sample(logits.as_ref().ok_or("no logits")?);
             if stop(next) || pos + 1 >= st.ctx() {
                 model.forward_batch(st, &[next], pos, false)?;
