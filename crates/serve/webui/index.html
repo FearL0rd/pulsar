@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pulsar</title>
+<style>
+  :root {
+    --bg: #0e0f13;
+    --bg-elev: #161821;
+    --bg-elev-2: #1d202b;
+    --border: #2a2e3c;
+    --text: #e6e7ee;
+    --text-dim: #9aa0b4;
+    --accent: #7c9eff;
+    --accent-dim: #4a5d8a;
+    --user: #2b3a5e;
+    --danger: #e06c75;
+    --ok: #6ad08a;
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.55;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elev);
+    flex-shrink: 0;
+  }
+  .logo {
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 30% 30%, var(--accent), var(--accent-dim) 70%, transparent 71%);
+    box-shadow: 0 0 12px var(--accent-dim);
+    flex-shrink: 0;
+  }
+  header .title { font-weight: 600; letter-spacing: .3px; }
+  header .model { color: var(--text-dim); font-size: 13px; font-family: var(--mono); }
+  header .spacer { flex: 1; }
+  .status {
+    font-size: 12px; color: var(--text-dim);
+    padding: 3px 8px; border: 1px solid var(--border); border-radius: 999px;
+    font-family: var(--mono);
+  }
+  .status.busy { color: var(--accent); border-color: var(--accent-dim); }
+  .status.err  { color: var(--danger); border-color: var(--danger); }
+
+  button {
+    font-family: inherit; font-size: 13px; cursor: pointer;
+    color: var(--text); background: var(--bg-elev-2);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 12px; transition: background .12s, border-color .12s;
+  }
+  button:hover { background: var(--border); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent-dim); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: var(--accent); }
+  button.danger:hover { color: var(--danger); border-color: var(--danger); }
+
+  #messages {
+    flex: 1; overflow-y: auto; padding: 22px 18px 8px;
+    scroll-behavior: smooth;
+  }
+  .msg { max-width: 820px; margin: 0 auto 18px; display: flex; gap: 12px; }
+  .msg .avatar {
+    width: 26px; height: 26px; border-radius: 6px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 700;
+  }
+  .msg.user .avatar { background: var(--accent-dim); color: #fff; }
+  .msg.assistant .avatar { background: var(--bg-elev-2); border: 1px solid var(--border); color: var(--accent); }
+  .msg .bubble { flex: 1; min-width: 0; }
+  .msg .role { font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+  .msg .content { overflow-wrap: break-word; word-break: break-word; }
+  .msg .content p { margin: 0 0 10px; }
+  .msg .content p:last-child { margin-bottom: 0; }
+  .msg .content pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; overflow-x: auto; font-family: var(--mono); font-size: 13px;
+    margin: 8px 0;
+  }
+  .msg .content code { font-family: var(--mono); font-size: 13px; }
+  .msg .content :not(pre) > code { background: var(--bg-elev-2); padding: 1px 5px; border-radius: 4px; }
+  .msg .content a { color: var(--accent); }
+  .msg .cursor { display: inline-block; width: 7px; height: 15px; background: var(--accent); vertical-align: text-bottom; animation: blink 1s steps(2) infinite; margin-left: 2px; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .empty { text-align: center; color: var(--text-dim); margin-top: 18vh; }
+  .empty h2 { font-weight: 500; color: var(--text); margin: 16px 0 6px; }
+  .empty p { font-size: 13px; margin: 4px 0; }
+
+  footer {
+    border-top: 1px solid var(--border);
+    background: var(--bg-elev);
+    padding: 12px 18px 16px;
+    flex-shrink: 0;
+  }
+  .compose { max-width: 820px; margin: 0 auto; }
+  .compose-row { display: flex; gap: 8px; align-items: flex-end; }
+  textarea#input {
+    flex: 1; resize: none; max-height: 200px; min-height: 44px;
+    background: var(--bg-elev-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 11px 14px; font-family: inherit; font-size: 15px; line-height: 1.5;
+    outline: none; transition: border-color .12s;
+  }
+  textarea#input:focus { border-color: var(--accent-dim); }
+
+  .toolbar { max-width: 820px; margin: 0 auto 10px; display: flex; gap: 14px; align-items: center; font-size: 12px; color: var(--text-dim); flex-wrap: wrap; }
+  .toolbar details { position: relative; }
+  .toolbar summary { cursor: pointer; list-style: none; padding: 3px 8px; border: 1px solid var(--border); border-radius: 6px; }
+  .toolbar summary::-webkit-details-marker { display: none; }
+  .toolbar summary:hover { background: var(--bg-elev-2); }
+  .panel {
+    position: absolute; bottom: 30px; left: 0; width: 240px;
+    background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px; display: flex; flex-direction: column; gap: 10px; z-index: 10;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  }
+  .panel label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+  .panel input[type=number], .panel input[type=text], .panel textarea {
+    background: var(--bg-elev-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font-family: var(--mono); font-size: 12px; outline: none;
+  }
+  .panel textarea { resize: vertical; min-height: 50px; font-family: var(--sans); }
+  .panel input:focus { border-color: var(--accent-dim); }
+  .hint { font-size: 11px; color: var(--text-dim); }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"></div>
+  <span class="title">Pulsar</span>
+  <span class="model" id="model">loading…</span>
+  <span class="spacer"></span>
+  <span class="status" id="status">idle</span>
+  <button id="clear" class="danger" title="Clear conversation">Clear</button>
+</header>
+
+<div id="messages">
+  <div class="empty" id="empty">
+    <div class="logo" style="width:40px;height:40px;margin:0 auto;"></div>
+    <h2>Ready</h2>
+    <p>Type a message below. <kbd>Enter</kbd> sends, <kbd>Shift+Enter</kbd> for a newline.</p>
+  </div>
+</div>
+
+<footer>
+  <div class="toolbar">
+    <details>
+      <summary>Settings</summary>
+      <div class="panel">
+        <label>System prompt
+          <textarea id="system" placeholder="You are a helpful assistant."></textarea>
+        </label>
+        <label>Temperature <span class="hint" id="temp-hint">0.8</span>
+          <input type="number" id="temp" step="0.05" min="0" max="2" value="0.8" />
+        </label>
+        <label>top_p
+          <input type="number" id="top-p" step="0.05" min="0" max="1" value="0.95" />
+        </label>
+        <label>max_tokens
+          <input type="number" id="max-tokens" step="32" min="1" value="1024" />
+        </label>
+      </div>
+    </details>
+    <span class="hint"><kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> newline</span>
+  </div>
+  <div class="compose">
+    <div class="compose-row">
+      <textarea id="input" rows="1" placeholder="Send a message…" autofocus></textarea>
+      <button id="send" class="primary">Send</button>
+      <button id="stop" class="danger" disabled>Stop</button>
+    </div>
+  </div>
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const messagesEl = $("messages");
+const inputEl = $("input");
+const sendBtn = $("send");
+const stopBtn = $("stop");
+const clearBtn = $("clear");
+const statusEl = $("status");
+const modelEl = $("model");
+
+let conversation = []; // {role, content}
+let controller = null;
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = "status" + (cls ? " " + cls : "");
+}
+
+async function loadModel() {
+  try {
+    const r = await fetch("/v1/models");
+    const j = await r.json();
+    const id = j?.data?.[0]?.id;
+    if (id) modelEl.textContent = id;
+    else modelEl.textContent = "(no model)";
+  } catch {
+    modelEl.textContent = "(error)";
+  }
+}
+
+function autoGrow() {
+  inputEl.style.height = "auto";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
+}
+
+function scrollDown() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Minimal markdown: fenced code blocks, inline code, bold, links, paragraphs.
+function renderMarkdown(text) {
+  const parts = [];
+  const fence = /```(\w*)\n([\s\S]*?)```/g;
+  let last = 0, m;
+  while ((m = fence.exec(text)) !== null) {
+    parts.push({ kind: "text", val: text.slice(last, m.index) });
+    parts.push({ kind: "code", val: m[2].replace(/\n$/, "") });
+    last = m.index + m[0].length;
+  }
+  parts.push({ kind: "text", val: text.slice(last) });
+
+  return parts.map((p) => {
+    if (p.kind === "code") {
+      return "<pre><code>" + escapeHtml(p.val) + "</code></pre>";
+    }
+    let h = escapeHtml(p.val);
+    // inline code
+    h = h.replace(/`([^`\n]+)`/g, (_x, c) => "<code>" + c + "</code>");
+    // bold
+    h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    // links
+    h = h.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+    // paragraphs + line breaks
+    return h
+      .split(/\n{2,}/)
+      .map((para) => "<p>" + para.replace(/\n/g, "<br>") + "</p>")
+      .join("");
+  }).join("");
+}
+
+function addMessage(role, content) {
+  $("empty")?.remove();
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + role;
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  avatar.textContent = role === "user" ? "you" : "✦";
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  const roleEl = document.createElement("div");
+  roleEl.className = "role";
+  roleEl.textContent = role === "user" ? "you" : "assistant";
+  const body = document.createElement("div");
+  body.className = "content";
+  if (role === "user") {
+    body.innerHTML = renderMarkdown(content);
+  } else {
+    body.innerHTML = content ? renderMarkdown(content) : '<span class="cursor"></span>';
+  }
+  bubble.appendChild(roleEl);
+  bubble.appendChild(body);
+  wrap.appendChild(avatar);
+  wrap.appendChild(bubble);
+  messagesEl.appendChild(wrap);
+  scrollDown();
+  return body; // return content node for streaming updates
+}
+
+function getSettings() {
+  const sys = $("system").value.trim();
+  const messages = [];
+  if (sys) messages.push({ role: "system", content: sys });
+  for (const turn of conversation) messages.push(turn);
+  return {
+    messages,
+    temperature: parseFloat($("temp").value) || 0.8,
+    top_p: parseFloat($("top-p").value) || 0.95,
+    max_tokens: parseInt($("max-tokens").value, 10) || 1024,
+    stream: true,
+  };
+}
+
+async function send() {
+  const text = inputEl.value.trim();
+  if (!text || controller) return;
+  conversation.push({ role: "user", content: text });
+  addMessage("user", text);
+  inputEl.value = "";
+  autoGrow();
+  await streamAssistant();
+}
+
+async function streamAssistant() {
+  controller = new AbortController();
+  sendBtn.disabled = true;
+  stopBtn.disabled = false;
+  setStatus("streaming", "busy");
+
+  const body = document.createElement("div");
+  body.className = "content";
+  body.innerHTML = '<span class="cursor"></span>';
+  // assistant bubble
+  $("empty")?.remove();
+  const wrap = document.createElement("div");
+  wrap.className = "msg assistant";
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  avatar.textContent = "✦";
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  const roleEl = document.createElement("div");
+  roleEl.className = "role";
+  roleEl.textContent = "assistant";
+  bubble.appendChild(roleEl);
+  bubble.appendChild(body);
+  wrap.appendChild(avatar);
+  wrap.appendChild(bubble);
+  messagesEl.appendChild(wrap);
+  scrollDown();
+
+  let acc = "";
+  let t0 = performance.now();
+  let ntok = 0;
+
+  try {
+    const resp = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(getSettings()),
+      signal: controller.signal,
+    });
+    if (!resp.ok || !resp.body) {
+      const txt = await resp.text().catch(() => "");
+      throw new Error("HTTP " + resp.status + " " + txt);
+    }
+
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let sep;
+      while ((sep = buf.indexOf("\n\n")) !== -1) {
+        const chunk = buf.slice(0, sep);
+        buf = buf.slice(sep + 2);
+        const line = chunk.trim();
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") { buf = ""; break; }
+        let ev;
+        try { ev = JSON.parse(payload); } catch { continue; }
+        const delta = ev?.choices?.[0]?.delta;
+        if (delta?.content) {
+          acc += delta.content;
+          ntok += 1;
+          body.innerHTML = renderMarkdown(acc) + '<span class="cursor"></span>';
+          scrollDown();
+        }
+      }
+    }
+    body.innerHTML = renderMarkdown(acc) || "<p><i>(empty)</i></p>";
+    conversation.push({ role: "assistant", content: acc });
+    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+    const rate = ntok && dt > 0 ? (ntok / dt).toFixed(1) : "—";
+    setStatus(`done · ${ntok} tok · ${dt}s · ${rate} tok/s`, "");
+  } catch (err) {
+    if (err.name === "AbortError") {
+      body.innerHTML = renderMarkdown(acc) + '<p><i>(stopped)</i></p>';
+      if (acc) conversation.push({ role: "assistant", content: acc });
+      setStatus("stopped");
+    } else {
+      body.innerHTML = '<p style="color:var(--danger)">error: ' + escapeHtml(err.message) + "</p>";
+      setStatus("error", "err");
+    }
+  } finally {
+    controller = null;
+    sendBtn.disabled = false;
+    stopBtn.disabled = true;
+    inputEl.focus();
+  }
+}
+
+inputEl.addEventListener("input", autoGrow);
+inputEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+sendBtn.addEventListener("click", send);
+stopBtn.addEventListener("click", () => controller?.abort());
+clearBtn.addEventListener("click", () => {
+  if (controller) controller.abort();
+  conversation = [];
+  messagesEl.innerHTML =
+    '<div class="empty" id="empty">' +
+    '<div class="logo" style="width:40px;height:40px;margin:0 auto;"></div>' +
+    "<h2>Ready</h2>" +
+    "<p>Type a message below.</p></div>";
+  setStatus("idle");
+});
+
+$("temp").addEventListener("input", (e) => ($("temp-hint").textContent = e.target.value));
+
+loadModel();
+autoGrow();
+</script>
+</body>
+</html>

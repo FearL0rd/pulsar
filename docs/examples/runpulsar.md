@@ -60,7 +60,17 @@ MODE=serve ./docs/examples/runpulsar.sh
 MODE=serve PORT=8080 HOST=0.0.0.0 ./docs/examples/runpulsar.sh
 ```
 
-Then from another shell:
+Open the **chat web UI** in a browser:
+
+```
+http://127.0.0.1:11435/        # same host:port as the API
+```
+
+The UI (dark theme, SSE streaming, sampling knobs, system prompt, stop
+button) is embedded into the `pulsar-serve` binary — no separate build
+step, no Node/npm. It talks to `/v1/chat/completions` on the same origin.
+
+Or hit the API directly from another shell:
 
 ```sh
 curl http://127.0.0.1:11435/v1/chat/completions -d '{
@@ -69,8 +79,8 @@ curl http://127.0.0.1:11435/v1/chat/completions -d '{
 }'
 ```
 
-Endpoint: `http://$HOST:$PORT/v1/chat/completions`. Single-user, one
-request at a time (per engine constraint).
+Endpoints: `/` (web UI), `/v1/models`, `/v1/chat/completions`. Single-user,
+one request at a time (per engine constraint).
 
 ## All environment variables
 

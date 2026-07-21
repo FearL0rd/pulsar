@@ -244,9 +244,11 @@ CXX=g++-12 cargo build --release -p engine
 # or: interactive chat (multi-turn, KV cache retained across turns)
 ./target/release/pulsar-cli -m /path/to/model.gguf --chat
 
-# or: OpenAI-compatible server
+# or: OpenAI-compatible server with a built-in web UI at /
 cargo build --release -p serve
 ./target/release/pulsar-serve -m /path/to/model.gguf --port 11435
+# open http://127.0.0.1:11435/  in a browser for the chat UI
+# or hit the API directly:
 curl http://127.0.0.1:11435/v1/chat/completions -d '{
   "messages": [{"role": "user", "content": "Hello!"}],
   "stream": true
@@ -364,7 +366,8 @@ cross-layer prefetch · measured-bandwidth GPU role assignment · MLA
 attention residency on a second GPU · resident expert tiers on spare
 GPUs · temp/top-p/min-p sampling · interactive chat · OpenAI-compatible
 server (`pulsar-serve`: `/v1/models`, `/v1/chat/completions` with SSE
-streaming; local single-user, one request at a time).
+streaming plus a built-in chat web UI at `/`, no build step, embedded via
+`include_str!`; local single-user, one request at a time).
 
 Done since: DSA lightning indexer (GLM contexts past 2048, batch scorer
 on tensor cores) · Kimi K2.7/deepseek2 with llama.cpp-exact YaRN ·

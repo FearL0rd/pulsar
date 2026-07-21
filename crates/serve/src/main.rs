@@ -24,6 +24,16 @@ fn main() {
     }
 }
 
+/// Self-contained chat webui (vanilla JS, no build step). Served at `/`
+/// alongside the API; same origin as `/v1/chat/completions`, so no CORS.
+#[cfg(target_os = "linux")]
+const WEBUI_HTML: &str = include_str!("../webui/index.html");
+
+/// Inline SVG favicon (the pulsar dot) — keeps the browser console clean
+/// instead of 404-ing on /favicon.ico.
+#[cfg(target_os = "linux")]
+const FAVICON_SVG: &str = include_str!("../webui/favicon.svg");
+
 #[cfg(target_os = "linux")]
 fn run() -> engine::Result {
     use std::io::{BufRead, BufReader, Read, Write};
@@ -67,7 +77,7 @@ fn run() -> engine::Result {
         .unwrap_or(0.9);
 
     let listener = std::net::TcpListener::bind((host.as_str(), port))?;
-    eprintln!("pulsar-serve: listening on http://{host}:{port}/v1");
+    eprintln!("pulsar-serve: listening on http://{host}:{port}  (web UI at /, API at /v1)");
 
     let mut request_id = 0u64;
     // token ids fully forwarded into the engine (KV + recurrent state
@@ -127,6 +137,12 @@ fn run() -> engine::Result {
             reader.read_exact(&mut body)?;
 
             match (method.as_str(), path.as_str()) {
+                ("GET", "/") | ("GET", "/index.html") => {
+                    respond_bytes(&mut stream, 200, "text/html; charset=utf-8", WEBUI_HTML.as_bytes())
+                }
+                ("GET", "/favicon.ico") | ("GET", "/favicon.svg") => {
+                    respond_bytes(&mut stream, 200, "image/svg+xml", FAVICON_SVG.as_bytes())
+                }
                 ("GET", "/v1/models") => {
                     let json = serde_json::json!({
                         "object": "list",
@@ -194,6 +210,25 @@ fn respond_json(
         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
         body.len()
     )?;
+    Ok(())
+}
+
+/// Raw bytes response with an explicit content-type (static assets, etc).
+#[cfg(target_os = "linux")]
+fn respond_bytes(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> engine::Result {
+    use std::io::Write;
+    let reason = if status == 200 { "OK" } else { "Error" };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)?;
     Ok(())
 }
 
