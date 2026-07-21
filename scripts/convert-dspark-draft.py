@@ -50,7 +50,7 @@ def main():
     cfg = json.loads((src / "config.json").read_text())
     dfc = cfg.get("dflash_config", {})
     target_layer_ids = cfg.get("target_layer_ids") or dfc["target_layer_ids"]
-    mask_id = cfg.get("mask_token_id") or dfc["mask_token_id"]
+    mask_id = cfg.get("mask_token_id") or dfc.get("mask_token_id")
     markov_rank = int(cfg.get("markov_rank") or dfc.get("markov_rank") or 0)
     has_conf = bool(cfg.get("enable_confidence_head"))
 
@@ -76,7 +76,11 @@ def main():
         # the known-good 35B conversion carried exactly these values
         w.add_float32("dflash-draft.rope.scaling.factor", 64.0)
         w.add_uint32("dflash-draft.rope.scaling.original_context_length", 4096)
-    w.add_uint32("dflash-draft.dflash.block_size", cfg.get("block_size") or dfc["block_size"])
+    block_size = cfg.get("block_size") or dfc.get("block_size")
+    if block_size is None:
+        block_size = 16  # DeepSpec Qwen3.6-35B default; fal config omits it
+        print("WARNING: config has no block_size, defaulting to 16", file=sys.stderr)
+    w.add_uint32("dflash-draft.dflash.block_size", block_size)
     w.add_uint32("dflash-draft.dflash.mask_token_id", mask_id)
     w.add_array("dflash-draft.dflash.target_layer_ids", target_layer_ids)
     # dspark keys mark DeepSpec-trained drafts (next-token row convention);
