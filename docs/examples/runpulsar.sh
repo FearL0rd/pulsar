@@ -15,6 +15,13 @@
 #   PULSAR_CACHE_GB, PULSAR_ATTN_VRAM_GB (or =off), PULSAR_ATTN_TIER_RESERVE_GB
 #   PULSAR_CPU, PULSAR_CPU_STEAL
 #   MODEL, PROMPT, N
+#   MODE                   generate (default) | chat | serve
+#                          generate: one-shot -p PROMPT -n N
+#                          chat:      pulsar-cli --chat (multi-turn, KV retained;
+#                                     pass --system "..." via args)
+#                          serve:     pulsar-serve --port PORT --host HOST
+#                                     (build first: cargo build --release -p serve)
+#   PORT, HOST             serve mode endpoint (default 11435 / 127.0.0.1)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -24,6 +31,9 @@ MODEL="${MODEL:-/home/cesar/models/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
 PROMPT="${PROMPT:-The capital of France is}"
 N="${N:-64}"
 MIN_VRAM_MB="${PULSAR_MIN_VRAM_MB:-8192}"
+MODE="${MODE:-generate}"
+PORT="${PORT:-11435}"
+HOST="${HOST:-127.0.0.1}"
 
 # ---- host expert cache (auto from MemAvailable) ----
 if [ -n "${PULSAR_CACHE_GB:-}" ]; then
@@ -269,10 +279,29 @@ echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "PULSAR_GPU=$PULSAR_GPU"
 echo "PULSAR_ATTN_GPU=${PULSAR_ATTN_GPU:-unset}"
 echo "PULSAR_CACHE_GB=$PULSAR_CACHE_GB${AUTO_CACHE_NOTE:-}"
+echo "PULSAR_DEV_CACHE_GB=${PULSAR_DEV_CACHE_GB:-solved by engine (free VRAM − staging − reserve)}"
 echo "PULSAR_ATTN_VRAM_GB=${PULSAR_ATTN_VRAM_GB:-unset}${ATTN_VRAM_NOTE}"
+echo "PULSAR_TIERS=${PULSAR_TIERS:-on (default — unset leaves engine default)}"
+echo "PULSAR_KV=${PULSAR_KV:-f32 (default; fp8 = e4m3 + per-row scale, lossy)}"
+echo "PULSAR_BATCH=${PULSAR_BATCH:-solved by engine (worst-case staging vs free VRAM)}"
+echo "PULSAR_NO_PREFETCH=${PULSAR_NO_PREFETCH:-unset (cross-layer prefetcher ON)}"
+echo "PULSAR_PROFILE=${PULSAR_PROFILE:-unset}"
 echo "PULSAR_CPU=${PULSAR_CPU:-unset (CPU expert lane OFF)}"
 echo "PULSAR_CPU_STEAL=$PULSAR_CPU_STEAL"
 echo "model: $MODEL"
+echo
+echo "run mode: $MODE"
+case "$MODE" in
+  generate)
+    echo "  pulsar-cli  -p \"$PROMPT\"  -n $N  (PULSAR_PROFILE=1 forced)"
+    ;;
+  chat)
+    echo "  pulsar-cli  --chat  (multi-turn, KV retained; PULSAR_PROFILE=1 forced)"
+    ;;
+  serve)
+    echo "  pulsar-serve  --port $PORT  --host $HOST  (PULSAR_PROFILE left to env)"
+    ;;
+esac
 echo
 
 echo "physical cards in use:"
@@ -291,14 +320,36 @@ if [[ "${PRIM_FREE:-0}" =~ ^[0-9]+$ ]] && [ "${PRIM_FREE:-0}" -lt 4096 ]; then
   exit 1
 fi
 
-CLI="${PULSAR_CLI:-$ROOT/target/release/pulsar-cli}"
-if [ ! -x "$CLI" ]; then
-  echo "ERROR: pulsar-cli not found at $CLI (build with: cargo build --release -p engine)" >&2
-  exit 1
-fi
+case "$MODE" in
+  generate|chat)
+    CLI="${PULSAR_CLI:-$ROOT/target/release/pulsar-cli}"
+    if [ ! -x "$CLI" ]; then
+      echo "ERROR: pulsar-cli not found at $CLI (build with: cargo build --release -p engine)" >&2
+      exit 1
+    fi
+    ;;
+  serve)
+    CLI="${PULSAR_SERVE:-$ROOT/target/release/pulsar-serve}"
+    if [ ! -x "$CLI" ]; then
+      echo "ERROR: pulsar-serve not found at $CLI (build with: cargo build --release -p serve)" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "ERROR: MODE='$MODE' (expected: generate | chat | serve)" >&2
+    exit 1
+    ;;
+esac
 
-exec env PULSAR_PROFILE=1 "$CLI" \
-  -m "$MODEL" \
-  -p "$PROMPT" \
-  -n "$N" \
-  "$@"
+case "$MODE" in
+  generate)
+    exec env PULSAR_PROFILE=1 "$CLI" -m "$MODEL" -p "$PROMPT" -n "$N" "$@"
+    ;;
+  chat)
+    exec env PULSAR_PROFILE=1 "$CLI" -m "$MODEL" --chat "$@"
+    ;;
+  serve)
+    echo "serving on http://${HOST}:${PORT}/v1/chat/completions (Ctrl-C to stop)"
+    exec "$CLI" -m "$MODEL" --port "$PORT" --host "$HOST" "$@"
+    ;;
+esac
