@@ -3117,6 +3117,11 @@ mod real {
             } else {
                 (None, None)
             };
+            // the split/attn placement loops leave whatever device they
+            // touched last current; restore the primary so post-load
+            // allocations (draft models, probes) land on the fast card
+            // instead of one the split already filled
+            kernels::set_device(kernels::primary_device())?;
             Ok(Model {
                 path: path.to_path_buf(),
                 shards,

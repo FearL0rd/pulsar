@@ -70,6 +70,7 @@ mod real {
         fn cudaDeviceSynchronize() -> i32;
 
         fn pulsar_embed_q8_0(out: *mut c_void, w: *const c_void, tokens: *const c_void, n_embd: u32, n_vocab: u32, n_tok: u32) -> i32;
+        fn pulsar_dspark_markov_argmax(logits: *const c_void, w2: *const c_void, state: *const c_void, vocab: u32, rank: u32, scratch: *mut c_void, out: *mut c_void) -> i32;
         fn pulsar_rms_norm(out: *mut c_void, x: *const c_void, w: *const c_void, n: u32, rows: u32, eps: f32) -> i32;
         fn pulsar_q8_0_matmul(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_q8_0_matmul_banked(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_bank: u32, n_tok: u32) -> i32;
@@ -231,6 +232,19 @@ mod real {
     /// neither can lspci at idle. So MEASURE: probe H2D bandwidth per device
     /// and take the fastest link (~100ms/device at startup, tie-break by
     /// compute capability). PULSAR_GPU overrides with a CUDA device index.
+    /// The primary (stream) device ensure_device picked; get_device()
+    /// drifts with per-layer set_device calls, this does not.
+    static PRIMARY_DEV: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// The measured-best primary device chosen at startup. Unlike
+    /// get_device() this is stable across the engine's per-layer device
+    /// switching, so late allocations (draft models, probes) can pin
+    /// themselves back to the fast card.
+    pub fn primary_device() -> i32 {
+        ensure_device();
+        PRIMARY_DEV.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn ensure_device() {
         use std::sync::Once;
         static ONCE: Once = Once::new();
@@ -262,6 +276,7 @@ mod real {
                 probed = best.1;
                 best.0
             });
+            PRIMARY_DEV.store(dev, std::sync::atomic::Ordering::Relaxed);
             if unsafe { cudaSetDevice(dev) } != 0 {
                 eprintln!("pulsar: cudaSetDevice({dev}) failed, falling back to CUDA default");
             } else if std::env::var_os("PULSAR_QUIET").is_none() {
@@ -761,6 +776,38 @@ mod real {
 
     pub fn embed_q8_0(out: &mut DeviceBuf, w: &DeviceBuf, tokens: &DeviceBuf, n_embd: u32, n_vocab: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_embed_q8_0(out.ptr_mut(), w.ptr(), tokens.ptr(), n_embd, n_vocab, n_tok) }, "embed_q8_0")
+    }
+
+    /// DSpark fused markov argmax over one logits row: returns
+    /// argmax_v logits[row_off + v] + q8dot(w2[v], state). `scratch` needs
+    /// 128 * 8 bytes; `out` 4 bytes (device); the id is read back here.
+    pub fn dspark_markov_argmax(
+        logits: &DeviceBuf,
+        row_off_elems: usize,
+        w2: &DeviceBuf,
+        state: &DeviceBuf,
+        vocab: u32,
+        rank: u32,
+        scratch: &mut DeviceBuf,
+        out: &mut DeviceBuf,
+    ) -> Result<u32> {
+        check(
+            unsafe {
+                pulsar_dspark_markov_argmax(
+                    (logits.ptr() as *const u8).add(row_off_elems * 4) as *const c_void,
+                    w2.ptr(),
+                    state.ptr(),
+                    vocab,
+                    rank,
+                    scratch.ptr_mut(),
+                    out.ptr_mut(),
+                )
+            },
+            "dspark_markov_argmax",
+        )?;
+        sync()?;
+        let id = out.read_i32(1)?;
+        Ok(id[0].max(0) as u32)
     }
 
     pub fn rms_norm(out: &mut DeviceBuf, x: &DeviceBuf, w: &DeviceBuf, n: u32, rows: u32, eps: f32) -> Result {

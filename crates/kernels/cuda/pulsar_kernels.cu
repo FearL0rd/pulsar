@@ -4265,6 +4265,92 @@ extern "C" int pulsar_embed_q8_0(
     return cuda_ok(cudaGetLastError(), "embed q8_0 launch");
 }
 
+/* DSpark markov-biased argmax: id = argmax_v logits[v] + q8dot(w2[v], state).
+ * w2 is the q8_0 requant of the [vocab x rank] markov projection; state is
+ * the f32 dequant of markov_w1[prev_token]. Fused so the vocab-sized bias
+ * vector never materializes. Two-stage reduce: per-block winners into
+ * scratch, then a single-block final argmax. */
+__global__ void dspark_markov_argmax_part_kernel(
+        const float *__restrict__ logits, const unsigned char *__restrict__ w2,
+        const float *__restrict__ state, int vocab, int rank,
+        float *__restrict__ best_val, int *__restrict__ best_id) {
+    extern __shared__ float sh_state[];
+    __shared__ float s_val[256];
+    __shared__ int s_id[256];
+    for (int i = threadIdx.x; i < rank; i += blockDim.x) sh_state[i] = state[i];
+    __syncthreads();
+    const int nb = rank / 32;
+    const size_t row_bytes = (size_t)nb * 34u;
+    float bv = -3.4e38f;
+    int bi = 0;
+    for (int v = blockIdx.x * blockDim.x + threadIdx.x; v < vocab;
+         v += gridDim.x * blockDim.x) {
+        const unsigned char *row = w2 + (size_t)v * row_bytes;
+        float dot = 0.f;
+        for (int b = 0; b < nb; b++) {
+            const __half *scale_h = (const __half *)(row + b * 34);
+            const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
+            float acc = 0.f;
+#pragma unroll
+            for (int i = 0; i < 32; i++) acc += (float)qs[i] * sh_state[b * 32 + i];
+            dot += __half2float(*scale_h) * acc;
+        }
+        float sc = logits[v] + dot;
+        if (sc > bv) { bv = sc; bi = v; }
+    }
+    s_val[threadIdx.x] = bv;
+    s_id[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && s_val[threadIdx.x + s] > s_val[threadIdx.x]) {
+            s_val[threadIdx.x] = s_val[threadIdx.x + s];
+            s_id[threadIdx.x] = s_id[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        best_val[blockIdx.x] = s_val[0];
+        best_id[blockIdx.x] = s_id[0];
+    }
+}
+
+__global__ void dspark_argmax_reduce_kernel(
+        const float *__restrict__ vals, const int *__restrict__ ids, int n,
+        int *__restrict__ out) {
+    __shared__ float s_val[256];
+    __shared__ int s_id[256];
+    float bv = -3.4e38f;
+    int bi = 0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        if (vals[i] > bv) { bv = vals[i]; bi = ids[i]; }
+    }
+    s_val[threadIdx.x] = bv;
+    s_id[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s && s_val[threadIdx.x + s] > s_val[threadIdx.x]) {
+            s_val[threadIdx.x] = s_val[threadIdx.x + s];
+            s_id[threadIdx.x] = s_id[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = s_id[0];
+}
+
+extern "C" int pulsar_dspark_markov_argmax(
+        const void *logits_dev, const void *w2_dev, const void *state_dev,
+        uint32_t vocab, uint32_t rank, void *scratch_dev, void *out_dev) {
+    if (vocab == 0 || rank == 0 || rank % 32u != 0) return 0;
+    const int blocks = 128;
+    float *bv = (float *)scratch_dev;
+    int *bi = (int *)((char *)scratch_dev + blocks * sizeof(float));
+    dspark_markov_argmax_part_kernel<<<blocks, 256, rank * sizeof(float)>>>(
+            (const float *)logits_dev, (const unsigned char *)w2_dev,
+            (const float *)state_dev, (int)vocab, (int)rank, bv, bi);
+    dspark_argmax_reduce_kernel<<<1, 256>>>(bv, bi, blocks, (int *)out_dev);
+    return cuda_ok(cudaGetLastError(), "dspark markov argmax launch");
+}
+
 /* combined glue selftest vs CPU references */
 extern "C" int pulsar_glue_selftest(void) {
     const uint32_t n = 512, rows = 3, n_vocab = 64;

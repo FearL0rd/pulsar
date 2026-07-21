@@ -183,6 +183,17 @@ fn run() -> engine::Result {
 
     eprintln!("pulsar: loading {model_path}");
     let t0 = std::time::Instant::now();
+    // load the dflash draft BEFORE the model: the dense-split solver
+    // fills cards to capacity from measured free VRAM, so the draft's
+    // buffers must already be resident for the split to leave room
+    let mut dflash_draft = match std::env::var("PULSAR_DFLASH") {
+        Ok(p) => {
+            let d = engine::DraftModel::load(std::path::Path::new(&p))?;
+            eprintln!("pulsar: dflash draft loaded ({p})");
+            Some(d)
+        }
+        Err(_) => None,
+    };
     let model = engine::Model::load(std::path::Path::new(&model_path))?;
     let tok = {
         let (_, g) = engine::parse_header(std::path::Path::new(&model_path))?;
@@ -308,9 +319,7 @@ fn run() -> engine::Result {
 
     // DFlash speculative decode (qwen35moe + a matched block-diffusion
     // draft gguf): PULSAR_DFLASH=/path/to/draft.gguf, greedy one-shot
-    if let (Ok(draft_path), None) = (std::env::var("PULSAR_DFLASH"), dump_logits.as_ref()) {
-        let mut draft = engine::DraftModel::load(std::path::Path::new(&draft_path))?;
-        eprintln!("pulsar: dflash draft loaded ({draft_path})");
+    if let (Some(mut draft), None) = (dflash_draft.take(), dump_logits.as_ref()) {
         let mut generated: Vec<u32> = Vec::new();
         let mut t_first: Option<std::time::Instant> = None;
         let out = std::io::stdout();

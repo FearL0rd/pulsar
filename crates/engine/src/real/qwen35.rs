@@ -78,6 +78,38 @@ struct DflashRt {
     capture_gdn: bool,
     /// capture layer ids from the draft gguf
     layer_ids: Vec<usize>,
+    /// dense-split second-span captures (empty without a bank)
+    stage2: Vec<Stage2>,
+    /// bank-side replay scratch: rollback kernels mix scratch with the
+    /// layer's GDN state in one launch, so split layers need scratch on
+    /// their own card (None without a bank)
+    bank_rb: Option<BankRb>,
+}
+
+/// Rollback replay scratch on the bank device (mirrors the Qwen35Rt
+/// conv_out/gq/gk/gv/gdn_o set for layers the second card owns).
+struct BankRb {
+    dev: i32,
+    first: usize,
+    conv_out: DeviceBuf,
+    gq: DeviceBuf,
+    gk: DeviceBuf,
+    gv: DeviceBuf,
+    gdn_o: DeviceBuf,
+}
+
+/// Deferred capture for a layer owned by the second card: rows stage on
+/// that card during its span and flush through a primary-side bounce
+/// into the ring after the hop back.
+struct Stage2 {
+    /// capture layer (>= bank.first)
+    il: usize,
+    /// slot index within layer_ids (ring column offset)
+    slot: usize,
+    /// [T_MAX][n_embd] f32 on the bank device
+    stage: DeviceBuf,
+    /// [T_MAX][n_embd] f32 on the primary
+    bounce: DeviceBuf,
 }
 
 /// Second-card copies of every activation/scratch buffer the layer
@@ -384,29 +416,65 @@ impl Qwen35Rt {
         if self.dflash.is_some() {
             return Ok(());
         }
-        if self.bank.is_some() {
-            // the capture ring lives on the primary; scatter from
-            // second-card layers would cross devices mid-eval
-            return Err("dflash is not supported with the dense split (PULSAR_SPLIT=off)".into());
-        }
         let s = m.shape;
         let feat_w = layer_ids.len() * s.n_embd as usize;
         let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
         let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
         let conv_dim = 2 * key_dim + value_dim;
+        // dense split: captures on second-card layers cannot scatter into
+        // the primary-side ring mid-span. Stage them on their own card and
+        // flush through a primary bounce after the hop back (same
+        // producer-current ordering trick as the residual hop).
+        let mut stage2 = Vec::new();
+        let mut bank_rb = None;
+        if let Some(b) = &self.bank {
+            let prev = kernels::get_device();
+            for (slot, &il) in layer_ids.iter().enumerate() {
+                if il >= b.first {
+                    kernels::set_device(b.dev)?;
+                    let stage = DeviceBuf::alloc(T_MAX * s.n_embd as usize * 4)?;
+                    kernels::set_device(prev)?;
+                    let bounce = DeviceBuf::alloc(T_MAX * s.n_embd as usize * 4)?;
+                    stage2.push(Stage2 { il, slot, stage, bounce });
+                }
+            }
+            kernels::set_device(b.dev)?;
+            let f32s = |n: usize| DeviceBuf::alloc(n * 4);
+            bank_rb = Some(BankRb {
+                dev: b.dev,
+                first: b.first,
+                conv_out: f32s(T_MAX * conv_dim)?,
+                gq: f32s(T_MAX * key_dim)?,
+                gk: f32s(T_MAX * key_dim)?,
+                gv: f32s(T_MAX * value_dim)?,
+                gdn_o: f32s(T_MAX * value_dim)?,
+            });
+            kernels::set_device(prev)?;
+        }
         let mut snap_s = Vec::new();
         let mut snap_conv = Vec::new();
         let mut stash_qkv = Vec::new();
         let mut stash_g = Vec::new();
         let mut stash_beta = Vec::new();
-        for gs in &self.states {
+        let prev_dev = kernels::get_device();
+        for (il, gs) in self.states.iter().enumerate() {
             match gs {
                 Some(g) => {
+                    // snapshots/stashes copy_d2d against the layer's GDN
+                    // state, so they must live on the layer's OWNER card
+                    // (plain cudaMemcpy cannot cross devices without P2P)
+                    let bank_dev = self.bank.as_ref().filter(|b| il >= b.first).map(|b| b.dev);
+                    if let Some(d) = bank_dev {
+                        kernels::set_device(d)?;
+                    }
                     snap_s.push(Some(DeviceBuf::alloc(g.s.bytes())?));
                     snap_conv.push(Some(DeviceBuf::alloc(g.conv.bytes())?));
                     stash_qkv.push(Some(DeviceBuf::alloc(T_MAX * conv_dim * 4)?));
                     stash_g.push(Some(DeviceBuf::alloc(T_MAX * s.ssm_v_heads as usize * 4)?));
                     stash_beta.push(Some(DeviceBuf::alloc(T_MAX * s.ssm_v_heads as usize * 4)?));
+                    if bank_dev.is_some() {
+                        kernels::set_device(prev_dev)?;
+                    }
                 }
                 None => {
                     snap_s.push(None);
@@ -426,6 +494,8 @@ impl Qwen35Rt {
             stash_beta,
             capture_gdn: false,
             layer_ids,
+            stage2,
+            bank_rb,
         });
         Ok(())
     }
@@ -455,35 +525,61 @@ impl Qwen35Rt {
         let key_dim = s.ssm_k_heads * s.ssm_state;
         let value_dim = s.ssm_v_heads * s.ssm_state;
         let conv_dim = 2 * key_dim + value_dim;
-        let Some(df) = &self.dflash else {
-            return Err("dflash not enabled".into());
-        };
-        for (il, gs) in self.states.iter_mut().enumerate() {
-            let Some(g) = gs else { continue };
-            let ss = df.snap_s[il].as_ref().unwrap();
-            let sc = df.snap_conv[il].as_ref().unwrap();
-            kernels::copy_d2d(&mut g.s, 0, ss, 0, ss.bytes())?;
-            kernels::copy_d2d(&mut g.conv, 0, sc, 0, sc.bytes())?;
-            if accept_n == 0 {
-                continue;
+        let mut df = self.dflash.take().ok_or("dflash not enabled")?;
+        let primary = kernels::primary_device();
+        let r = (|| -> Result {
+            let DflashRt {
+                snap_s, snap_conv, stash_qkv, stash_g, stash_beta, bank_rb, ..
+            } = &mut df;
+            for (il, gs) in self.states.iter_mut().enumerate() {
+                let Some(g) = gs else { continue };
+                // split layers replay entirely on their own card: the
+                // kernels mix scratch with the GDN state in one launch,
+                // and cross-device args fault asynchronously
+                let on_bank = bank_rb.as_ref().is_some_and(|rb| il >= rb.first);
+                if on_bank {
+                    kernels::set_device(bank_rb.as_ref().unwrap().dev)?;
+                }
+                let ss = snap_s[il].as_ref().unwrap();
+                let sc = snap_conv[il].as_ref().unwrap();
+                kernels::copy_d2d(&mut g.s, 0, ss, 0, ss.bytes())?;
+                kernels::copy_d2d(&mut g.conv, 0, sc, 0, sc.bytes())?;
+                if accept_n == 0 {
+                    if on_bank {
+                        kernels::set_device(primary)?;
+                    }
+                    continue;
+                }
+                let sq = stash_qkv[il].as_ref().unwrap();
+                let Attn::Qwen35(w) = &m.layers[il].attn else {
+                    return Err("qwen35 layer expected".into());
+                };
+                let gdn = w.gdn.as_ref().ok_or("gdn weights missing")?;
+                let (conv_out, gq, gk, gv, gdn_o) = if on_bank {
+                    let rb = bank_rb.as_mut().unwrap();
+                    (&mut rb.conv_out, &mut rb.gq, &mut rb.gk, &mut rb.gv, &mut rb.gdn_o)
+                } else {
+                    (&mut self.conv_out, &mut self.gq, &mut self.gk, &mut self.gv, &mut self.gdn_o)
+                };
+                kernels::qwen35_conv_batch(conv_out, sq, &gdn.conv, &mut g.conv, conv_dim, s.ssm_conv_k, accept_n)?;
+                kernels::qwen35_split_qkv(gq, gk, gv, conv_out, accept_n, key_dim, value_dim)?;
+                kernels::qwen35_l2_norm(gq, accept_n * s.ssm_k_heads, s.ssm_state, s.rms_eps)?;
+                kernels::qwen35_l2_norm(gk, accept_n * s.ssm_k_heads, s.ssm_state, s.rms_eps)?;
+                kernels::qwen35_gdn_batch(
+                    gdn_o, &mut g.s, gq, gk, gv,
+                    stash_g[il].as_ref().unwrap(),
+                    stash_beta[il].as_ref().unwrap(),
+                    s.ssm_v_heads, s.ssm_k_heads, s.ssm_state, accept_n,
+                )?;
+                if on_bank {
+                    kernels::set_device(primary)?;
+                }
             }
-            let sq = df.stash_qkv[il].as_ref().unwrap();
-            let Attn::Qwen35(w) = &m.layers[il].attn else {
-                return Err("qwen35 layer expected".into());
-            };
-            let gdn = w.gdn.as_ref().ok_or("gdn weights missing")?;
-            kernels::qwen35_conv_batch(&mut self.conv_out, sq, &gdn.conv, &mut g.conv, conv_dim, s.ssm_conv_k, accept_n)?;
-            kernels::qwen35_split_qkv(&mut self.gq, &mut self.gk, &mut self.gv, &self.conv_out, accept_n, key_dim, value_dim)?;
-            kernels::qwen35_l2_norm(&mut self.gq, accept_n * s.ssm_k_heads, s.ssm_state, s.rms_eps)?;
-            kernels::qwen35_l2_norm(&mut self.gk, accept_n * s.ssm_k_heads, s.ssm_state, s.rms_eps)?;
-            kernels::qwen35_gdn_batch(
-                &mut self.gdn_o, &mut g.s, &self.gq, &self.gk, &self.gv,
-                df.stash_g[il].as_ref().unwrap(),
-                df.stash_beta[il].as_ref().unwrap(),
-                s.ssm_v_heads, s.ssm_k_heads, s.ssm_state, accept_n,
-            )?;
-        }
-        Ok(())
+            Ok(())
+        })();
+        kernels::set_device(primary)?;
+        self.dflash = Some(df);
+        r
     }
 
     /// Full-snapshot restore (legacy path; rollback_to supersedes it).
@@ -520,6 +616,29 @@ struct DraftLayer {
     down: DeviceBuf,
 }
 
+/// DSpark heads riding on the DFlash trunk (DeepSpec: DSpark = DFlash +
+/// markov head + confidence head). The markov head biases each draft
+/// step's logits with w2 @ w1[prev_token]; the confidence head predicts
+/// per-slot acceptance so low-confidence draft tails are cut before the
+/// (expensive) batched verify.
+struct DsparkHeads {
+    /// q8_0 [n_vocab x rank] prev-token embedding (row-gathered like an
+    /// embedding table)
+    w1: DeviceBuf,
+    /// q8_0 [n_vocab x rank] rank -> vocab bias projection
+    w2: DeviceBuf,
+    rank: u32,
+    /// f32 [rank] dequantized w1[prev] for the current step
+    state: DeviceBuf,
+    /// per-block argmax winners (128 * 8B) for the fused kernel
+    scratch: DeviceBuf,
+    /// 4B argmax result
+    out_id: DeviceBuf,
+    /// host f32 [n_embd + rank] confidence projection (None = no head)
+    conf_w: Option<Vec<f32>>,
+    conf_bias: f32,
+}
+
 /// The DFlash block-diffusion draft (lucebox draft_graph semantics).
 /// Shares the TARGET's token embedding and lm head.
 pub struct DraftModel {
@@ -549,6 +668,12 @@ pub struct DraftModel {
     ffb: DeviceBuf,
     ffm: DeviceBuf,
     tmp: DeviceBuf, // [16][n_embd]
+    /// DSpark markov + confidence heads (None on plain DFlash drafts)
+    dspark: Option<DsparkHeads>,
+    /// DeepSpec-trained drafts emit NEXT-token rows (row j predicts the
+    /// token after slot j); z-lab drafts fill the mask at row j. Detected
+    /// from the dspark metadata the converter writes.
+    next_rows: bool,
 }
 
 impl DraftModel {
@@ -614,6 +739,16 @@ impl DraftModel {
             }
             _ => return Err("draft gguf missing dflash.target_layer_ids".into()),
         };
+        let next_rows = g.arch_meta("dspark.confidence_head").is_some()
+            || std::env::var_os("PULSAR_DFLASH_DEEPSPEC").is_some();
+        // DeepSpec extract_context_feature reads hidden_states[l + 1]
+        // (the residual ENTERING layer l+1); our ring captures at layer
+        // entry, so DeepSpec-trained drafts shift the capture points up
+        let layer_ids: Vec<usize> = if next_rows {
+            layer_ids.iter().map(|&l| l + 1).collect()
+        } else {
+            layer_ids
+        };
         if block_size > T_MAX {
             return Err("draft block_size exceeds T_MAX".into());
         }
@@ -639,6 +774,41 @@ impl DraftModel {
         let bs = block_size;
         let kv_rows = RING_CAP + bs;
         let n_cap = layer_ids.len();
+        // DSpark heads (markov bias + confidence prefix cut); plain
+        // DFlash drafts carry no dspark metadata and skip all of this.
+        let dspark = match g.arch_meta("dspark.markov_rank").and_then(gguf::Value::as_u64) {
+            Some(rank) if rank > 0 && std::env::var_os("PULSAR_NO_DSPARK").is_none() => {
+                let rank = rank as u32;
+                let has_conf = matches!(
+                    g.arch_meta("dspark.confidence_head"),
+                    Some(gguf::Value::Bool(true))
+                );
+                let conf_w = if has_conf {
+                    Some(super::read_f16_as_f32(&file, &g, "confidence_proj.weight")?)
+                } else {
+                    None
+                };
+                let conf_bias = g
+                    .arch_meta("dspark.confidence_bias")
+                    .and_then(gguf::Value::as_f32)
+                    .unwrap_or(0.0);
+                eprintln!(
+                    "pulsar: dspark heads active (markov rank {rank}{})",
+                    if conf_w.is_some() { " + confidence" } else { "" }
+                );
+                Some(DsparkHeads {
+                    w1: up("markov_w1.weight")?,
+                    w2: up("markov_w2.weight")?,
+                    rank,
+                    state: f32s(rank as usize)?,
+                    scratch: DeviceBuf::alloc(128 * 8)?,
+                    out_id: DeviceBuf::alloc(4)?,
+                    conf_w,
+                    conf_bias,
+                })
+            }
+            _ => None,
+        };
         Ok(DraftModel {
             fc: up("dflash_fc.weight")?,
             hidden_norm: up("dflash_hidden_norm.weight")?,
@@ -665,7 +835,25 @@ impl DraftModel {
             ffb: f32s(bs * ff as usize)?,
             ffm: f32s(bs * ff as usize)?,
             tmp: f32s(bs * n_embd as usize)?,
+            dspark,
+            next_rows,
         })
+    }
+}
+
+/// Confidence cut threshold in logit space. PULSAR_DSPARK_CONF is the
+/// sigmoid probability (default 0.5: cut only slots the head thinks are
+/// more likely rejected than accepted); "off" disables the cut.
+fn dspark_conf_threshold() -> f32 {
+    match std::env::var("PULSAR_DSPARK_CONF").ok().as_deref() {
+        Some("off") => f32::NEG_INFINITY,
+        Some(v) => v
+            .parse::<f32>()
+            .ok()
+            .filter(|p| *p > 0.0 && *p < 1.0)
+            .map(|p| (p / (1.0 - p)).ln())
+            .unwrap_or(0.0),
+        None => 0.0,
     }
 }
 
@@ -719,7 +907,31 @@ impl Model {
                 // holding the final residual
                 b.swap(st, rt);
                 kernels::copy_across(&mut st.cur, &b.cur, bytes)?;
+                // dflash second-span captures: bounce to the primary while
+                // the producer card is still current (same ordering trick
+                // as the residual hop), scatter once back on the primary
+                if let Some(df) = &mut rt.dflash {
+                    for e in &mut df.stage2 {
+                        kernels::copy_across(&mut e.bounce, &e.stage, bytes)?;
+                    }
+                }
                 kernels::set_device(primary)?;
+                if let Some(df) = &mut rt.dflash {
+                    let DflashRt { ring, stage2, layer_ids, .. } = df;
+                    let stride = (layer_ids.len() as u32) * s.n_embd;
+                    for e in stage2.iter() {
+                        kernels::qwen35_ring_scatter(
+                            ring,
+                            &e.bounce,
+                            pos,
+                            RING_CAP as u32,
+                            t,
+                            s.n_embd,
+                            stride,
+                            e.slot as u32 * s.n_embd,
+                        )?;
+                    }
+                }
             }
             Ok(())
         };
@@ -751,9 +963,15 @@ impl Model {
     fn eval_qwen35_span(&self, st: &mut State, rt: &mut Qwen35Rt, lo: usize, hi: usize, pos: u32, t: u32) -> Result {
         let dbg = std::env::var_os("PULSAR_DEBUG_L2").is_some()
             || std::env::var_os("PULSAR_DENSE_PROF").is_some();
+        // no graphs while dflash is active: capture layers scatter with
+        // the runtime position (a replayed graph would bake it stale),
+        // and the capture_gdn stash is a runtime branch with cudaMemcpy -
+        // illegal under stream capture, silently skipped on replay
+        let dflash_on = rt.dflash.is_some();
         let graphable = |il: usize| {
             let l = &self.layers[il];
-            matches!(&l.attn, Attn::Qwen35(w) if w.gdn.is_some())
+            !dflash_on
+                && matches!(&l.attn, Attn::Qwen35(w) if w.gdn.is_some())
                 && matches!(l.ffn, Ffn::DenseKq { .. })
         };
         let mut graphs = std::mem::take(&mut rt.graphs);
@@ -816,7 +1034,12 @@ impl Model {
         // ---- DFlash feature capture: HF hidden_states[il] convention -
         // the residual stream ENTERING layer il (= output of layer il-1)
         if let Some(df) = &mut rt.dflash {
-            if let Some(idx) = df.layer_ids.iter().position(|&x| x == il) {
+            if let Some(e) = df.stage2.iter_mut().find(|e| e.il == il) {
+                // second-span layer: the ring lives on the primary, so
+                // stage locally; the run loop flushes after the hop back
+                kernels::copy_d2d(&mut e.stage, 0, &st.cur, 0, (t * s.n_embd) as usize * 4)
+                    .map_err(|e| format!("dflash stage2 capture at layer {il}: {e}"))?;
+            } else if let Some(idx) = df.layer_ids.iter().position(|&x| x == il) {
                 let stride = (df.layer_ids.len() as u32) * s.n_embd;
                 kernels::qwen35_ring_scatter(
                     &mut df.ring,
@@ -1055,11 +1278,72 @@ impl Model {
         // final norm -> target lm head (head_logits reads st.normed)
         kernels::rms_norm(&mut st.normed, &d.h, &d.out_norm, s.n_embd, bs as u32, eps)?;
         self.head_logits(st, bs as u32)?;
-        kernels::sync()?;
-        let logits = st.logits.read_f32(bs * s.n_vocab as usize)?;
         let v = s.n_vocab as usize;
-        let mut out: Vec<u32> = (0..bs).map(|i| argmax(&logits[i * v..(i + 1) * v])).collect();
-        out[0] = last_tok;
+        let mut out: Vec<u32>;
+        // DeepSpec next-token rows: draft slot j comes from logits row
+        // j-1 (row 0 is keyed on the anchor token); z-lab mask-fill rows
+        // read slot j from row j.
+        let row_of = |j: usize| if d.next_rows { j - 1 } else { j };
+        if let Some(dk) = &mut d.dspark {
+            // markov-biased greedy: each slot's argmax includes the
+            // w2 @ w1[prev] bigram bias, sequenced on the previous pick
+            // (fused kernel; the vocab-sized bias never materializes)
+            out = vec![last_tok; bs];
+            let mut states_host: Vec<Vec<f32>> = Vec::new();
+            for i in 1..bs {
+                let prev = [out[i - 1] as i32];
+                st.tok.write(0, kernels::as_bytes(&prev))?;
+                kernels::embed_q8_0(&mut dk.state, &dk.w1, &st.tok, dk.rank, s.n_vocab, 1)?;
+                out[i] = kernels::dspark_markov_argmax(
+                    &st.logits,
+                    row_of(i) * v,
+                    &dk.w2,
+                    &dk.state,
+                    s.n_vocab,
+                    dk.rank,
+                    &mut dk.scratch,
+                    &mut dk.out_id,
+                )?;
+                if dk.conf_w.is_some() {
+                    states_host.push(dk.state.read_f32(dk.rank as usize)?);
+                }
+            }
+            // confidence prefix cut: slot i survives while the predicted
+            // acceptance logit stays above the threshold; the verify then
+            // runs only the surviving rows
+            if let Some(w) = &dk.conf_w {
+                let thr = dspark_conf_threshold();
+                let h_host = d.h.read_f32(bs * s.n_embd as usize)?;
+                let ne = s.n_embd as usize;
+                let mut keep = 1usize;
+                for i in 1..bs {
+                    let hrow = &h_host[row_of(i) * ne..(row_of(i) + 1) * ne];
+                    let stt = &states_host[i - 1];
+                    let mut acc = dk.conf_bias;
+                    for (a, b) in w[..ne].iter().zip(hrow) {
+                        acc += a * b;
+                    }
+                    for (a, b) in w[ne..].iter().zip(stt) {
+                        acc += a * b;
+                    }
+                    if acc < thr {
+                        break;
+                    }
+                    keep += 1;
+                }
+                out.truncate(keep);
+            }
+        } else {
+            kernels::sync()?;
+            let logits = st.logits.read_f32(bs * s.n_vocab as usize)?;
+            out = (0..bs)
+                .map(|i| {
+                    let r = if i == 0 { 0 } else { row_of(i) };
+                    argmax(&logits[r * v..(r + 1) * v])
+                })
+                .collect();
+            out[0] = last_tok;
+        }
         Ok(out)
     }
 }
@@ -1097,10 +1381,11 @@ pub fn generate_dflash(
         if committed + bs as u32 + 1 >= st.ctx {
             break;
         }
-        // 1. draft
+        // 1. draft (DSpark confidence may cut the block short: nrows <= bs)
         let t0 = std::time::Instant::now();
         let draft_tok = model.dflash_draft(st, draft, committed, last_tok)?;
-        st.mtp_drafted += (bs - 1) as u64;
+        let nrows = draft_tok.len();
+        st.mtp_drafted += (nrows - 1) as u64;
         let t_draft = t0.elapsed();
         // 2. snapshot + batched verify (gdn inputs stashed for rollback)
         let t0 = std::time::Instant::now();
@@ -1110,19 +1395,19 @@ pub fn generate_dflash(
             rt.dflash.as_mut().unwrap().capture_gdn = true;
         }
         let all = model
-            .forward_rows(st, &draft_tok, committed, bs as u32)?
+            .forward_rows(st, &draft_tok, committed, nrows as u32)?
             .ok_or("no verify logits")?;
         st.qwen35.as_mut().unwrap().dflash.as_mut().unwrap().capture_gdn = false;
         let t_verify = t0.elapsed();
         let target_tok: Vec<u32> =
-            (0..bs).map(|i| argmax(&all[i * v..(i + 1) * v])).collect();
+            (0..nrows).map(|i| argmax(&all[i * v..(i + 1) * v])).collect();
         if std::env::var_os("PULSAR_DFLASH_DEBUG").is_some() {
             eprintln!("dflash round @{committed}:\n  draft  {draft_tok:?}\n  target {target_tok:?}");
         }
         // 3. accept the matching prefix (row i predicts the token after
         //    draft_tok[i]; draft_tok[0] = last_tok is always accepted)
         let mut accept_n = 1usize;
-        while accept_n < bs && draft_tok[accept_n] == target_tok[accept_n - 1] {
+        while accept_n < nrows && draft_tok[accept_n] == target_tok[accept_n - 1] {
             accept_n += 1;
         }
         st.mtp_accepted += (accept_n - 1) as u64;
