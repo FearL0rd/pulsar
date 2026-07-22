@@ -206,6 +206,12 @@ mod real {
                 // DeepSeek-V4-Flash: hyper-connections + sink attention +
                 // compressed KV + hash routing (task #22)
                 Some("deepseek4") => Family::Dsv4,
+                // poolside Laguna S/XS 2.1: GQA MoE with a sigmoid router
+                // (exp_probs_b correction bias, topk-norm, shared expert),
+                // interleaved full/sliding attention like gemma4, plus two
+                // Laguna-only pieces: a per-head output gate (attn_gate,
+                // softplus) and learnable sinks on the sliding layers.
+                Some("laguna") => Family::Gqa,
                 // Qwen3.6-35B-A3B hybrid GDN (task #21)
                 Some("qwen35moe") => Family::Qwen35,
                 // Qwen3.6 dense (27B lineage, task #37): same GDN hybrid
@@ -231,7 +237,18 @@ mod real {
             let mut s = Shape {
                 family,
                 n_embd: u("embedding_length")?,
-                n_head: u("attention.head_count")?,
+                // laguna ships head_count as a per-layer array (48 on full
+                // layers, 72 on sliding); the scalar Shape field takes the
+                // MAX for buffer sizing, per-layer truth lives in
+                // Model::geom.n_head_q - same split gemma4 uses for kv.
+                n_head: u("attention.head_count").unwrap_or_else(|_| {
+                    match g.arch_meta("attention.head_count") {
+                        Some(Value::Array(a)) => {
+                            a.iter().filter_map(Value::as_u64).max().unwrap_or(1) as u32
+                        }
+                        _ => 1,
+                    }
+                }),
                 // gemma4 ships head_count_kv as a per-layer array; the
                 // scalar Shape field takes the max (buffer sizing), the
                 // per-layer truth lives in Model::geom
@@ -336,6 +353,14 @@ mod real {
                 ssm_inner: 0,
                 full_attn_interval: 0,
             };
+            if g.architecture() == Some("laguna") {
+                // laguna ships real YaRN (factor 32 over an 8192 native
+                // window) on BOTH attention flavours; rope_cfg's
+                // deepseek2 mscale path does not apply (log_mult 0).
+                s.rope_scale_factor = f("rope.scaling.factor").unwrap_or(1.0);
+                s.rope_orig_ctx = u("rope.scaling.original_context_length").unwrap_or(8192);
+                s.rope_yarn_log_mult = 0.0;
+            }
             if family == Family::Gqa {
                 // partial rotary: MiniMax rotates rope.dimension_count of
                 // head_dim; absent (Hy3) = full head
@@ -574,11 +599,17 @@ mod real {
     /// for uniform-geometry families.
     #[derive(Clone, Copy)]
     struct Geom {
+        /// per-layer QUERY head count (laguna varies it: 48 full / 72
+        /// sliding). 0 = uniform, use Shape::n_head.
+        n_head_q: u32,
         n_head_kv: u32,
         head_dim: u32,
         theta: f32,
         window: u32,   /* 0 = full causal */
         factors: bool, /* proportional rope via rope_freqs */
+        /// per-layer rotation width; 0 = rotate the whole head. laguna
+        /// rotates 64 of 128 on full layers, 128 on sliding ones.
+        rot: u32,
     }
 
     enum Attn {
@@ -710,6 +741,9 @@ mod real {
         ffn: Ffn,
         gemma: Option<GemmaW>,
         ink: Option<InkW>,
+        /// laguna per-head output gate (g_proj): softplus(x @ w) scales
+        /// each attention head row before attn_output. None elsewhere.
+        attn_gate: Option<DeviceBuf>,
     }
 
     /// The nextn/MTP draft block: predicts token t+2 from (hidden of
@@ -2101,6 +2135,26 @@ mod real {
         let mut buf = vec![0u8; bytes as usize];
         file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
 
+        // F16 2D tensors -> q8_0: every dense-matmul consumer in the
+        // engine reads q8_0 blocks, and raw f16 bytes fed to those
+        // kernels decode as noise (poolside's Laguna ggufs ship ALL
+        // attention projections in f16; same trap as the dspark drafts).
+        // 1D f16 stays raw - callers that want it use read_f16_as_f32.
+        if t.ty == TensorType::F16 && t.dims.len() >= 2 {
+            let n = t.n_elements() as usize;
+            let mut out = Vec::with_capacity(n / 32 * 34);
+            let mut f = vec![0f32; 32];
+            for blk in buf.chunks_exact(64) {
+                for (i, c) in blk.chunks_exact(2).enumerate() {
+                    f[i] = requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                }
+                requant::quantize_q8_0(&f, &mut out);
+            }
+            if n % 32 != 0 {
+                return Err(format!("{name}: f16 width not a multiple of 32").into());
+            }
+            return Ok(out);
+        }
         // dense K-quant tensors -> q8_0 (see mod requant). output.weight
         // stays native: head_logits reads K-quants directly.
         let convert = matches!(
@@ -2464,6 +2518,7 @@ mod real {
             // pinned overflow would be read over that card's own link.
             let gemma_arch = gguf.architecture() == Some("gemma4");
             let ink_arch = gguf.architecture() == Some("inkling");
+            let laguna_arch = gguf.architecture() == Some("laguna");
             // per-layer attention geometry: gemma4 interleaves sliding-
             // window layers (own kv width, head_dim, theta) with full ones
             let geom: Vec<Geom> = if ink_arch {
@@ -2492,6 +2547,7 @@ mod real {
                     .map(|il| {
                         let swa = swa_pat.get(il).copied().unwrap_or(false);
                         Geom {
+                            n_head_q: 0,
                             n_head_kv: kvh
                                 .get(il)
                                 .copied()
@@ -2501,6 +2557,7 @@ mod real {
                             theta: 0.0,
                             window: if swa { window } else { 0 },
                             factors: false,
+                            rot: 0,
                         }
                     })
                     .collect()
@@ -2535,11 +2592,61 @@ mod real {
                     .map(|il| {
                         let swa = swa_pat.get(il).copied().unwrap_or(false);
                         Geom {
+                            n_head_q: 0,
                             n_head_kv: kvh.get(il).copied().unwrap_or(1) as u32,
                             head_dim: if swa { hd_swa } else { hd_full },
                             theta: if swa { theta_swa } else { theta_full },
                             window: if swa { window } else { 0 },
                             factors: !swa,
+                            rot: 0,
+                        }
+                    })
+                    .collect()
+            } else if laguna_arch {
+                // Laguna interleaves one full-attention layer every 4th
+                // with sliding ones, and varies the QUERY head count per
+                // layer (48 full / 72 sliding) - unlike gemma, whose
+                // per-layer array is head_count_kv. n_head_kv is constant
+                // (8); the per-layer truth we need is the q head count,
+                // carried in Geom::n_head_q.
+                let arr_u = |k: &str| -> Vec<u64> {
+                    match gguf.arch_meta(k) {
+                        Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).collect(),
+                        Some(v) => v.as_u64().map(|x| vec![x]).unwrap_or_default(),
+                        None => Vec::new(),
+                    }
+                };
+                let heads = arr_u("attention.head_count");
+                let kvh = arr_u("attention.head_count_kv");
+                let g_u = |k: &str, d: u32| -> u32 {
+                    gguf.arch_meta(k).and_then(Value::as_u64).map(|v| v as u32).unwrap_or(d)
+                };
+                let g_f = |k: &str, d: f32| -> f32 {
+                    gguf.arch_meta(k).and_then(Value::as_f32).unwrap_or(d)
+                };
+                let window = g_u("attention.sliding_window", 512);
+                let theta_full = g_f("rope.freq_base", 10_000_000.0);
+                let theta_swa = g_f("rope.freq_base_swa", theta_full);
+                // partial rotary: full layers rotate rope.dimension_count
+                // (64 of 128), sliding layers dimension_count_swa (128)
+                let rot_full = g_u("rope.dimension_count", shape.head_dim);
+                let rot_swa = g_u("rope.dimension_count_swa", shape.head_dim);
+                // a layer is FULL when its q head count matches the
+                // smaller of the two values in the array (48 vs 72); the
+                // gguf carries no explicit sliding pattern for laguna
+                let h_min = heads.iter().copied().min().unwrap_or(shape.n_head as u64);
+                (0..shape.n_exec_layer as usize)
+                    .map(|il| {
+                        let nh = heads.get(il).copied().unwrap_or(shape.n_head as u64);
+                        let full = nh == h_min;
+                        Geom {
+                            n_head_q: nh as u32,
+                            n_head_kv: kvh.get(il).copied().unwrap_or(shape.n_head_kv as u64) as u32,
+                            head_dim: shape.head_dim,
+                            theta: if full { theta_full } else { theta_swa },
+                            window: if full { 0 } else { window },
+                            factors: false,
+                            rot: if full { rot_full } else { rot_swa },
                         }
                     })
                     .collect()
@@ -2990,6 +3097,13 @@ mod real {
                     ffn,
                     gemma,
                     ink,
+                    // laguna: per-head output gate (gating="per-head", so
+                    // one column per QUERY head on this layer)
+                    attn_gate: if gguf.tensor(&t("attn_gate.weight")).is_some() {
+                        Some(upload(&file, &gguf, &t("attn_gate.weight"))?)
+                    } else {
+                        None
+                    },
                 })
             };
 
@@ -3384,6 +3498,8 @@ mod real {
         // copied primary->attn GPU, attn output copied back
         normed_a: DeviceBuf,
         attn_out_a: DeviceBuf,
+        /// laguna per-head attention gate logits [max_batch][n_head]
+        attn_gate_buf: DeviceBuf,
         // resident expert tiers on leftover GPUs + the primary-side
         // buffer their partial outputs are gathered into
         pub tiers: Vec<ExpertTier>,
@@ -4035,6 +4151,9 @@ mod real {
             } else {
                 (f32s(1)?, f32s(1)?)
             };
+            // laguna output gate: one logit per (token, query head)
+            let has_gate = m.layers.iter().any(|l| l.attn_gate.is_some());
+            let attn_gate_buf = f32s(if has_gate { mb * s.n_head } else { 1 })?;
             // Gqa attention scratch beside the KV caches (attn card under
             // offload, primary otherwise): raw k/v projections, inkling's
             // rel-bias buffers and the k/v-stream shortconv state+tmp
@@ -4150,6 +4269,7 @@ mod real {
                 idx_last_sel: 0,
                 normed_a,
                 attn_out_a,
+                attn_gate_buf,
                 tier_ret: if tiers.is_empty() { f32s(1)? } else { f32s(mb * s.n_embd)? },
                 cpu_pool: cpu_tier::Pool::from_env(),
                 cpu_ret: f32s(1)?, // grows on first CPU-lane hit
@@ -4419,6 +4539,13 @@ mod real {
                 }
             }
 
+            if std::env::var_os("PULSAR_L2_TRACE").is_some() {
+                kernels::sync()?;
+                let v = st.cur.read_f32((n_tok * s.n_embd) as usize)?;
+                let last = &v[(n_tok as usize - 1) * s.n_embd as usize..];
+                let l2: f32 = last.iter().map(|x| x * x).sum::<f32>().sqrt();
+                eprintln!("l2 EMBD {l2:.4} first {:.5} {:.5} {:.5}", last[0], last[1], last[2]);
+            }
             for (il, l) in self.layers.iter().enumerate() {
                 // stage layer il+1's pinned attn tensors under this
                 // layer's compute (decode only: prefill amortizes weights
@@ -4429,6 +4556,13 @@ mod real {
                     }
                 }
                 self.eval_layer(st, il, l, n_tok, pos0, primary)?;
+                if std::env::var_os("PULSAR_L2_TRACE").is_some() {
+                    kernels::sync()?;
+                    let v = st.cur.read_f32((n_tok * s.n_embd) as usize)?;
+                    let last = &v[(n_tok as usize - 1) * s.n_embd as usize..];
+                    let l2: f32 = last.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    eprintln!("l2 L{il} out {l2:.4} first {:.5} {:.5} {:.5}", last[0], last[1], last[2]);
+                }
             }
 
             if rows == 0 {
@@ -4503,8 +4637,11 @@ mod real {
             // per-layer attention geometry (gemma4 SWA/full interleave);
             // uniform families read straight from Shape
             let gm = self.geom.get(il).copied();
+            // per-layer query head count: laguna varies it (48 full / 72
+            // sliding); 0 or no geom = uniform s.n_head
+            let nh_q = gm.map(|g| g.n_head_q).filter(|&v| v != 0).unwrap_or(s.n_head);
             let heads_dim = match (&l.attn, gm) {
-                (Attn::Gqa { .. }, Some(g)) => s.n_head * g.head_dim,
+                (Attn::Gqa { .. }, Some(g)) => nh_q * g.head_dim,
                 _ => s.heads_dim(),
             };
             {
@@ -4533,7 +4670,7 @@ mod real {
                             kernels::set_device(d)?;
                         }
                         let xin = if self.attn_dev.is_some() { &st.normed_a } else { &st.normed };
-                        kernels::matmul_q8_0(&mut st.q, attn_q, xin, s.n_embd, s.n_head * hd, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.q, attn_q, xin, s.n_embd, nh_q * hd, n_tok)?;
                         kernels::matmul_q8_0(&mut st.k, attn_k, xin, s.n_embd, hkv * hd, n_tok)?;
                         match attn_v {
                             Some(v_w) => kernels::matmul_q8_0(&mut st.v, v_w, xin, s.n_embd, hkv * hd, n_tok)?,
@@ -4550,17 +4687,43 @@ mod real {
                             kernels::sconv(&mut st.sconv_tmp_kv, &st.v, &ink.sconv_v, &mut st.sconv_state[il][1], n_tok, hkv * hd, s.sconv_k)?;
                             kernels::copy_across(&mut st.v, &st.sconv_tmp_kv, kvb)?;
                         }
-                        kernels::gqa_head_rms_norm(&mut st.q, Some(q_norm), n_tok * s.n_head, hd, eps)?;
+                        kernels::gqa_head_rms_norm(&mut st.q, Some(q_norm), n_tok * nh_q, hd, eps)?;
                         kernels::gqa_head_rms_norm(&mut st.k, Some(k_norm), n_tok * hkv, hd, eps)?;
-                        if gm.is_some() && l.ink.is_none() {
-                            // gemma: v gets a weightless per-head rms norm
+                        if gm.is_some() && l.ink.is_none() && l.attn_gate.is_none() {
+                            // gemma: v gets a weightless per-head rms norm.
+                            // laguna also has per-layer geom but does NOT
+                            // do this (attn_gate marks it).
                             kernels::gqa_head_rms_norm(&mut st.v, None, n_tok * hkv, hd, eps)?;
                         }
-                        if l.ink.is_none() {
+                        if let Some(rot_w) = gm.map(|g| g.rot).filter(|&r| r != 0) {
+                            // laguna per-layer-type rope (llama.cpp
+                            // models/laguna.cpp is the validated spec):
+                            // FULL layers run YaRN (factor 32 over 8192,
+                            // theta 500k, rot 64) with attn_factor set to
+                            // CANCEL the kernel-internal
+                            // 1 + 0.1 ln(1/freq_scale) mscale - rotated
+                            // dims stay unit-scaled. SLIDING layers run
+                            // PLAIN rope (theta 10k, rot 128): freq_scale
+                            // 1.0 and ext_factor 0, NOT the global yarn.
+                            let yarn = window == 0 && s.rope_scale_factor > 1.0;
+                            let f = s.rope_scale_factor;
+                            let rc = kernels::RopeCfg {
+                                n_ctx_orig: s.rope_orig_ctx,
+                                freq_base: theta,
+                                freq_scale: if yarn { 1.0 / f } else { 1.0 },
+                                ext_factor: if yarn { 1.0 } else { 0.0 },
+                                attn_factor: if yarn { 1.0 / (1.0 + 0.1 * f.ln()) } else { 1.0 },
+                                beta_fast: 32.0,
+                                beta_slow: 1.0,
+                                kq_mult: 1.0,
+                            };
+                            kernels::rope_yarn_partial(&mut st.q, n_tok, nh_q, hd, rot_w, pos0, &rc)?;
+                            kernels::rope_yarn_partial(&mut st.k, n_tok, hkv, hd, rot_w, pos0, &rc)?;
+                        } else if l.ink.is_none() {
                             // inkling has no rope: position rides the
                             // relative bias below (log-N tau is identity
                             // below 128k ctx, so it is skipped here)
-                            kernels::gqa_rope(&mut st.q, n_tok, s.n_head, hd, rot, pos0, theta, factors)?;
+                            kernels::gqa_rope(&mut st.q, n_tok, nh_q, hd, rot, pos0, theta, factors)?;
                             kernels::gqa_rope(&mut st.k, n_tok, hkv, hd, rot, pos0, theta, factors)?;
                         }
                         let kvq = st.kv_fp8 as u32;
@@ -4570,9 +4733,10 @@ mod real {
                         // inkling at muP 1/head_dim
                         let scale = if l.ink.is_some() {
                             1.0 / hd as f32
-                        } else if gm.is_some() {
+                        } else if gm.is_some() && l.attn_gate.is_none() {
                             1.0
                         } else {
+                            // laguna: head_dim**-0.5 despite QK-norm
                             1.0 / (hd as f32).sqrt()
                         };
                         let rel_ext = if let Some(ink) = &l.ink {
@@ -4585,12 +4749,35 @@ mod real {
                             0
                         };
                         let rel = l.ink.as_ref().map(|_| &st.rel_buf);
-                        kernels::gqa_attention_rel(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq)?;
+                        kernels::gqa_attention_rel(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, nh_q, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq)?;
+
+                        // laguna: per-head output gate. g_proj gives one
+                        // logit per (token, head); softplus of it scales
+                        // the whole head row before the output projection.
+                        if let Some(gw) = &l.attn_gate {
+                            kernels::matmul_q8_0(&mut st.attn_gate_buf, gw, xin, s.n_embd, nh_q, n_tok)?;
+                            if il == 0 && std::env::var_os("PULSAR_L2_TRACE").is_some() {
+                                kernels::sync()?;
+                                let g = st.attn_gate_buf.read_f32((n_tok * nh_q) as usize)?;
+                                let h = st.heads.read_f32((n_tok * nh_q * hd) as usize)?;
+                                let hl2: f32 = h.iter().map(|x| x * x).sum::<f32>().sqrt();
+                                let gmin = g.iter().cloned().fold(f32::INFINITY, f32::min);
+                                let gmax = g.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                                eprintln!("l2 L0 gate logits [{gmin:.3}, {gmax:.3}] heads-pre-gate L2 {hl2:.4}");
+                            }
+                            kernels::laguna_head_gate(&mut st.heads, &st.attn_gate_buf, n_tok, nh_q, hd)?;
+                            if il == 0 && std::env::var_os("PULSAR_L2_TRACE").is_some() {
+                                kernels::sync()?;
+                                let h = st.heads.read_f32((n_tok * nh_q * hd) as usize)?;
+                                let hl2: f32 = h.iter().map(|x| x * x).sum::<f32>().sqrt();
+                                eprintln!("l2 L0 heads-post-gate L2 {hl2:.4}");
+                            }
+                        }
 
                         // output projection on the attn card, hop back,
                         // restore the primary (mirrors the Mla path)
                         if self.attn_dev.is_some() {
-                            kernels::matmul_q8_0(&mut st.attn_out_a, attn_output_w, &st.heads, s.n_head * hd, s.n_embd, n_tok)?;
+                            kernels::matmul_q8_0(&mut st.attn_out_a, attn_output_w, &st.heads, nh_q * hd, s.n_embd, n_tok)?;
                             kernels::copy_across(&mut st.attn_out, &st.attn_out_a, (n_tok * s.n_embd) as usize * 4)?;
                             kernels::set_device(primary)?;
                         }
@@ -4713,7 +4900,19 @@ mod real {
                     kernels::sconv(&mut st.sconv_tmp, &st.attn_out, &ink.sconv_attn, &mut st.sconv_state[il][2], n_tok, s.n_embd, s.sconv_k)?;
                     kernels::copy_across(&mut st.attn_out, &st.sconv_tmp, (n_tok * s.n_embd) as usize * 4)?;
                 }
+                if std::env::var_os("PULSAR_L2_TRACE").is_some() && il == 0 {
+                    kernels::sync()?;
+                    let a = st.attn_out.read_f32((n_tok * s.n_embd) as usize)?;
+                    let l2: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    eprintln!("l2 L0 attn_out(post o_proj) L2 {l2:.4} first {:.5} {:.5}", a[0], a[1]);
+                }
                 kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, n_tok * s.n_embd)?;
+                if std::env::var_os("PULSAR_L2_TRACE").is_some() && il == 0 {
+                    kernels::sync()?;
+                    let a = st.after_attn.read_f32((n_tok * s.n_embd) as usize)?;
+                    let l2: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    eprintln!("l2 L0 after_attn(residual) L2 {l2:.4}");
+                }
 
                 // ffn
                 kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, n_tok, eps)?;

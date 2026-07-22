@@ -125,6 +125,9 @@ mod real {
         fn pulsar_qwen35_gdn_step(out: *mut c_void, state: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, g: *const c_void, beta: *const c_void, h_v: u32, h_k: u32, dim: u32) -> i32;
         fn pulsar_qwen35_split_gate(q: *mut c_void, gate: *mut c_void, fused: *const c_void, n_head: u32, dim: u32) -> i32;
         fn pulsar_qwen35_sigmoid_gate(x: *mut c_void, gate: *const c_void, n: u32) -> i32;
+        fn pulsar_laguna_head_gate(x: *mut c_void, gate: *const c_void, n_tok: u32, n_head: u32, head_dim: u32) -> i32;
+        #[allow(clippy::too_many_arguments)]
+        fn pulsar_rope_yarn_partial(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, n_ctx_orig: u32) -> i32;
         fn pulsar_qwen35_conv_batch(out: *mut c_void, x: *const c_void, kern: *const c_void, state: *mut c_void, n_chan: u32, k: u32, n_tok: u32) -> i32;
         fn pulsar_qwen35_gdn_batch(out: *mut c_void, state: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, g: *const c_void, beta: *const c_void, h_v: u32, h_k: u32, dim: u32, n_tok: u32) -> i32;
         fn pulsar_qwen35_row_scale(x: *mut c_void, s: *const c_void, n_rows: u32, dim: u32) -> i32;
@@ -1188,6 +1191,15 @@ mod real {
     }
 
     /// x *= sigmoid(gate) elementwise.
+    /// Laguna per-head output gate: x [n_tok][n_head][head_dim] scaled by
+    /// softplus(gate[n_tok][n_head]), one scalar per head row.
+    pub fn laguna_head_gate(x: &mut DeviceBuf, gate: &DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32) -> Result {
+        check(
+            unsafe { pulsar_laguna_head_gate(x.ptr_mut(), gate.ptr(), n_tok, n_head, head_dim) },
+            "laguna_head_gate",
+        )
+    }
+
     pub fn qwen35_sigmoid_gate(x: &mut DeviceBuf, gate: &DeviceBuf, n: u32) -> Result {
         check(unsafe { pulsar_qwen35_sigmoid_gate(x.ptr_mut(), gate.ptr(), n) }, "qwen35_sigmoid_gate")
     }
@@ -1217,6 +1229,20 @@ mod real {
 
     /// NEOX-paired YaRN rope over the full head (DFlash draft: trained
     /// with rope_scaling yarn; ggml semantics via RopeCfg).
+    /// NEOX yarn rope over a partial rotation width (lanes >= rot_dim
+    /// pass through). rot_dim == head_dim reproduces the full rotation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_yarn_partial(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, r: &RopeCfg) -> Result {
+        check(
+            unsafe {
+                pulsar_rope_yarn_partial(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos0,
+                    r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor,
+                    r.beta_fast, r.beta_slow, r.n_ctx_orig)
+            },
+            "rope_yarn_partial",
+        )
+    }
+
     pub fn qwen35_rope_yarn(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, pos0: u32, r: &RopeCfg) -> Result {
         check(unsafe { pulsar_qwen35_rope_yarn(x.ptr_mut(), n_tok, n_head, head_dim, pos0, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor, r.beta_fast, r.beta_slow, r.n_ctx_orig) }, "qwen35_rope_yarn")
     }
