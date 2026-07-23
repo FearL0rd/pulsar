@@ -907,12 +907,26 @@ mod real {
     /// Engine-side telemetry snapshot. Cumulative counters/timers; serve diffs
     /// consecutive snapshots to get per-turn deltas. Hardware (RAM/cores) and
     /// layer/expert counts are added serve-side from std + gguf metadata.
+    /// One GPU's name and VRAM occupancy, for the /stats hardware panel.
+    pub struct GpuStat {
+        pub name: String,
+        pub vram_free: usize,
+        pub vram_total: usize,
+    }
+
     pub struct Stats {
         pub gpu_count: i32,
         pub ctx: u32,
         pub tiers: Vec<TierStat>,
         pub cpu_hits: u64,
         pub cache_hits: u64,
+        /// per-device name + VRAM free/total, all GPUs (not just expert tiers)
+        pub gpus: Vec<GpuStat>,
+        /// host RAM expert-cache used / capacity bytes (the RAM tier)
+        pub host_used: usize,
+        pub host_budget: usize,
+        /// model bytes resident in VRAM: fixed expert tiers + the VRAM slab cache
+        pub vram_resident: usize,
         /// cumulative per-stage wall time, seconds (see Prof)
         pub prof_gpu_wait: f64,
         pub prof_resolve: f64,
@@ -3815,7 +3829,7 @@ mod real {
         /// Telemetry snapshot for the /stats endpoint. Cheap: reads counters
         /// and the resident tier list, no device work.
         pub fn stats(&self) -> Stats {
-            let tiers = self
+            let tiers: Vec<TierStat> = self
                 .tiers
                 .iter()
                 .map(|t| TierStat {
@@ -3824,13 +3838,28 @@ mod real {
                     hits: t.hits,
                 })
                 .collect();
+            let n_gpu = kernels::device_count();
+            let gpus = (0..n_gpu)
+                .map(|d| {
+                    let (free, total) = kernels::mem_info(d).unwrap_or((0, 0));
+                    GpuStat { name: String::new(), vram_free: free, vram_total: total }
+                })
+                .collect();
+            // model bytes actually in VRAM: fixed expert tiers + the *used* slabs
+            // of the VRAM cache (pool.bytes() is reserved capacity, not occupancy)
+            let vram_resident = tiers.iter().map(|t| t.bytes).sum::<usize>()
+                + self.dev_cache.map.len() * self.dev_cache.slab_bytes;
             let s = |d: std::time::Duration| d.as_secs_f64();
             Stats {
-                gpu_count: kernels::device_count(),
+                gpu_count: n_gpu,
                 ctx: self.ctx,
                 tiers,
                 cpu_hits: self.cpu_hits,
                 cache_hits: self.dev_cache.hits,
+                gpus,
+                host_used: self.store.used,
+                host_budget: self.store.budget,
+                vram_resident,
                 prof_gpu_wait: s(self.prof.sync),
                 prof_resolve: s(self.prof.resolve),
                 prof_h2d: s(self.prof.h2d),

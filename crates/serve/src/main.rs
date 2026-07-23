@@ -166,6 +166,24 @@ fn run() -> engine::Result {
                         .iter()
                         .map(|t| serde_json::json!({"dev": t.dev, "bytes": t.bytes, "hits": t.hits}))
                         .collect();
+                    let gpu_names = gpu_names();
+                    let gpus: Vec<_> = s
+                        .gpus
+                        .iter()
+                        .enumerate()
+                        .map(|(i, g)| serde_json::json!({
+                            "dev": i,
+                            "name": gpu_names.get(i).cloned().unwrap_or_default(),
+                            "vram_used": g.vram_total.saturating_sub(g.vram_free),
+                            "vram_total": g.vram_total,
+                        }))
+                        .collect();
+                    // model residency: VRAM (resident tiers + slab cache), RAM (host
+                    // cache), disk (the streamed remainder of the gguf on disk)
+                    let model_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+                    let vram = s.vram_resident as u64;
+                    let ram = s.host_used as u64;
+                    let disk = model_bytes.saturating_sub(vram + ram);
                     let json = serde_json::json!({
                         "model": model_name,
                         "ctx": s.ctx,
@@ -174,10 +192,14 @@ fn run() -> engine::Result {
                         "n_expert_used": find_u(".expert_used_count").unwrap_or(0),
                         "hardware": {
                             "gpu_count": s.gpu_count,
+                            "cpu_name": cpu_name(),
                             "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
                             "ram_total_kb": meminfo_kb("MemTotal"),
                             "ram_available_kb": meminfo_kb("MemAvailable"),
+                            "gpus": gpus,
                         },
+                        "model_bytes": model_bytes,
+                        "residency": {"vram": vram, "ram": ram, "ram_budget": s.host_budget, "disk": disk},
                         "tiers": tiers,
                         "cpu_hits": s.cpu_hits,
                         "cache_hits": s.cache_hits,
@@ -303,6 +325,36 @@ fn meminfo_kb(key: &str) -> u64 {
                 .and_then(|v| v.parse().ok())
         })
         .unwrap_or(0)
+}
+
+/// CPU model name from /proc/cpuinfo (empty if unavailable). /stats hardware.
+fn cpu_name() -> String {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split(':').nth(1))
+                .map(|v| v.trim().to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// GPU names by device index, from nvidia-smi (empty if unavailable). VRAM
+/// used/total come from the engine's cudaMemGetInfo; nvidia-smi supplies names.
+fn gpu_names() -> Vec<String> {
+    std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Raw bytes response with an explicit content-type (static assets, etc).

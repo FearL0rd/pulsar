@@ -474,8 +474,9 @@
     font-size: 12px;
     line-height: 1.45;
   }
-  .kv .k { color: var(--text-tertiary); }
+  .kv .k { color: var(--text-tertiary); flex-shrink: 0; }
   .kv .v { color: var(--text-warm); font-family: var(--mono); font-size: 11.5px; text-align: right; }
+  .kv .v-name { font-size: 10.5px; line-height: 1.35; word-break: break-word; }
   .stat-grid {
     display: grid;
     grid-template-columns: 1fr 1fr 1fr;
@@ -1093,7 +1094,8 @@
 
   <div class="side-section">
     <div class="side-title">Runtime</div>
-    <div class="kv"><span class="k">GPU</span><span class="v" id="hw-gpu">—</span></div>
+    <div class="kv"><span class="k">CPU</span><span class="v v-name" id="hw-cpu">—</span></div>
+    <div id="hw-gpus"></div>
     <div class="kv"><span class="k">RAM</span><span class="v" id="hw-ram">—</span></div>
     <div class="kv"><span class="k">Cores</span><span class="v" id="hw-cores">—</span></div>
   </div>
@@ -1112,9 +1114,9 @@
   </div>
 
   <div class="side-section">
-    <div class="side-title">Resident tiers</div>
-    <div class="bar" id="tiers-bar"></div>
-    <div class="legend" id="tiers-legend"></div>
+    <div class="side-title">Model in memory</div>
+    <div class="bar" id="resid-bar"></div>
+    <div class="legend" id="resid-legend"></div>
   </div>
 
   <div class="side-section">
@@ -1353,10 +1355,31 @@ function renderBar(barEl, legEl, segs) {
 }
 
 // Static runtime/hardware/tier rendering from a /stats snapshot.
+const gbB = (b) => (b / 1073741824).toFixed(1); // bytes → GiB, 1 decimal
 function applyStats(j) {
   const hw = j?.hardware || {};
-  $("hw-gpu").textContent = Number.isFinite(hw.gpu_count) ? hw.gpu_count + "× GPU" : "—";
   const gb = (kb) => (kb / 1048576).toFixed(0);
+  $("hw-cpu").textContent = hw.cpu_name || "—";
+  $("hw-cpu").title = hw.cpu_name || "";
+  // per-GPU name + total VRAM, one row per card
+  const gpus = Array.isArray(hw.gpus) ? hw.gpus : [];
+  const gEl = $("hw-gpus");
+  gEl.textContent = "";
+  gpus.forEach((g) => {
+    const nm = (g.name || "GPU").replace(/^NVIDIA\s+/, "").replace(/GeForce\s+/, "");
+    const row = document.createElement("div");
+    row.className = "kv";
+    const k = document.createElement("span");
+    k.className = "k";
+    k.textContent = "G" + g.dev;
+    const v = document.createElement("span");
+    v.className = "v v-name";
+    v.textContent = nm + " · " + gbB(g.vram_total) + " GB";
+    v.title = (g.name || "") + " — " + gbB(g.vram_total) + " GB VRAM";
+    row.appendChild(k);
+    row.appendChild(v);
+    gEl.appendChild(row);
+  });
   $("hw-ram").textContent = Number.isFinite(hw.ram_total_kb)
     ? gb(hw.ram_total_kb) + " GB (" + gb(hw.ram_available_kb || 0) + " free)"
     : "—";
@@ -1366,32 +1389,32 @@ function applyStats(j) {
     modelSideEl.textContent = j.model;
   }
   if (Number.isFinite(j?.ctx) && j.ctx > 0) maxCtx = j.ctx;
-  const tiers = Array.isArray(j?.tiers) ? j.tiers : [];
-  const totB = tiers.reduce((a, t) => a + (t.bytes || 0), 0);
-  renderBar($("tiers-bar"), $("tiers-legend"), tiers.map((t, i) => ({
-    cls: "seg-" + "abcd"[i % 4],
-    label: "gpu" + (t.dev ?? i),
-    pct: totB > 0 ? ((t.bytes || 0) / totB) * 100 : 0,
-    text: ((t.bytes || 0) / 1e9).toFixed(1) + " GB",
-  })));
-  renderGpuBars(tiers, totB);
+  // model residency: how much of the model sits in VRAM / RAM cache / on disk
+  const rz = j?.residency || {};
+  const rTot = (rz.vram || 0) + (rz.ram || 0) + (rz.disk || 0);
+  renderBar($("resid-bar"), $("resid-legend"), [
+    { cls: "seg-a", label: "VRAM", pct: rTot > 0 ? (rz.vram || 0) / rTot * 100 : 0, text: gbB(rz.vram || 0) + " GB" },
+    { cls: "seg-c", label: "RAM", pct: rTot > 0 ? (rz.ram || 0) / rTot * 100 : 0, text: gbB(rz.ram || 0) + " GB" },
+    { cls: "seg-d", label: "disk", pct: rTot > 0 ? (rz.disk || 0) / rTot * 100 : 0, text: gbB(rz.disk || 0) + " GB" },
+  ]);
+  renderGpuBars(gpus);
   setChips(controller ? "busy" : "idle");
 }
 
-// Per-GPU bars at bottom of sidebar: one row per tier with share of resident bytes.
-function renderGpuBars(tiers, totB) {
+// Per-GPU VRAM bars: one row per physical GPU, used / total.
+function renderGpuBars(gpus) {
   const section = $("gpu-bars-section");
   const el = $("gpu-bars");
   el.textContent = "";
-  if (!tiers.length) { section.hidden = true; return; }
+  if (!gpus.length) { section.hidden = true; return; }
   section.hidden = false;
-  tiers.forEach((t, i) => {
-    const pct = totB > 0 ? ((t.bytes || 0) / totB) * 100 : 0;
+  gpus.forEach((g) => {
+    const pct = g.vram_total > 0 ? (g.vram_used / g.vram_total) * 100 : 0;
     const row = document.createElement("div");
     row.className = "gpu-bar-row";
     const label = document.createElement("span");
     label.className = "gpu-label";
-    label.textContent = "G" + (t.dev ?? i);
+    label.textContent = "G" + g.dev;
     const track = document.createElement("span");
     track.className = "gpu-track";
     const fill = document.createElement("span");
@@ -1400,7 +1423,7 @@ function renderGpuBars(tiers, totB) {
     track.appendChild(fill);
     const val = document.createElement("span");
     val.className = "gpu-val";
-    val.textContent = ((t.bytes || 0) / 1e9).toFixed(1) + " GB";
+    val.textContent = gbB(g.vram_used) + "/" + (g.vram_total / 1073741824).toFixed(0) + " GB";
     row.appendChild(label);
     row.appendChild(track);
     row.appendChild(val);
