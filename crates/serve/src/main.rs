@@ -266,12 +266,13 @@ fn run() -> engine::Result {
                         .flatten()
                         .filter_map(|e| {
                             let name = e.file_name().to_string_lossy().into_owned();
-                            // skip non-servable: MTP draft sidecars, and F16/BF16
-                            // source checkpoints (too large to serve as a chat model)
+                            // skip non-servable: MTP draft sidecars, and full-
+                            // precision source checkpoints (the -F16/-BF16 quant
+                            // suffix, NOT "fromBF16" provenance on real quants)
                             if !name.ends_with(".gguf")
                                 || name.contains("draft")
-                                || name.contains("F16")
-                                || name.contains("BF16")
+                                || name.ends_with("-F16.gguf")
+                                || name.ends_with("-BF16.gguf")
                             {
                                 return None;
                             }
