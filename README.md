@@ -13,7 +13,7 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Nine model architectures running on consumer GPUs: **Hy3 295B**
+Ten model architectures running on consumer GPUs: **Hy3 295B**
 (hy-v3, GQA), **GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention),
 **Kimi K2.7 1T** (deepseek2, MLA + YaRN), **MiniMax M3** (partial
 rotary, swiglu_oai), **Gemma 4 26B-A4B** (interleaved sliding-window
@@ -31,7 +31,12 @@ attention on the rest - 262k context with KV on only 10 of 40 layers,
 needle recall verified at 45k tokens with 19.6 tok/s decode at that
 depth; prefer K-quants for it: the Q4_K_XL decodes at 51.8 tok/s where
 the smaller Q3_K_XL manages 36, because iq3's codebook lookups are
-decode compute the simple K-quant shifts don't pay). Reference
+decode compute the simple K-quant shifts don't pay), and
+**Laguna-S-2.1 118B** (laguna: hybrid attention with a full-window
+layer every fourth and sliding-window 512 elsewhere, a per-head output
+gate, and per-layer-type RoPE — YaRN on the full-window layers, plain
+on the sliding ones; the imatrix IQ2_XXS build decodes faster than the
+Q4_K_M because more experts stay resident at 36GB). Reference
 box: RTX 5060 Ti 16GB + RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one
 Gen5 NVMe.
 
@@ -40,6 +45,7 @@ Gen5 NVMe.
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
 | Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 22GB (Q4_K_XL) | **51.8 tok/s** | – |
 | ThinkingCap-Qwen3.6-27B (dense) | 27B | 27B | 16GB (Q4_K_M) | **18.7 tok/s** (27.8 w/ nextn MTP) | – |
+| Laguna-S-2.1 | 118B | 8B (top-10 of 256 + shared) | 36GB (IQ2_XXS, imatrix) | **17.3 tok/s** | – |
 | DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **8.2 tok/s** (11.3 w/ CPU lane) | – |
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **6.0 tok/s** (6.9 w/ CPU lane) | 0.64–0.70 |
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **5.3 tok/s** (6.4 w/ CPU lane) | – |
