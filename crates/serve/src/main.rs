@@ -78,6 +78,12 @@ fn run() -> engine::Result {
 
     let listener = std::net::TcpListener::bind((host.as_str(), port))?;
     eprintln!("pulsar-serve: listening on http://{host}:{port}  (web UI at /, API at /v1)");
+    // Record this ctx as last-known-good: KV allocated and we are serving. A
+    // resize that OOMs dies before reaching here, so PULSAR_CTX_STATE keeps the
+    // previous value and the supervisor restarts at it (see launch script).
+    if let Some(p) = std::env::var_os("PULSAR_CTX_STATE") {
+        let _ = std::fs::write(&p, ctx.to_string());
+    }
 
     let mut request_id = 0u64;
     // token ids fully forwarded into the engine (KV + recurrent state
