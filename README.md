@@ -45,7 +45,7 @@ Gen5 NVMe.
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
 | Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 22GB (Q4_K_XL) | **51.8 tok/s** | – |
 | ThinkingCap-Qwen3.6-27B (dense) | 27B | 27B | 16GB (Q4_K_M) | **18.7 tok/s** (27.8 w/ nextn MTP) | – |
-| Laguna-S-2.1 | 118B | 8B (top-10 of 256 + shared) | 36GB (IQ2_XXS, imatrix) | **17.3 tok/s** | – |
+| Laguna-S-2.1 | 118B | 8B (top-10 of 256 + shared) | 36GB (IQ2_XXS, imatrix) | **17.3 tok/s** (22.4 w/ CPU lane) | – |
 | DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **8.2 tok/s** (11.3 w/ CPU lane) | – |
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **6.0 tok/s** (6.9 w/ CPU lane) | 0.64–0.70 |
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **5.3 tok/s** (6.4 w/ CPU lane) | – |
