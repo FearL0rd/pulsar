@@ -98,6 +98,10 @@ enum ChatStyle {
     /// <|assistant|>\n ... (GLM 4/5 lineage; role tokens delimit turns,
     /// stops are the role tokens themselves + <|endoftext|>)
     Glm,
+    /// <system>text</system>\n <user>text</user> <assistant>text</assistant>
+    /// ... (poolside Laguna; paired open/close role tags, GLM-style thinking
+    /// off via an empty <think></think> block)
+    Laguna,
 }
 
 pub struct ChatMarkers {
@@ -224,6 +228,29 @@ impl ChatMarkers {
                 stops: t.stop_ids.clone(),
             });
         }
+        if t.find_token("<assistant>").is_some() && t.find_token("</assistant>").is_some() {
+            // poolside Laguna: <user>/<system> render as literal text; the
+            // <assistant> / <think> / </think> / </assistant> markers are real
+            // vocab tokens. bos==eos. Thinking off = a bare </think> opener.
+            let assistant = find("<assistant>")?;
+            let mut stops = t.stop_ids.clone();
+            if let Some(end) = t.find_token("</assistant>") {
+                if !stops.contains(&end) {
+                    stops.push(end);
+                }
+            }
+            return Ok(ChatMarkers {
+                style: ChatStyle::Laguna,
+                bos: t.bos_id,
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: t.find_token("</assistant>"),
+                user: assistant, // unused for Laguna (render_user emits text)
+                assistant,
+                aux0: find("<think>")?,
+                aux1: find("</think>")?,
+                stops,
+            });
+        }
         Ok(ChatMarkers {
             style: ChatStyle::Hy3,
             bos: Some(t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?),
@@ -294,6 +321,8 @@ impl ChatMarkers {
                 v.push(self.aux0);
                 v
             }
+            // <system>/<user> are plain text in Laguna, not vocab tokens
+            ChatStyle::Laguna => t.encode(&format!("<system>{text}</system>\n")),
         }
     }
 
@@ -338,6 +367,7 @@ impl ChatMarkers {
                 v.push(self.aux0);
                 v
             }
+            ChatStyle::Laguna => t.encode(&format!("<user>{text}</user>\n")),
         }
     }
 
@@ -397,6 +427,8 @@ impl ChatMarkers {
             // bare <|message_model|>: the model emits its own content-
             // kind marker (thinking or text)
             ChatStyle::Inkling => vec![self.assistant],
+            // <assistant> then a bare </think>: thinking off (Laguna's own form)
+            ChatStyle::Laguna => vec![self.assistant, self.aux1],
         }
     }
 
