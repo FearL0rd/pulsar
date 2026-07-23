@@ -1349,7 +1349,7 @@ function setChips(slot) {
   $("chip-ctx").textContent = curCtx ? fmtCtx(curCtx) + "/" + fmtCtx(maxCtx) : "—";
   $("chip-slot").textContent = slot;
   $("stat-tps").textContent = lastTps ? lastTps.toFixed(1) : "—";
-  $("stat-ctx").textContent = curCtx ? fmtCtx(curCtx) + "/" + fmtCtx(maxCtx) : "—";
+  $("stat-ctx").textContent = curCtx ? fmtCtx(curCtx) + "/" + fmtCtx(maxCtx) : fmtCtx(maxCtx);
   $("stat-turns").textContent = String(turns);
   $("stat-active").textContent = controller ? "1" : "0";
   $("stat-queued").textContent = "0";
@@ -1526,7 +1526,10 @@ function applyStats(j) {
     modelEl.textContent = j.model;
     modelSideEl.textContent = j.model;
   }
-  if (Number.isFinite(j?.ctx) && j.ctx > 0) maxCtx = j.ctx;
+  if (Number.isFinite(j?.ctx) && j.ctx > 0) {
+    maxCtx = j.ctx;
+    if (!curCtx) $("stat-ctx").textContent = fmtCtx(maxCtx);
+  }
   if (typeof j?.cpu_lane === "boolean") setCpuToggle(j.cpu_lane);
   // model residency: how much of the model sits in VRAM / RAM cache / on disk
   const rz = j?.residency || {};
