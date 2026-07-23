@@ -849,6 +849,11 @@
     scrollbar-color: var(--text-secondary) transparent;
   }
   .msg .content code { font-family: var(--mono); font-size: .86em; }
+  /* code syntax highlighting (code block is dark in both themes) */
+  .msg .content pre .hl-k { color: #c678dd; }
+  .msg .content pre .hl-s { color: #98c379; }
+  .msg .content pre .hl-c { color: #7f848e; font-style: italic; }
+  .msg .content pre .hl-n { color: #d19a66; }
   .msg .content :not(pre) > code {
     padding: 2px 5px;
     color: var(--text-warm);
@@ -1212,7 +1217,6 @@
   </div>
   <span class="spacer"></span>
   <div class="header-actions">
-    <span class="status" id="status" hidden>idle</span>
     <button id="theme-toggle" class="theme-toggle icon-only" type="button" aria-label="Switch to dark mode" aria-pressed="false" title="Switch to dark mode">
       <span class="theme-icon" aria-hidden="true">☾</span>
     </button>
@@ -1686,6 +1690,24 @@ function escapeHtml(s) {
 }
 
 // Minimal markdown: fenced code blocks, inline code, bold, links, paragraphs.
+// Lightweight, language-agnostic highlighter for fenced code. Input is
+// already HTML-escaped (quotes are &quot; / &#39;), so match those forms and
+// only keyword-tag the gaps between comments/strings/numbers.
+const HL_KW = /\b(fn|let|mut|const|static|struct|enum|trait|impl|pub|use|mod|match|if|else|for|while|loop|break|continue|return|self|Self|as|move|async|await|where|dyn|ref|def|class|lambda|import|from|with|yield|try|except|finally|raise|elif|pass|function|var|new|typeof|instanceof|public|private|protected|void|int|float|double|bool|char|string|true|false|null|None|True|False|nil|package|func|go|defer|chan|interface|type|namespace|template|typename|auto|include|extends|implements|throw|throws|catch|switch|case|default|do|then|end|echo|local|require)\b/g;
+const HL_TOK = /(\/\/[^\n]*|#[^\n]*|\/\*[\s\S]*?\*\/)|(&quot;[^\n]*?&quot;|&#39;[^\n]*?&#39;|`[^`\n]*`)|(\b\d[\w.]*\b)/g;
+function highlightCode(esc) {
+  let out = "", last = 0, m;
+  const kw = (s) => s.replace(HL_KW, '<span class="hl-k">$1</span>');
+  while ((m = HL_TOK.exec(esc)) !== null) {
+    out += kw(esc.slice(last, m.index));
+    if (m[1]) out += '<span class="hl-c">' + m[1] + "</span>";
+    else if (m[2]) out += '<span class="hl-s">' + m[2] + "</span>";
+    else out += '<span class="hl-n">' + m[3] + "</span>";
+    last = m.index + m[0].length;
+  }
+  return out + kw(esc.slice(last));
+}
+
 function renderMarkdown(text) {
   const parts = [];
   const fence = /```(\w*)\n([\s\S]*?)```/g;
@@ -1699,7 +1721,7 @@ function renderMarkdown(text) {
 
   return parts.map((p) => {
     if (p.kind === "code") {
-      return "<pre><code>" + escapeHtml(p.val) + "</code></pre>";
+      return "<pre><code>" + highlightCode(escapeHtml(p.val)) + "</code></pre>";
     }
     let h = escapeHtml(p.val);
     // inline code
@@ -1803,19 +1825,15 @@ async function streamAssistant() {
       if (gen !== rafGen) return; // superseded by a finalize / abort / error
       body.innerHTML = renderMarkdown(acc) + '<span class="cursor"></span>';
       scrollDown();
-      // live generation readout (throttled by the same rAF)
+      // live generation readout (throttled by the same rAF): keep every chip
+      // current WHILE generating, not just at the end
       if (t0) {
         const dt = (performance.now() - t0) / 1000;
-        const parts = [];
-        if (prefillTps) parts.push("prefill " + Math.round(prefillTps) + " tok/s");
-        if (dt > 0) parts.push((ntok / dt).toFixed(1) + " tok/s");
-        parts.push(fmtCtx(promptToks + ntok) + "/" + fmtCtx(maxCtx));
-        setStatus(parts.join(" · "), "busy");
-        if (dt > 0) {
-          lastTps = ntok / dt;
-          curCtx = promptToks + ntok;
-          setChips("busy");
-        }
+        lastTtft = (t0 - tSend) / 1000; // prefill wall time, known at first token
+        lastPrefillTps = prefillTps;
+        curCtx = promptToks + ntok;
+        if (dt > 0) lastTps = ntok / dt;
+        setChips("busy");
       }
     });
   };
