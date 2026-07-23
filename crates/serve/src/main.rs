@@ -192,6 +192,32 @@ fn run() -> engine::Result {
                     });
                     respond_json(&mut stream, 200, &json)
                 }
+                // Per-expert residency + routing heat for the Brain cortex.
+                // Grouped by MoE layer into compact parallel arrays.
+                ("GET", "/experts") => {
+                    let n_expert = model
+                        .gguf
+                        .metadata
+                        .iter()
+                        .find(|(k, _)| k.ends_with(".expert_count"))
+                        .and_then(|(_, v)| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let cells = st.expert_map(&model);
+                    let layers: Vec<_> = if n_expert > 0 {
+                        cells
+                            .chunks(n_expert)
+                            .map(|ch| {
+                                let tier: Vec<u8> = ch.iter().map(|c| c.tier).collect();
+                                let heat: Vec<u64> = ch.iter().map(|c| c.heat).collect();
+                                serde_json::json!({"layer": ch[0].layer, "tier": tier, "heat": heat})
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let json = serde_json::json!({"n_expert": n_expert, "layers": layers});
+                    respond_json(&mut stream, 200, &json)
+                }
                 ("POST", "/v1/chat/completions") => handle_chat(
                     &mut stream,
                     &body,

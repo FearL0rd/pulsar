@@ -922,6 +922,15 @@ mod real {
         pub prof_calls: u64,
     }
 
+    /// One expert's residency + routing heat, for the Brain cortex viz.
+    /// tier: 0 = disk-only, 2 = host RAM cache, 3 = VRAM-resident tier.
+    pub struct ExpertCell {
+        pub layer: u32,
+        pub expert: u32,
+        pub tier: u8,
+        pub heat: u64,
+    }
+
     /// Ping-pong staging arena for one parity of MLA layers: layer N+1's
     /// PINNED attn tensors are cudaMemcpyAsync'd here (2x the bandwidth of
     /// zero-copy kernel reads, and overlapped under layer N's compute).
@@ -3829,6 +3838,30 @@ mod real {
                 prof_tail: s(self.prof.tail),
                 prof_calls: self.prof.calls,
             }
+        }
+
+        /// Per-expert residency + routing heat for the Brain cortex viz. One
+        /// cell per (layer, expert) over MoE layers; heat is the live host-cache
+        /// touch frequency, tier is where the expert's gate slab currently lives.
+        pub fn expert_map(&self, m: &Model) -> Vec<ExpertCell> {
+            let n_expert = m.shape.n_expert as usize;
+            let mut cells = Vec::new();
+            for (l, lw) in m.layers.iter().enumerate() {
+                let Ffn::Moe { gate_exps, .. } = &lw.ffn else { continue };
+                for e in 0..n_expert {
+                    let off = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
+                    let tier = if self.tiers.iter().any(|t| t.map.contains_key(&off)) {
+                        3u8 // VRAM-resident tier
+                    } else if self.dev_cache.map.contains_key(&off) {
+                        2 // host RAM cache
+                    } else {
+                        0 // disk-only
+                    };
+                    let heat = self.dev_cache.touch.get(&off).map(|t| t.0).unwrap_or(0);
+                    cells.push(ExpertCell { layer: l as u32, expert: e as u32, tier, heat });
+                }
+            }
+            cells
         }
 
         /// Persist the slab popularity census so the next run starts warm.
