@@ -187,6 +187,7 @@ fn run() -> engine::Result {
                     let json = serde_json::json!({
                         "model": model_name,
                         "ctx": s.ctx,
+                        "cpu_lane": cpu_lane_on(),
                         "n_layer": find_u(".block_count").unwrap_or(0),
                         "n_expert": find_u(".expert_count").unwrap_or(0),
                         "n_expert_used": find_u(".expert_used_count").unwrap_or(0),
@@ -302,10 +303,22 @@ fn run() -> engine::Result {
                         respond_json(&mut stream, 200, &serde_json::json!({"reloading": name}))?;
                         let _ = std::io::Write::flush(&mut stream);
                         eprintln!("pulsar-serve: switching model -> {name}, re-exec");
-                        let err = reexec_with_model(&target);
+                        let err = reexec(&target, cpu_lane_on());
                         eprintln!("pulsar-serve: re-exec failed: {err}");
                         std::process::exit(1);
                     }
+                }
+                // Toggle the AVX2 CPU expert lane: re-exec the current model
+                // with PULSAR_CPU set/unset (reload, same as a model switch).
+                ("POST", "/cpu_lane") => {
+                    let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let enabled = req["enabled"].as_bool().unwrap_or(false);
+                    respond_json(&mut stream, 200, &serde_json::json!({"reloading": true, "cpu_lane": enabled}))?;
+                    let _ = std::io::Write::flush(&mut stream);
+                    eprintln!("pulsar-serve: CPU lane -> {enabled}, re-exec");
+                    let err = reexec(std::path::Path::new(&model_path), enabled);
+                    eprintln!("pulsar-serve: re-exec failed: {err}");
+                    std::process::exit(1);
                 }
                 ("POST", "/v1/chat/completions") => handle_chat(
                     &mut stream,
@@ -402,7 +415,7 @@ fn cpu_name() -> String {
 /// Only returns (with an error) if exec fails. The model path is validated by
 /// the caller to be a .gguf inside the current model's directory.
 #[cfg(target_os = "linux")]
-fn reexec_with_model(newmodel: &std::path::Path) -> std::io::Error {
+fn reexec(newmodel: &std::path::Path, cpu_lane: bool) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let args: Vec<String> = std::env::args().collect();
     let mut cmd = std::process::Command::new(&args[0]);
@@ -416,7 +429,17 @@ fn reexec_with_model(newmodel: &std::path::Path) -> std::io::Error {
             i += 1;
         }
     }
+    if cpu_lane {
+        cmd.env("PULSAR_CPU", "1");
+    } else {
+        cmd.env_remove("PULSAR_CPU");
+    }
     cmd.exec()
+}
+
+/// Whether the AVX2 CPU expert lane is enabled in this process.
+fn cpu_lane_on() -> bool {
+    std::env::var_os("PULSAR_CPU").is_some_and(|v| v != "0" && !v.is_empty())
 }
 
 /// GPU names by device index, from nvidia-smi (empty if unavailable). VRAM
