@@ -3557,6 +3557,10 @@ mod real {
         pub cpu_pool: Option<cpu_tier::Pool>,
         cpu_ret: DeviceBuf,
         pub cpu_hits: u64,
+        /// true per-(layer,expert) routing selections, tier-independent: counts
+        /// every router pick, resident or streamed. Feeds /experts heat and the
+        /// topic atlas without the host-cache blind spot. Index l*n_expert + e.
+        route_counts: Vec<u64>,
         // grouped batch-MoE scratch (grow-only; prefill chunks only)
         grp_ptrs: DeviceBuf,
         grp_starts: DeviceBuf,
@@ -3886,7 +3890,7 @@ mod real {
                     } else {
                         0 // disk-only
                     };
-                    let heat = self.dev_cache.touch.get(&off).map(|t| t.0).unwrap_or(0);
+                    let heat = self.route_counts.get(l * n_expert + e).copied().unwrap_or(0);
                     cells.push(ExpertCell { layer: l as u32, expert: e as u32, tier, heat });
                 }
             }
@@ -4390,6 +4394,7 @@ mod real {
                 cpu_pool: cpu_tier::Pool::from_env(),
                 cpu_ret: f32s(1)?, // grows on first CPU-lane hit
                 cpu_hits: 0,
+                route_counts: vec![0u64; (m.shape.n_layer * m.shape.n_expert.max(1)) as usize],
                 tiers,
                 grp_ptrs: DeviceBuf::alloc(s.n_expert.max(1) as usize * std::mem::size_of::<ExpertPtrs>())?,
                 grp_starts: DeviceBuf::alloc((s.n_expert as usize + 1) * 4)?,
@@ -5176,6 +5181,16 @@ mod real {
                             None
                         };
                         st.prof.resolve_d2h += t_d2h.elapsed();
+                        // true routing count: every selection this layer, resident
+                        // or streamed (topic atlas / Brain heat, no tier blind spot)
+                        {
+                            let base = il * s.n_expert as usize;
+                            for &e in &selected {
+                                if e >= 0 && (e as u32) < s.n_expert {
+                                    st.route_counts[base + e as usize] += 1;
+                                }
+                            }
+                        }
                         if let (Some((_, _, next_exps)), Some(pred)) = (&next_moe, &pred_ids) {
                             let mut reads = Vec::with_capacity(3 * pred.len());
                             for &e in pred {

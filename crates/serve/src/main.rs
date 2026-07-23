@@ -166,16 +166,11 @@ fn run() -> engine::Result {
                         .iter()
                         .map(|t| serde_json::json!({"dev": t.dev, "bytes": t.bytes, "hits": t.hits}))
                         .collect();
-                    let gpu_names = gpu_names();
-                    let gpus: Vec<_> = s
-                        .gpus
-                        .iter()
+                    let gpus: Vec<_> = gpu_info()
+                        .into_iter()
                         .enumerate()
-                        .map(|(i, g)| serde_json::json!({
-                            "dev": i,
-                            "name": gpu_names.get(i).cloned().unwrap_or_default(),
-                            "vram_used": g.vram_total.saturating_sub(g.vram_free),
-                            "vram_total": g.vram_total,
+                        .map(|(i, (name, total, used))| serde_json::json!({
+                            "dev": i, "name": name, "vram_used": used, "vram_total": total,
                         }))
                         .collect();
                     // model residency: VRAM (resident tiers + slab cache), RAM (host
@@ -442,18 +437,29 @@ fn cpu_lane_on() -> bool {
     std::env::var_os("PULSAR_CPU").is_some_and(|v| v != "0" && !v.is_empty())
 }
 
-/// GPU names by device index, from nvidia-smi (empty if unavailable). VRAM
-/// used/total come from the engine's cudaMemGetInfo; nvidia-smi supplies names.
-fn gpu_names() -> Vec<String> {
+/// Per-GPU (name, vram_total_bytes, vram_used_bytes) for EVERY card, from one
+/// nvidia-smi query so name/total/used stay consistent for the same device
+/// (the engine's cudaMemGetInfo order can differ from nvidia-smi's, which
+/// mismatched names against VRAM on multi-GPU boxes).
+fn gpu_info() -> Vec<(String, u64, u64)> {
     std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .args([
+            "--query-gpu=name,memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
-                .map(|l| l.trim().to_string())
+                .filter_map(|l| {
+                    let mut p = l.split(',');
+                    let name = p.next()?.trim().to_string();
+                    let total: u64 = p.next()?.trim().parse().ok()?;
+                    let used: u64 = p.next()?.trim().parse().ok()?;
+                    Some((name, total * 1024 * 1024, used * 1024 * 1024)) // MiB -> bytes
+                })
                 .collect()
         })
         .unwrap_or_default()
