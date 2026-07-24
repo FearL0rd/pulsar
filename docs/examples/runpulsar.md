@@ -156,7 +156,7 @@ from the engine's own defaults.
 
 | var | default | what |
 |---|---|---|
-| `PULSAR_KV` | `f32` | GQA K/V format: `fp8` (e4m3+scale, ~3.9×), `fp16` (~2.0×), `int8` (~4.0×), `q8_0` (~3.8×), `q4_0` (~7.6×). Lossy, opt-in |
+| `PULSAR_KV` | `f32` | GQA K/V format: `fp8` (e4m3+scale, ~3.9×), `fp16` (~2.0×), `int8` (~4.0×), `q8_0` (~3.8×), `q4_0` (~7.6×), `turbo8`/`turbo4` (q8_0/q4_0 + orthogonal rotation; outlier-proof on Hy3/Qwen3-MoE, ~3.8×/~7.6×). Lossy, opt-in |
 | `PULSAR_TIERS` | `on` | resident expert tiers on spare GPUs. `off` = bit-exact single-device path |
 | `PULSAR_NO_PREFETCH` | unset | set any value to disable the cross-layer prefetcher |
 | `PULSAR_PROFILE` | unset | per-stage wall-time profile. **Forced to `1` in generate/chat by the script** |
@@ -225,6 +225,10 @@ PULSAR_CACHE_GB=48 ./docs/examples/runpulsar.sh
 
 # long-context KV squeeze (lossy)
 PULSAR_KV=fp8 MODE=chat ./docs/examples/runpulsar.sh
+
+# rotated block-KV — q8_0/q4_0 quality without the outlier tax
+PULSAR_KV=turbo8 MODE=chat ./docs/examples/runpulsar.sh   # ~3.8×, near-fp8 quality
+PULSAR_KV=turbo4 MODE=chat ./docs/examples/runpulsar.sh   # ~7.6×, 4-bit viable
 ```
 
 ## Troubleshooting

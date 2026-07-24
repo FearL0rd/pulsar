@@ -51,7 +51,7 @@ If the floor is not clean, the run is unstable — re-run.
 | `MODEL` | _(required)_ | path to a GQA/Qwen35 family gguf (NOT glm-dsa / GLM-5.2) |
 | `PROMPT` | _(~120-token Fibonacci paragraph)_ | forced token sequence; longer = more positions |
 | `PROMPT_FILE` | unset | read the prompt from this file (overrides `PROMPT`) |
-| `FMTS` | `f32 fp8 fp16 int8 q8_0 q4_0` | formats to sweep |
+| `FMTS` | `f32 fp8 fp16 int8 q8_0 q4_0` | formats to sweep (add `turbo4`/`turbo8` for rotated block-KV) |
 | `PULSAR_CLI` | `target/release/pulsar-cli` | override CLI binary path |
 
 For serious validation, point `PROMPT_FILE` at a real corpus paragraph —
@@ -117,6 +117,29 @@ all Jac ~0.9, all top-1 ~95%. A block format (q8_0 / q4_0) sitting far
 below that — or 4-bit tied with 8-bit — signals a kernel defect, not
 precision loss; investigate the dequant path.
 
+### Rotated block-KV (`turbo4` / `turbo8`)
+
+Plain `q4_0`/`q8_0` scale per 32-element block: one outlier in the block
+inflates `d`, and the other ~31 lanes quantize to 0 (`round(small/d)=0`).
+On outlier-heavy K (Hy3, Qwen3-MoE) this collapses top-1 to ~62%. `turbo4`
+and `turbo8` fold a fixed orthogonal rotation Π into K (pre-append) and Q
+(pre-attention) so each block holds a mix of magnitudes — no single lane
+dominates `d`. Decode-invariant: `(Q@Πᵀ)·(K@Πᵀ)ᵀ = Q@Kᵀ` since ΠᵀΠ=I. V is
+untouched. Same storage size as the plain block format; the rotation is
+math-only. Measured on Hy3 (IQ2XXS-AttnQ8) over 113 teacher-forced
+positions:
+
+| fmt | top-1 agree | mean \|Δlogit\| | top-5 Jac |
+|---|---|---|---|
+| q8_0 | 61.9% | 0.437 | 0.48 |
+| `turbo8` | **92.0%** | **0.095** | **0.82** |
+| q4_0 | 62.8% | 0.471 | 0.46 |
+| `turbo4` | **85.8%** | **0.127** | **0.73** |
+
+turbo8 nearly recovers fp8-class quality at q8_0's 3.8× squeeze; turbo4
+lifts 4-bit from unusable to viable. Aliases: `turbo8`=`rotq8`=`turboq8`,
+`turbo4`=`rotq4`=`turboq4`. Excluded on qwen35-dense (`n_expert==1`).
+
 ## Cookbook
 
 ```sh
@@ -125,6 +148,9 @@ MODEL=/data/qwen3moe.gguf ./docs/examples/bench_kv_tf.sh
 
 # block formats only (the ones under investigation)
 MODEL=/data/qwen3moe.gguf FMTS="f32 q4_0 q8_0" ./docs/examples/bench_kv_tf.sh
+
+# rotated block-KV vs plain — outlier-heavy K (Hy3, Qwen3-MoE)
+MODEL=/data/qwen3moe.gguf FMTS="f32 q4_0 turbo4 q8_0 turbo8" ./docs/examples/bench_kv_tf.sh
 
 # more positions = tighter stats — point at a real corpus
 PROMPT_FILE=/data/wiki.txt MODEL=/data/qwen3moe.gguf ./docs/examples/bench_kv_tf.sh
