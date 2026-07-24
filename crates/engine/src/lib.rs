@@ -3536,6 +3536,21 @@ mod real {
         /// default f32 path keeps bit-exact guarantees. MLA/Dsv4 keep
         /// their own caches as-is.
         kvq: u32,
+        /// Whether K/Q are rotated by `pi` (orthogonal Π) before block-quant.
+        /// turbo4/turbo8 set this true. Split-rope heads skip it (stays
+        /// false with a warning) since qk_dim != head_dim.
+        kvq_rot: bool,
+        /// Orthogonal rotation Π (head_dim×head_dim row-major, f32). Identity-
+        /// sized (4 B) placeholder when kvq_rot is false. Applied as
+        /// K_rot = K @ Πᵀ via matmul_f32 before KV append, and Q_rot = Q @ Πᵀ
+        /// before attention. Decode-invariant: (QΠᵀ)·(KΠᵀ)ᵀ = QKᵀ.
+        pi: DeviceBuf,
+        /// Rotated-K scratch (n_tok * n_head_kv * head_dim, f32). Consumed
+        /// once per layer; sized as a placeholder when rotation disabled.
+        krot: DeviceBuf,
+        /// Rotated-Q scratch (n_tok * n_head * head_dim, f32). Mirror of
+        /// `q`'s attention-head layout, not the rope/`qk_dim`-padded layout.
+        qrot: DeviceBuf,
         logits: DeviceBuf,
         pub store: StreamingStore,
         prefetcher: Prefetcher,
@@ -4156,6 +4171,12 @@ mod real {
             //   q8_0 -> 32-wide blocks f16 d + 32 i8 (stride head_dim/32*34)
             //   q4_0 -> 32-wide blocks f16 d + 16 nibbles (stride head_dim/32*18)
             // MLA keeps its compact latent cache as-is.
+            // turbo<4|8> / rotq<4|8> = q4_0/q8_0 with a fixed orthogonal
+            // rotation folded into K (pre-append) and Q (pre-attention).
+            // Rotation spreads per-32-block outliers across the block so no
+            // single lane dominates blockmax `d` — see TurboQuant. Decode-
+            // invariant: (Q@Πᵀ)·(K@Πᵀ)ᵀ = Q@Kᵀ since ΠᵀΠ=I. V is untouched.
+            //
             // qwen35-dense (n_expert==1) runs the dense-split path, which does
             // not support the quantized KV layout - applying it deadlocked the
             // forward (GPUs idle, no output). Keep dense on f32, and warn loudly
@@ -4164,14 +4185,16 @@ mod real {
             let kv_req = std::env::var("PULSAR_KV").ok();
             let kv_dense = s.family == Family::Qwen35 && s.n_expert == 1;
             let kv_ok = matches!(s.family, Family::Gqa | Family::Qwen35) && !kv_dense;
-            let kvq = if kv_ok {
+            let (kvq, kvq_rot) = if kv_ok {
                 match kv_req.as_deref() {
-                    Some("fp8") => 1,
-                    Some("fp16") | Some("f16") => 2,
-                    Some("int8") | Some("i8") => 3,
-                    Some("q8_0") | Some("q8") => 4,
-                    Some("q4_0") | Some("q4") => 5,
-                    _ => 0,
+                    Some("fp8") => (1, false),
+                    Some("fp16") | Some("f16") => (2, false),
+                    Some("int8") | Some("i8") => (3, false),
+                    Some("q8_0") | Some("q8") => (4, false),
+                    Some("q4_0") | Some("q4") => (5, false),
+                    Some("turbo8") | Some("rotq8") | Some("turboq8") => (4, true),
+                    Some("turbo4") | Some("rotq4") | Some("turboq4") => (5, true),
+                    _ => (0, false),
                 }
             } else {
                 if kv_req.as_deref().is_some_and(|v| !v.is_empty() && v != "f32") {
@@ -4180,7 +4203,7 @@ mod real {
                         kv_req.as_deref().unwrap_or("")
                     );
                 }
-                0
+                (0, false)
             };
             let kv_row = |hd: usize| match kvq {
                 0 => hd * 4,
@@ -4210,7 +4233,11 @@ mod real {
             if kvq != 0 {
                 let full = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
                 let name = match kvq {
-                    1 => "fp8", 2 => "fp16", 3 => "int8", 4 => "q8_0", _ => "q4_0",
+                    1 => "fp8",
+                    2 => "fp16",
+                    3 => "int8",
+                    4 => if kvq_rot { "turbo8" } else { "q8_0" },
+                    _ => if kvq_rot { "turbo4" } else { "q4_0" },
                 };
                 eprintln!(
                     "pulsar: {name} KV cache on ({:.2} GB -> {:.2} GB over {} layers)",
@@ -4225,6 +4252,12 @@ mod real {
                         "pulsar: block-KV head_dim={} ({}divisible by 32)",
                         s.head_dim,
                         if s.head_dim % 32 == 0 { "" } else { "NOT " }
+                    );
+                }
+                if kvq_rot {
+                    eprintln!(
+                        "pulsar: turbo rotation ON — K/Q rotated by orthogonal Π (head_dim={}) before block-quant",
+                        s.head_dim,
                     );
                 }
             }
@@ -4347,6 +4380,79 @@ mod real {
             // rel-bias buffers and the k/v-stream shortconv state+tmp
             let kbuf = f32s(mb * s.n_head_kv * s.head_dim)?;
             let vbuf = f32s(mb * s.n_head_kv * s.head_dim)?;
+            // turbo rotation: orthogonal Π (head_dim×head_dim) built host-side
+            // via modified Gram-Schmidt on a fixed xorshift seed — deterministic,
+            // zero deps. Valid for any uniform-head_dim GQA layout: qk_nope/
+            // qk_rope are MLA-only fields (0 for Gqa/Qwen35), so qk_dim() is not
+            // a split indicator here. Rope (rot_w lanes) is baked into head_dim;
+            // rotating the full head preserves Q·Kᵀ regardless of the internal
+            // nope/rope subdivision. Family is already gated by the PULSAR_KV
+            // parse (Gqa|Qwen35), so kvq_rot flows through unchecked.
+            let pi = if kvq_rot {
+                let hd = s.head_dim as usize;
+                let n = hd * hd;
+                let mut g = 0x9E3779B97F4A7C15u64;
+                let mut rng = || {
+                    // xorshift64* on the fixed seed — only need a spread of
+                    // directions; orthogonality comes from MGS, not the RNG.
+                    g ^= g << 13;
+                    g ^= g >> 7;
+                    g ^= g << 17;
+                    ((g % 1_000_000) as f64 / 1_000_000.0 - 0.5) * 2.0
+                };
+                let mut m = vec![0.0f32; n];
+                for i in 0..hd {
+                    for j in 0..hd {
+                        m[i * hd + j] = rng() as f32;
+                    }
+                }
+                // Modified Gram-Schmidt: orthonormalize rows in place.
+                for i in 0..hd {
+                    let (si, ei) = (i * hd, (i + 1) * hd);
+                    for k in 0..i {
+                        let (sk, ek) = (k * hd, (k + 1) * hd);
+                        let dot = m[si..ei]
+                            .iter()
+                            .zip(&m[sk..ek])
+                            .map(|(a, b)| a * b)
+                            .sum::<f32>();
+                        for j in 0..hd {
+                            m[si + j] -= dot * m[sk + j];
+                        }
+                    }
+                    let norm = m[si..ei].iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm < 1e-6 {
+                        // Degenerate (vanishingly unlikely at f32 from a fixed
+                        // seed); nudge row i to e_i to keep Π invertible.
+                        for j in 0..hd {
+                            m[si + j] = if j == i { 1.0 } else { 0.0 };
+                        }
+                    } else {
+                        for j in 0..hd {
+                            m[si + j] /= norm;
+                        }
+                    }
+                }
+                let mut pi = f32s(n as u32)?;
+                pi.write(0, kernels::as_bytes(&m))?;
+                pi
+            } else {
+                f32s(1)?
+            };
+            // Rotated-K/Q scratch — sized only when rotation engages so the
+            // q4_0/q8_0 kernels receive the rotated source buffer. Mirror
+            // the layout the call sites expect: K is n_head_kv*head_dim per
+            // token, Q is n_head*head_dim per token (attention head stride).
+            let krot = if kvq_rot {
+                f32s(mb * s.n_head_kv * s.head_dim)?
+            } else {
+                f32s(1)?
+            };
+            let qrot = if kvq_rot {
+                f32s(mb * s.n_head * s.head_dim)?
+            } else {
+                f32s(1)?
+            };
             let r_buf = f32s(if s.d_rel > 0 { mb * s.n_head * s.d_rel } else { 1 })?;
             let rel_buf = f32s(if s.d_rel > 0 {
                 mb * s.n_head * s.rel_ext.max(s.rel_ext_swa)
@@ -4426,6 +4532,10 @@ mod real {
                 kcache,
                 vcache,
                 kvq,
+                kvq_rot,
+                pi,
+                krot,
+                qrot,
                 logits: f32s(spec_rows * s.n_vocab)?,
                 store: StreamingStore::open(&m.shards, cache_bytes)?,
                 prefetcher: Prefetcher::spawn(&m.shards)?,
@@ -4916,7 +5026,23 @@ mod real {
                             kernels::gqa_rope(&mut st.k, n_tok, hkv, hd, rot, pos0, theta, factors)?;
                         }
                         let kvq = st.kvq;
-                        kernels::gqa_kv_append(&mut st.kcache[il], &st.k, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
+                        // turbo: rotate K by Πᵀ before block-quant append so
+                        // outliers spread across the 32-wide block. V is NOT
+                        // rotated — only K and Q preserve the dot-product.
+                        let ksrc: &DeviceBuf = if st.kvq_rot {
+                            kernels::matmul_f32(
+                                &mut st.krot,
+                                &st.pi,
+                                &st.k,
+                                hd,
+                                hd,
+                                n_tok * hkv,
+                            )?;
+                            &st.krot
+                        } else {
+                            &st.k
+                        };
+                        kernels::gqa_kv_append(&mut st.kcache[il], ksrc, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
                         kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
                         // gemma scores at scale 1.0 (q is per-head normed);
                         // inkling at muP 1/head_dim
@@ -4938,7 +5064,25 @@ mod real {
                             0
                         };
                         let rel = l.ink.as_ref().map(|_| &st.rel_buf);
-                        kernels::gqa_attention_rel(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, nh_q, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq)?;
+                        // turbo: rotate Q by the SAME Πᵀ so Q·Kᵀ is preserved
+                        // ((QΠᵀ)·(KΠᵀ)ᵀ = QKᵀ) while the rotated K already sits
+                        // in the cache. qrot mirrors q's attention-head layout
+                        // (n_head*head_dim per token), which equals q's stride
+                        // here since rotation is gated on qk_dim==head_dim.
+                        let qsrc: &DeviceBuf = if st.kvq_rot {
+                            kernels::matmul_f32(
+                                &mut st.qrot,
+                                &st.pi,
+                                &st.q,
+                                hd,
+                                hd,
+                                n_tok * nh_q,
+                            )?;
+                            &st.qrot
+                        } else {
+                            &st.q
+                        };
+                        kernels::gqa_attention_rel(&mut st.heads, qsrc, &st.kcache[il], &st.vcache[il], n_tok, nh_q, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq)?;
 
                         // laguna: per-head output gate. g_proj gives one
                         // logit per (token, head); softplus of it scales

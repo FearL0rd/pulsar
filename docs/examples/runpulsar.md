@@ -156,10 +156,13 @@ from the engine's own defaults.
 
 | var | default | what |
 |---|---|---|
-| `PULSAR_KV` | `f32` | GQA K/V format: `fp8` (e4m3+scale, ~3.9×), `fp16` (~2.0×), `int8` (~4.0×), `q8_0` (~3.8×), `q4_0` (~7.6×). Lossy, opt-in |
+| `PULSAR_KV` | `f32` | GQA K/V format: `fp8` (e4m3+scale, ~3.9×), `fp16` (~2.0×), `int8` (~4.0×), `q8_0` (~3.8×), `q4_0` (~7.6×), `turbo8`/`turbo4` (q8_0/q4_0 + orthogonal rotation; outlier-proof on Hy3/Qwen3-MoE, ~3.8×/~7.6×). Lossy, opt-in |
 | `PULSAR_TIERS` | `on` | resident expert tiers on spare GPUs. `off` = bit-exact single-device path |
 | `PULSAR_NO_PREFETCH` | unset | set any value to disable the cross-layer prefetcher |
 | `PULSAR_PROFILE` | unset | per-stage wall-time profile. **Forced to `1` in generate/chat by the script** |
+| `PULSAR_NGRAM` | unset | draft-free n-gram speculation depth (greedy only). `PULSAR_NGRAM=N` proposes up to N tokens from the longest recent-suffix match, verified in one forward. `N` clamped to [1,15]. Net-slower until the host cache outruns disk; net faster at warm cache. `PULSAR_MTP_DEBUG=1` shows per-step accept counts |
+| `PULSAR_MTP` | unset | `1` enables nextn speculative decode (one extra transformer block fed the last hidden state). Requires a gguf with a `nextn` block, else ignored with a warning |
+| `PULSAR_MTP_DEPTH` | `3` | tokens speculated per MTP round, verified together in one forward |
 
 > **Gotcha — `PULSAR_TIERS`:** the script runs `unset PULSAR_TIERS` before
 > launch, so exporting `PULSAR_TIERS=off` from your shell has **no effect**
@@ -225,6 +228,19 @@ PULSAR_CACHE_GB=48 ./docs/examples/runpulsar.sh
 
 # long-context KV squeeze (lossy)
 PULSAR_KV=fp8 MODE=chat ./docs/examples/runpulsar.sh
+
+# rotated block-KV — q8_0/q4_0 quality without the outlier tax
+PULSAR_KV=turbo8 MODE=chat ./docs/examples/runpulsar.sh   # ~3.8×, near-fp8 quality
+PULSAR_KV=turbo4 MODE=chat ./docs/examples/runpulsar.sh   # ~7.6×, 4-bit viable
+
+# draft-free n-gram speculation (greedy; net faster once the host cache is warm)
+PULSAR_NGRAM=4 MODE=generate ./docs/examples/runpulsar.sh
+
+# nextn speculative decode (needs a MTP/nextn-capable gguf)
+PULSAR_MTP=1 PULSAR_MTP_DEPTH=3 MODE=generate ./docs/examples/runpulsar.sh
+
+# stack: rotated block-KV + n-gram speculation — small KV × fewer forwards
+PULSAR_KV=turbo4 PULSAR_NGRAM=4 MODE=generate ./docs/examples/runpulsar.sh
 ```
 
 ## Troubleshooting

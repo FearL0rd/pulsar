@@ -300,7 +300,7 @@ Everything auto-configures; these override.
 |---|---|---|
 | `PULSAR_GPU` | measured | CUDA index of the expert-streaming (primary) GPU |
 | `PULSAR_ATTN_GPU` | auto (MLA) | attention GPU by CUDA index. MLA models auto-offload (`off` disables); GQA models are opt-in by index: a capacity shuffle that loses on 2 GPUs at short context, pays on 3+ GPUs or long context |
-| `PULSAR_KV` | f32 | GQA K/V storage format. One of `fp8` (e4m3 + per-row scale, ~3.9× smaller KV), `fp16` (IEEE half, ~2.0×), `int8` (int8 + per-row scale, ~4.0×), `q8_0` (32-wide blocks, ~3.8×), `q4_0` (32-wide blocks, ~7.6×). Lossy, hence opt-in: the default f32 keeps decode bit-exact. Runs on any GPU (storage format, no special hardware needed). MLA/Dsv4 keep their own caches |
+| `PULSAR_KV` | f32 | GQA K/V storage format. One of `fp8` (e4m3 + per-row scale, ~3.9× smaller KV), `fp16` (IEEE half, ~2.0×), `int8` (int8 + per-row scale, ~4.0×), `q8_0` (32-wide blocks, ~3.8×), `q4_0` (32-wide blocks, ~7.6×), `turbo8` (q8_0 + rotation, ~3.8×), `turbo4` (q4_0 + rotation, ~7.6×). Lossy, hence opt-in: the default f32 keeps decode bit-exact. Runs on any GPU (storage format, no special hardware needed). MLA/Dsv4 keep their own caches. `turbo<4\|8>` (aliases `rotq<4\|8>`, `turboq<4\|8>`) fold a fixed orthogonal rotation into K (pre-append) and Q (pre-attention) so per-32-block outliers spread across the block instead of dominating blockmax `d` — decode-invariant: `(Q@Πᵀ)·(K@Πᵀ)ᵀ = Q@Kᵀ` since ΠᵀΠ=I; V is untouched. Measured on Hy3: turbo8 92% / turbo4 86% top-1 vs q8_0 62% / q4_0 63% |
 | `PULSAR_TIERS` | on | `off` disables resident expert tiers (also the bit-exact single-device path) |
 | `PULSAR_CACHE_GB` | measured | host RAM budget for the expert LFU cache (solved from MemAvailable) |
 | `PULSAR_DEV_CACHE_GB` | solved | VRAM hot-expert pool: measured free VRAM minus staging + reserve |
@@ -383,7 +383,9 @@ measured honestly: net-slower until the host cache outruns the disk;
 templates (Hy3/Kimi/ChatML/Gemma/MiniMax/Inkling/DeepSeek) · int8
 tensor-core prefill (dense GEMM + grouped MoE) · MiniMax M3, Qwen3,
 Gemma 4, TML Inkling forward graphs · opt-in fp8 e4m3 KV cache
-(`PULSAR_KV=fp8`) · `pulsar-quant` recipe quantizer (BF16 gguf →
+(`PULSAR_KV=fp8`) · TurboQuant rotated block-KV (`PULSAR_KV=turbo4|turbo8`,
+orthogonal Π on K/Q spreads outliers so block-quant stops zeroing the
+other 31 lanes; decode-invariant, V untouched) · `pulsar-quant` recipe quantizer (BF16 gguf →
 ds4-style expert mixes, iq2_xxs with imatrix, per-tensor `--map`
 rules; removes llama.cpp from the model-prep pipeline; shard
 streaming: `--fetch-cmd`/`--delete-shards` quantize sources bigger
