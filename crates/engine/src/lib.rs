@@ -3537,8 +3537,9 @@ mod real {
         /// their own caches as-is.
         kvq: u32,
         /// Whether K/Q are rotated by `pi` (orthogonal Π) before block-quant.
-        /// turbo4/turbo8 set this true. Split-rope heads skip it (stays
-        /// false with a warning) since qk_dim != head_dim.
+        /// turbo4/turbo8 set this true. Drops back to false with a warning if
+        /// qk_dim exceeds head_dim (q and qrot strides would disagree) or if Π
+        /// fails its orthogonality check.
         kvq_rot: bool,
         /// Orthogonal rotation Π (head_dim×head_dim row-major, f32). Identity-
         /// sized (4 B) placeholder when kvq_rot is false. Applied as
@@ -4186,7 +4187,7 @@ mod real {
             let kv_dense = s.family == Family::Qwen35 && s.n_expert == 1;
             let kv_ok = matches!(s.family, Family::Gqa | Family::Qwen35) && !kv_dense;
             let (kvq, kvq_rot) = if kv_ok {
-                match kv_req.as_deref() {
+                let (q, rot) = match kv_req.as_deref() {
                     Some("fp8") => (1, false),
                     Some("fp16") | Some("f16") => (2, false),
                     Some("int8") | Some("i8") => (3, false),
@@ -4195,6 +4196,24 @@ mod real {
                     Some("turbo8") | Some("rotq8") | Some("turboq8") => (4, true),
                     Some("turbo4") | Some("rotq4") | Some("turboq4") => (5, true),
                     _ => (0, false),
+                };
+                // Rotation writes head_dim-strided vectors into qrot, which is
+                // sized n_head*head_dim per token. `q` itself is allocated at
+                // head_dim.max(qk_dim()), so a head whose qk_dim exceeds
+                // head_dim would leave the two strides disagreeing and the
+                // rotation would read across head boundaries. qk_nope/qk_rope
+                // are MLA-only and stay 0 for Gqa/Qwen35, so this holds today;
+                // the guard keeps it from breaking silently if that changes.
+                if rot && s.qk_dim() > s.head_dim {
+                    eprintln!(
+                        "pulsar: PULSAR_KV={} rotation disabled - qk_dim {} exceeds head_dim {} (split-rope q stride); falling back to plain block-KV",
+                        kv_req.as_deref().unwrap_or(""),
+                        s.qk_dim(),
+                        s.head_dim,
+                    );
+                    (q, false)
+                } else {
+                    (q, rot)
                 }
             } else {
                 if kv_req.as_deref().is_some_and(|v| !v.is_empty() && v != "f32") {
@@ -4383,17 +4402,25 @@ mod real {
             // turbo rotation: orthogonal Π (head_dim×head_dim) built host-side
             // via modified Gram-Schmidt on a fixed xorshift seed — deterministic,
             // zero deps. Valid for any uniform-head_dim GQA layout: qk_nope/
-            // qk_rope are MLA-only fields (0 for Gqa/Qwen35), so qk_dim() is not
-            // a split indicator here. Rope (rot_w lanes) is baked into head_dim;
-            // rotating the full head preserves Q·Kᵀ regardless of the internal
-            // nope/rope subdivision. Family is already gated by the PULSAR_KV
+            // qk_rope are MLA-only fields (0 for Gqa/Qwen35), so q's stride is
+            // head_dim, which is what qrot mirrors (the PULSAR_KV parse guards
+            // the qk_dim > head_dim case). Rope (rot_w lanes) is baked into
+            // head_dim; rotating the full head preserves Q·Kᵀ regardless of the
+            // internal nope/rope subdivision. Family is already gated by the
             // parse (Gqa|Qwen35), so kvq_rot flows through unchecked.
+            //
+            // The whole scheme rests on ΠᵀΠ = I, so Π is verified before use
+            // rather than assumed: MGS loses orthogonality with the condition
+            // number, and the degenerate-row fallback below patches a row
+            // without re-orthogonalizing it. Either would silently break
+            // decode-invariance, so a failed check disables rotation loudly.
+            let mut kvq_rot = kvq_rot;
             let pi = if kvq_rot {
                 let hd = s.head_dim as usize;
                 let n = hd * hd;
                 let mut g = 0x9E3779B97F4A7C15u64;
                 let mut rng = || {
-                    // xorshift64* on the fixed seed — only need a spread of
+                    // xorshift64 on the fixed seed — only need a spread of
                     // directions; orthogonality comes from MGS, not the RNG.
                     g ^= g << 13;
                     g ^= g >> 7;
@@ -4433,9 +4460,30 @@ mod real {
                         }
                     }
                 }
-                let mut pi = f32s(n as u32)?;
-                pi.write(0, kernels::as_bytes(&m))?;
-                pi
+                // Verify ΠΠᵀ = I. Square + orthonormal rows gives ΠᵀΠ = I
+                // too, which is the identity (QΠᵀ)·(KΠᵀ)ᵀ = QKᵀ relies on.
+                let mut worst = 0.0f32;
+                for i in 0..hd {
+                    for j in 0..hd {
+                        let dot: f32 = (0..hd).map(|k| m[i * hd + k] * m[j * hd + k]).sum();
+                        let want = if i == j { 1.0 } else { 0.0 };
+                        worst = worst.max((dot - want).abs());
+                    }
+                }
+                // MGS at f32 lands near 1e-5 for head_dim 128. 1e-3 sits well
+                // above that drift floor and well below a deviation that would
+                // move attention, so it separates "normal" from "broken".
+                if worst > 1e-3 {
+                    eprintln!(
+                        "pulsar: turbo rotation disabled - Π failed orthogonality check (max |ΠΠᵀ-I| = {worst:.2e}, head_dim {hd}); falling back to plain block-KV",
+                    );
+                    kvq_rot = false;
+                    f32s(1)?
+                } else {
+                    let mut pi = f32s(n as u32)?;
+                    pi.write(0, kernels::as_bytes(&m))?;
+                    pi
+                }
             } else {
                 f32s(1)?
             };
@@ -5067,8 +5115,10 @@ mod real {
                         // turbo: rotate Q by the SAME Πᵀ so Q·Kᵀ is preserved
                         // ((QΠᵀ)·(KΠᵀ)ᵀ = QKᵀ) while the rotated K already sits
                         // in the cache. qrot mirrors q's attention-head layout
-                        // (n_head*head_dim per token), which equals q's stride
-                        // here since rotation is gated on qk_dim==head_dim.
+                        // (n_head*head_dim per token); q is allocated at
+                        // head_dim.max(qk_dim()), and the PULSAR_KV parse
+                        // disables rotation when qk_dim exceeds head_dim, so
+                        // the two strides agree wherever this runs.
                         let qsrc: &DeviceBuf = if st.kvq_rot {
                             kernels::matmul_f32(
                                 &mut st.qrot,
