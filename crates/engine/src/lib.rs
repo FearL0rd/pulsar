@@ -560,6 +560,13 @@ mod real {
             /// here, so the offset-keyed cache/census/tier machinery
             /// serves shared experts like any other slab
             sink: Option<[ExpertTensor; 3]>,
+            /// per-expert f32 bias vectors, [n_expert][mid_dim] for gate/up
+            /// and [n_expert][out_dim] for down. gpt-oss is the only arch
+            /// here that ships them; everything else leaves this None and
+            /// the kernels skip the add. Resident, never streamed: the
+            /// whole set is n_expert * (2*mid + out) floats, a rounding
+            /// error next to one expert's quantized weights.
+            exp_bias: Option<[DeviceBuf; 3]>,
         },
     }
 
@@ -2897,6 +2904,18 @@ mod real {
                         } else {
                             None
                         },
+                        // f32 and small enough to stay resident; presence is
+                        // decided by the file, so an arch that grows biases
+                        // later needs no code here
+                        exp_bias: if gguf.tensor(&t("ffn_gate_exps.bias")).is_some() {
+                            Some([
+                                upload(&file, &gguf, &t("ffn_gate_exps.bias"))?,
+                                upload(&file, &gguf, &t("ffn_up_exps.bias"))?,
+                                upload(&file, &gguf, &t("ffn_down_exps.bias"))?,
+                            ])
+                        } else {
+                            None
+                        },
                     }
                 };
                 if let Some(d) = attn_dev {
@@ -4670,7 +4689,25 @@ mod real {
                 attn_out_a,
                 attn_gate_buf,
                 tier_ret: if tiers.is_empty() { f32s(1)? } else { f32s(mb * s.n_embd)? },
-                cpu_pool: cpu_tier::Pool::from_env(),
+                // The CPU lane dots quantized weights directly and has no
+                // bias term, so on an arch that carries expert biases it
+                // would silently drop them for whatever it steals. Refuse
+                // the lane rather than be quietly wrong.
+                cpu_pool: {
+                    let has_bias = m.layers.iter().any(|l| {
+                        matches!(&l.ffn, Ffn::Moe { exp_bias: Some(_), .. })
+                    });
+                    match (cpu_tier::Pool::from_env(), has_bias) {
+                        (Some(_), true) => {
+                            eprintln!(
+                                "pulsar: CPU expert lane disabled - this model carries per-expert \
+                                 biases and the lane has no bias path"
+                            );
+                            None
+                        }
+                        (p, _) => p,
+                    }
+                },
                 cpu_ret: f32s(1)?, // grows on first CPU-lane hit
                 cpu_hits: 0,
                 route_counts: vec![0u64; (m.shape.n_layer * m.shape.n_expert.max(1)) as usize],
@@ -5390,7 +5427,7 @@ mod real {
                         }
                         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                     }
-                    Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, fused_up_off, down_scale, sink } => {
+                    Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, fused_up_off, down_scale, sink, exp_bias } => {
                         let gw = l.gemma.as_ref();
                         // inkling: shared experts ride the router as
                         // always-on slots; per-layer gscale folds into the
@@ -5625,6 +5662,28 @@ mod real {
                             }
                         };
                         let off_of = |t: &ExpertTensor, le: u64| t.abs_offset + le * t.expert_bytes;
+                        // Per-expert bias pointers. Biases are resident f32
+                        // and indexed by expert id, so unlike the weight
+                        // slabs they need no cache/tier resolve; sink slots
+                        // (id >= n_expert) have no bias tensor and stay null.
+                        let bias_of = |e: i32| -> (
+                            *const std::ffi::c_void,
+                            *const std::ffi::c_void,
+                            *const std::ffi::c_void,
+                        ) {
+                            match exp_bias {
+                                Some([gb, ub, db]) if e >= 0 && (e as u32) < s.n_expert => {
+                                    let mid = (e as u64) * s.n_ff_exp as u64 * 4;
+                                    let out = (e as u64) * s.n_embd as u64 * 4;
+                                    (
+                                        byte_off(gb.ptr(), mid),
+                                        byte_off(ub.ptr(), mid),
+                                        byte_off(db.ptr(), out),
+                                    )
+                                }
+                                _ => (std::ptr::null(), std::ptr::null(), std::ptr::null()),
+                            }
+                        };
                         // resolve tier placement once per distinct expert
                         // (was recomputed in cpu/offsets/ptrs loops)
                         let mut tier_place: std::collections::HashMap<
@@ -5651,6 +5710,9 @@ mod real {
                                             if is_sink { 0 } else { *fused_up_off },
                                         ),
                                         down: *t.map.get(&off_of(d3.0, d3.1))?,
+                                        gate_b: bias_of(e).0,
+                                        up_b: bias_of(e).1,
+                                        down_b: bias_of(e).2,
                                     },
                                     is_sink,
                                 ))
@@ -5916,6 +5978,9 @@ mod real {
                                         gate: resolved[&off_of(g3.0, g3.1)],
                                         up: byte_off(resolved[&off_of(u3.0, u3.1)], *fused_up_off),
                                         down: resolved[&off_of(d3.0, d3.1)],
+                                        gate_b: bias_of(e).0,
+                                        up_b: bias_of(e).1,
+                                        down_b: bias_of(e).2,
                                     }
                                 } else {
                                     ExpertPtrs::NULL
@@ -5950,6 +6015,9 @@ mod real {
                                     if e as u32 >= s.n_expert { 0 } else { *fused_up_off },
                                 ),
                                 down: resolved[&off_of(d3.0, d3.1)],
+                                gate_b: bias_of(e).0,
+                                up_b: bias_of(e).1,
+                                down_b: bias_of(e).2,
                             };
                             if !sink_same && e as u32 >= s.n_expert {
                                 sink_ptrs[si] = ep;
@@ -6040,6 +6108,12 @@ mod real {
                                     &mut tier.out, &tier.ptrs, &tier.midq,
                                     s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
                                 )?;
+                                if exp_bias.is_some() {
+                                    kernels::moe_down_bias(
+                                        &mut tier.out, &tier.ptrs, &tier.weights,
+                                        s.n_embd, s.n_expert_used, n_tok,
+                                    )?;
+                                }
                             }
                             if sink_hits > 0 {
                                 // sink pass: same mid/midq scratch, stream-
@@ -6104,6 +6178,18 @@ mod real {
                             kernels::moe_down(
                                 &mut st.moe_out, &st.expert_ptrs, &st.midq,
                                 s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+                            )?;
+                        }
+                        // The down bias is sum_s w_s * b_down_s, and the pair
+                        // stage already folded w_s into mid, so it needs the
+                        // weights again and cannot ride the down matmul. Both
+                        // branches above land in moe_out through expert_ptrs,
+                        // whose tier/lane/sink slots are NULL - those paths
+                        // add their own bias against their own ptrs.
+                        if exp_bias.is_some() {
+                            kernels::moe_down_bias(
+                                &mut st.moe_out, &st.expert_ptrs, &st.router_weights,
+                                s.n_embd, s.n_expert_used, n_tok,
                             )?;
                         }
 

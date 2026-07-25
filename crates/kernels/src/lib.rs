@@ -26,6 +26,13 @@ mod real {
         pub gate: *const c_void,
         pub up: *const c_void,
         pub down: *const c_void,
+        /// Per-expert f32 bias vectors, null when the architecture has
+        /// none. gpt-oss is the only shipped model that carries them; every
+        /// other MoE here leaves these null and the kernels skip the add.
+        /// gate/up are mid_dim long, down is out_dim long.
+        pub gate_b: *const c_void,
+        pub up_b: *const c_void,
+        pub down_b: *const c_void,
     }
 
     unsafe impl Send for ExpertPtrs {}
@@ -35,6 +42,9 @@ mod real {
             gate: std::ptr::null(),
             up: std::ptr::null(),
             down: std::ptr::null(),
+            gate_b: std::ptr::null(),
+            up_b: std::ptr::null(),
+            down_b: std::ptr::null(),
         };
     }
 
@@ -96,6 +106,7 @@ mod real {
         fn pulsar_moe_pair_swiglu_grouped(mid: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, weights: *const c_void, xq: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32, act_op: u32) -> i32;
         fn pulsar_moe_down_grouped(partial: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, midq: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32) -> i32;
         fn pulsar_moe_slot_sum(out: *mut c_void, partial: *const c_void, out_dim: u32, n_used: u32, n_tok: u32) -> i32;
+        fn pulsar_moe_down_bias(out: *mut c_void, ptrs: *const c_void, weights: *const c_void, out_dim: u32, n_used: u32, n_tok: u32) -> i32;
         fn pulsar_gqa_head_rms_norm(x: *mut c_void, w: *const c_void, rows: u32, head_dim: u32, eps: f32) -> i32;
         fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
         fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, kvq: u32) -> i32;
@@ -939,6 +950,12 @@ mod real {
 
     pub fn moe_slot_sum(out: &mut DeviceBuf, partial: &DeviceBuf, out_dim: u32, n_used: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_moe_slot_sum(out.ptr_mut(), partial.ptr(), out_dim, n_used, n_tok) }, "moe_slot_sum")
+    }
+
+    /// Adds sum_s w_s * b_down_s to a finished down-projection output.
+    /// No-op unless some expert carries a down bias; only gpt-oss does.
+    pub fn moe_down_bias(out: &mut DeviceBuf, ptrs: &DeviceBuf, weights: &DeviceBuf, out_dim: u32, n_used: u32, n_tok: u32) -> Result {
+        check(unsafe { pulsar_moe_down_bias(out.ptr_mut(), ptrs.ptr(), weights.ptr(), out_dim, n_used, n_tok) }, "moe_down_bias")
     }
 
     pub fn add(out: &mut DeviceBuf, a: &DeviceBuf, b: &DeviceBuf, n: u32) -> Result {
