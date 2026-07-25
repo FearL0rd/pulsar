@@ -4876,13 +4876,28 @@ static void mla_fill_q8(uint8_t *w, uint64_t rows, uint32_t cols) {
     }
 }
 
+/* Shapes are parameters, not constants, because the attention kernel's
+ * scoring loop is warp-cooperative: lanes stride kv_lora_dim by 32 and the
+ * rope pairs by 32, so how many times each loop iterates depends entirely
+ * on the dims. A 64/8 toy exercises the single-iteration case only - GLM
+ * runs 512/64 with thousands of selected rows and takes different paths
+ * through the same code. Both are covered below. */
 static int mla_selftest_one(float freq_scale, float ext_factor,
                             float beta_fast, float beta_slow,
+                            uint32_t kv_lora, uint32_t qk_rope,
+                            uint32_t cache_cap, uint32_t n_prefill,
                             const char *name) {
-    const uint32_t n_head = 4, kv_lora = 64, qk_nope = 32, qk_rope = 8;
+    /* the host reference below keeps its per-head scratch on the stack;
+     * these bound it. Exceeding them silently smashed the stack when the
+     * dims first became parameters, so fail loudly instead. */
+    const uint32_t MAX_LORA = 1024u, MAX_SEL = 256u;
+    if (kv_lora > MAX_LORA || cache_cap > MAX_SEL) {
+        printf("mla-selftest %s: SKIP (dims exceed host scratch)\n", name);
+        return 0;
+    }
+    const uint32_t n_head = 4, qk_nope = 32;
     const uint32_t qk_dim = qk_nope + qk_rope, value_dim = 16;
     const uint32_t kv_raw_dim = kv_lora + qk_rope;
-    const uint32_t cache_cap = 16, n_prefill = 3;
     const uint32_t n_ctx_orig = 64;
     const float freq_base = 10000.0f, attn_factor = 1.0f, eps = 1e-5f;
     const float scale = 1.0f / sqrtf((float)qk_dim);
@@ -4940,11 +4955,11 @@ static int mla_selftest_one(float freq_scale, float ext_factor,
         }
         for (uint32_t h = 0; h < n_head; h++) {
             const float *qh = h_q_roped + ((uint64_t)t * n_head + h) * qk_dim;
-            float low[64];
+            float low[MAX_LORA];
             for (uint32_t j = 0; j < kv_lora; j++)
                 low[j] = mla_host_q8_dot(
                         k_b + ((uint64_t)h * kv_lora + j) * kb_row, qh, qk_nope);
-            float sc[16];
+            float sc[MAX_SEL];
             float maxs = -INFINITY;
             for (uint32_t r = 0; r <= t; r++) {
                 float dotv = 0.0f;
@@ -4970,7 +4985,7 @@ static int mla_selftest_one(float freq_scale, float ext_factor,
                 denom += sc[r];
             }
             denom = fmaxf(denom, 1.0e-20f);
-            float lora_sum[64];
+            float lora_sum[MAX_LORA];
             for (uint32_t j = 0; j < kv_lora; j++) {
                 float acc = 0.0f;
                 for (uint32_t r = 0; r <= t; r++)
@@ -5070,9 +5085,13 @@ static int mla_selftest_one(float freq_scale, float ext_factor,
 
 extern "C" int pulsar_mla_selftest(void) {
     /* plain rope (GLM-5.2's live config) and a yarn config to exercise
-     * the correction path */
-    return mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, "plain") &&
-           mla_selftest_one(0.5f, 1.0f, 32.0f, 1.0f, "yarn");
+     * the correction path, both at toy dims; then GLM's real geometry
+     * (kv_lora 512, qk_rope 64) with enough cached rows that the
+     * warp-per-score loop iterates many times - the shape the toy cases
+     * cannot reach and the one the engine actually runs. */
+    return mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, 64, 8, 16, 3, "plain") &&
+           mla_selftest_one(0.5f, 1.0f, 32.0f, 1.0f, 64, 8, 16, 3, "yarn") &&
+           mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, 512, 64, 96, 24, "glm-shape");
 }
 #include "dsa_indexer.inc"
 #include "dsv4_kernels.inc"
