@@ -306,9 +306,12 @@ mod real {
                 n_vocab,
                 // absent on qwen3moe (no scaling) - default 1.0
                 expert_weight_scale: f("expert_weights_scale").unwrap_or(1.0),
+                // softmax over the SELECTED top-k, not sigmoid per expert
+                // and not softmax over all of them: llama.cpp calls this
+                // SOFTMAX_WEIGHT, and gpt-oss uses it with no renorm after
                 router_softmax: matches!(
                     g.architecture(),
-                    Some("qwen3moe") | Some("gemma4") | Some("qwen35moe")
+                    Some("qwen3moe") | Some("gemma4") | Some("qwen35moe") | Some("gpt-oss")
                 ),
                 // gated-FFN op: 1 = gelu (gemma4), 2 = swiglu_oai (MiniMax
                 // M3: clamp 7, alpha 1.702, up+1 - llama.cpp PR 24523),
@@ -2771,7 +2774,7 @@ mod real {
                         theta: shape.rope_freq_base,
                         window: if il % 2 == 0 { window } else { 0 },
                         factors: false,
-                        rot: shape.head_dim,
+                        rot: 0, // EXPERIMENT: take the plain gqa_rope path
                     })
                     .collect()
             } else {
