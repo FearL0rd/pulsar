@@ -2845,6 +2845,25 @@ __global__ static void moe_down_bias_kernel(
     if (b != 0.0f) out[gid] += b;
 }
 
+/* Adds a [dim] bias to each of `rows` contiguous rows. gpt-oss carries
+ * q/k/v/output biases on its attention projections; every other arch here
+ * has none and never calls this. */
+__global__ static void add_bias_rows_kernel(
+        float *x, const float *bias, uint32_t dim, uint32_t rows) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (uint64_t)rows * dim) return;
+    x[gid] += bias[gid % dim];
+}
+
+extern "C" int pulsar_add_bias_rows(
+        void *x_dev, const void *bias_dev, uint32_t dim, uint32_t rows) {
+    if (dim == 0 || rows == 0) return 0;
+    const uint64_t total = (uint64_t)rows * dim;
+    add_bias_rows_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)x_dev, (const float *)bias_dev, dim, rows);
+    return cuda_ok(cudaGetLastError(), "add bias rows launch");
+}
+
 extern "C" int pulsar_moe_down_bias(
         void *out_dev, const void *ptrs_dev, const void *weights_dev,
         uint32_t out_dim, uint32_t n_used, uint32_t n_tok) {

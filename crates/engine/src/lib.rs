@@ -626,8 +626,11 @@ mod real {
             /// None = k reused as v (gemma E-series attention_k_eq_v)
             attn_v: Option<DeviceBuf>,
             attn_k: DeviceBuf,
-            q_norm: DeviceBuf,
-            k_norm: DeviceBuf,
+            /// None = the arch has no qk-norm at all (gpt-oss uses q/k
+            /// biases instead). Distinct from passing a null weight to the
+            /// norm kernel, which still normalizes, just without a scale.
+            q_norm: Option<DeviceBuf>,
+            k_norm: Option<DeviceBuf>,
         },
         Mla {
             q_a: DeviceBuf,
@@ -741,10 +744,20 @@ mod real {
         il < n_leading_dense as usize || (il >= 6 && (il - 6) % 4 == 0)
     }
 
+    /// gpt-oss attention biases, all f32. Every other arch here projects
+    /// without them and leaves this None.
+    struct AttnBias {
+        q: DeviceBuf,
+        k: DeviceBuf,
+        v: DeviceBuf,
+        out: DeviceBuf,
+    }
+
     struct LayerW {
         attn_norm: DeviceBuf,
         attn: Attn,
         attn_output: DeviceBuf,
+        attn_bias: Option<AttnBias>,
         ffn_norm: DeviceBuf,
         ffn: Ffn,
         gemma: Option<GemmaW>,
@@ -2930,8 +2943,16 @@ mod real {
                         } else {
                             None // gemma attention_k_eq_v: k doubles as v
                         },
-                        q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
-                        k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
+                        q_norm: if gguf.tensor(&t("attn_q_norm.weight")).is_some() {
+                            Some(upload(&file, &gguf, &t("attn_q_norm.weight"))?)
+                        } else {
+                            None
+                        },
+                        k_norm: if gguf.tensor(&t("attn_k_norm.weight")).is_some() {
+                            Some(upload(&file, &gguf, &t("attn_k_norm.weight"))?)
+                        } else {
+                            None
+                        },
                     },
                     Family::Mla => Attn::Mla {
                         q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"), &mut *no_budget)?,
@@ -3174,6 +3195,18 @@ mod real {
                     attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
                     attn,
                     attn_output,
+                    // presence decided by the file, so an arch that grows
+                    // attention biases later needs no code here
+                    attn_bias: if gguf.tensor(&t("attn_q.bias")).is_some() {
+                        Some(AttnBias {
+                            q: upload(&file, &gguf, &t("attn_q.bias"))?,
+                            k: upload(&file, &gguf, &t("attn_k.bias"))?,
+                            v: upload(&file, &gguf, &t("attn_v.bias"))?,
+                            out: upload(&file, &gguf, &t("attn_output.bias"))?,
+                        })
+                    } else {
+                        None
+                    },
                     // qwen35 calls the pre-FFN norm post_attention_norm
                     ffn_norm: if gguf.tensor(&t("ffn_norm.weight")).is_some() {
                         upload(&file, &gguf, &t("ffn_norm.weight"))?
@@ -5123,8 +5156,17 @@ mod real {
                         let xin = if self.attn_dev.is_some() { &st.normed_a } else { &st.normed };
                         kernels::matmul_q8_0(&mut st.q, attn_q, xin, s.n_embd, nh_q * hd, n_tok)?;
                         kernels::matmul_q8_0(&mut st.k, attn_k, xin, s.n_embd, hkv * hd, n_tok)?;
+                        if let Some(ab) = &l.attn_bias {
+                            kernels::add_bias_rows(&mut st.q, &ab.q, nh_q * hd, n_tok)?;
+                            kernels::add_bias_rows(&mut st.k, &ab.k, hkv * hd, n_tok)?;
+                        }
                         match attn_v {
-                            Some(v_w) => kernels::matmul_q8_0(&mut st.v, v_w, xin, s.n_embd, hkv * hd, n_tok)?,
+                            Some(v_w) => {
+                                kernels::matmul_q8_0(&mut st.v, v_w, xin, s.n_embd, hkv * hd, n_tok)?;
+                                if let Some(ab) = &l.attn_bias {
+                                    kernels::add_bias_rows(&mut st.v, &ab.v, hkv * hd, n_tok)?;
+                                }
+                            }
                             // attention_k_eq_v: v = the raw k projection
                             None => kernels::copy_across(&mut st.v, &st.k, (n_tok * hkv * hd) as usize * 4)?,
                         }
@@ -5138,8 +5180,14 @@ mod real {
                             kernels::sconv(&mut st.sconv_tmp_kv, &st.v, &ink.sconv_v, &mut st.sconv_state[il][1], n_tok, hkv * hd, s.sconv_k)?;
                             kernels::copy_across(&mut st.v, &st.sconv_tmp_kv, kvb)?;
                         }
-                        kernels::gqa_head_rms_norm(&mut st.q, Some(q_norm), n_tok * nh_q, hd, eps)?;
-                        kernels::gqa_head_rms_norm(&mut st.k, Some(k_norm), n_tok * hkv, hd, eps)?;
+                        // absent qk-norm means no normalization at all, not
+                        // a weightless one - skip rather than pass None
+                        if let Some(qn) = q_norm {
+                            kernels::gqa_head_rms_norm(&mut st.q, Some(qn), n_tok * nh_q, hd, eps)?;
+                        }
+                        if let Some(kn) = k_norm {
+                            kernels::gqa_head_rms_norm(&mut st.k, Some(kn), n_tok * hkv, hd, eps)?;
+                        }
                         if gm.is_some() && l.ink.is_none() && l.attn_gate.is_none() {
                             // gemma: v gets a weightless per-head rms norm.
                             // laguna also has per-layer geom but does NOT
@@ -5376,6 +5424,9 @@ mod real {
                 }
                 if self.attn_dev.is_none() {
                     kernels::matmul_q8_0(&mut st.attn_out, attn_output_w, &st.heads, heads_dim, s.n_embd, n_tok)?;
+                    if let Some(ab) = &l.attn_bias {
+                        kernels::add_bias_rows(&mut st.attn_out, &ab.out, s.n_embd, n_tok)?;
+                    }
                 }
                 if let Some(gw) = &l.gemma {
                     // gemma post-attention norm sits INSIDE the residual

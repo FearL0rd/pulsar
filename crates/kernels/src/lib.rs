@@ -107,6 +107,7 @@ mod real {
         fn pulsar_moe_down_grouped(partial: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, midq: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32) -> i32;
         fn pulsar_moe_slot_sum(out: *mut c_void, partial: *const c_void, out_dim: u32, n_used: u32, n_tok: u32) -> i32;
         fn pulsar_moe_down_bias(out: *mut c_void, ptrs: *const c_void, weights: *const c_void, out_dim: u32, n_used: u32, n_tok: u32) -> i32;
+        fn pulsar_add_bias_rows(x: *mut c_void, bias: *const c_void, dim: u32, rows: u32) -> i32;
         fn pulsar_gqa_head_rms_norm(x: *mut c_void, w: *const c_void, rows: u32, head_dim: u32, eps: f32) -> i32;
         fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
         fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, kvq: u32) -> i32;
@@ -956,6 +957,11 @@ mod real {
     /// No-op unless some expert carries a down bias; only gpt-oss does.
     pub fn moe_down_bias(out: &mut DeviceBuf, ptrs: &DeviceBuf, weights: &DeviceBuf, out_dim: u32, n_used: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_moe_down_bias(out.ptr_mut(), ptrs.ptr(), weights.ptr(), out_dim, n_used, n_tok) }, "moe_down_bias")
+    }
+
+    /// Adds a [dim] bias vector to each of `rows` rows, in place.
+    pub fn add_bias_rows(x: &mut DeviceBuf, bias: &DeviceBuf, dim: u32, rows: u32) -> Result {
+        check(unsafe { pulsar_add_bias_rows(x.ptr_mut(), bias.ptr(), dim, rows) }, "add_bias_rows")
     }
 
     pub fn add(out: &mut DeviceBuf, a: &DeviceBuf, b: &DeviceBuf, n: u32) -> Result {
