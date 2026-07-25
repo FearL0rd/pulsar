@@ -299,6 +299,28 @@ impl ChatMarkers {
         })
     }
 
+    /// Preamble a style needs even when the caller supplies no system
+    /// prompt. Harmony is the only one so far, and it is not optional
+    /// there: gpt-oss routes output over named channels, and the shape of
+    /// this block decides whether it does so correctly. Without the channel
+    /// list it never closes `analysis`; without the date line it stops
+    /// emitting <|message|> after the channel name. Both were measured, and
+    /// the text mirrors the model's own template for that reason.
+    pub fn default_system(&self) -> Option<String> {
+        match self.style {
+            ChatStyle::Harmony => Some(format!(
+                "You are ChatGPT, a large language model trained by OpenAI.\n\
+                 Knowledge cutoff: 2024-06\n\
+                 Current date: {}\n\n\
+                 Reasoning: medium\n\n\
+                 # Valid channels: analysis, commentary, final. Channel must \
+                 be included for every message.",
+                today_ymd()
+            )),
+            _ => None,
+        }
+    }
+
     /// Conversation prologue: bos for most styles, [gMASK]<sop> for GLM.
     pub fn prologue(&self) -> Vec<u32> {
         let mut v: Vec<u32> = self.bos.into_iter().collect();
@@ -534,6 +556,25 @@ impl ChatMarkers {
     pub fn is_stop(&self, id: u32) -> bool {
         id == self.eos || Some(id) == self.eot || self.stops.binary_search(&id).is_ok()
     }
+}
+
+/// Today as YYYY-MM-DD, UTC. Hinnant's civil-from-days so the harmony
+/// preamble carries a real date without pulling in a date crate.
+fn today_ymd() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// GPT-2's byte<->unicode bijection: printable bytes map to themselves,
