@@ -4185,7 +4185,19 @@ mod real {
             // silently apply-and-hang; a stale env carries over on model switch).
             let kv_req = std::env::var("PULSAR_KV").ok();
             let kv_dense = s.family == Family::Qwen35 && s.n_expert == 1;
-            let kv_ok = matches!(s.family, Family::Gqa | Family::Qwen35) && !kv_dense;
+            // Exhaustive: whether a family can honor PULSAR_KV is a property
+            // of its cache layout, and the wrong answer here is not a slow
+            // path but a hang (see the qwen35-dense note above). A new family
+            // must say so rather than inherit whatever this line happened to
+            // mean when it was written.
+            let kv_ok = match s.family {
+                // GQA keeps a plain [layer][kv_head][pos] cache the quant
+                // kernels understand; qwen35's full-attention layers use the
+                // same one, minus the dense split path
+                Family::Gqa | Family::Qwen35 => !kv_dense,
+                // MLA/Dsv4 carry their own compact latent caches
+                Family::Mla | Family::Dsv4 => false,
+            };
             let (kvq, kvq_rot) = if kv_ok {
                 let (q, rot) = match kv_req.as_deref() {
                     Some("fp8") => (1, false),
@@ -4828,14 +4840,21 @@ mod real {
             rows: u32,
         ) -> Result<Option<Vec<f32>>> {
             let s = self.shape;
-            if s.family == Family::Dsv4 {
+            // Exhaustive on purpose. A family whose state advances token by
+            // token cannot take the batched path below: the batch would be
+            // computed against the wrong history and the logits would be
+            // silently wrong, not obviously broken. Written as two `if`s a
+            // new family inherits the batched arm for free, so keep this a
+            // match and make the compiler ask.
+            match s.family {
                 // V4 is a sequential state machine (SWA ring, streaming
                 // compressor): prefill loops single-token forwards
-                return self.forward_dsv4(st, tokens, pos0, rows);
-            }
-            if s.family == Family::Qwen35 {
+                Family::Dsv4 => return self.forward_dsv4(st, tokens, pos0, rows),
                 // GDN conv window + delta state are sequential too
-                return self.forward_qwen35(st, tokens, pos0, rows);
+                Family::Qwen35 => return self.forward_qwen35(st, tokens, pos0, rows),
+                // pure-KV attention: a row's whole history is the cache, so
+                // batching rows is safe
+                Family::Gqa | Family::Mla => {}
             }
             // a batch must not straddle the indexer top_k boundary: rows
             // before it use causal range selection, rows after it need
@@ -4945,8 +4964,15 @@ mod real {
         /// shortconv). A prefix-cache may only APPEND to the forwarded
         /// stream for these; pure-KV families can rewind and overwrite.
         pub fn recurrent_state(&self) -> bool {
-            matches!(self.shape.family, Family::Dsv4 | Family::Qwen35)
-                || self.shape.sconv_k > 1
+            // Exhaustive: answering `false` for a family that does carry
+            // recurrent state lets the prefix cache rewind something that
+            // cannot be rewound, which corrupts the stream rather than
+            // failing. sconv_k > 1 catches inkling's shortconv on top.
+            let by_family = match self.shape.family {
+                Family::Dsv4 | Family::Qwen35 => true,
+                Family::Gqa | Family::Mla => false,
+            };
+            by_family || self.shape.sconv_k > 1
         }
 
         /// lm-head over the first `k` rows of st.normed into st.logits.
