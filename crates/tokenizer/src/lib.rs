@@ -273,6 +273,12 @@ impl ChatMarkers {
                     }
                 }
             }
+            // <|end|> closes a MESSAGE, not the turn: the assistant runs
+            // analysis<|end|><|start|>assistant<|channel|>final... and only
+            // <|return|>/<|call|> end generation. The generic EOG text list
+            // puts <|end|> in stop_ids for other archs' sake - drop it here
+            // or generation dies at the end of the analysis channel.
+            stops.retain(|&x| x != end);
             stops.sort_unstable();
             return Ok(ChatMarkers {
                 style: ChatStyle::Harmony,

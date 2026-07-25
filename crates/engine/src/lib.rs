@@ -5272,10 +5272,12 @@ mod real {
                         if let Some(kn) = k_norm {
                             kernels::gqa_head_rms_norm(&mut st.k, Some(kn), n_tok * hkv, hd, eps)?;
                         }
-                        if gm.is_some() && l.ink.is_none() && l.attn_gate.is_none() {
+                        if gm.is_some() && l.ink.is_none() && l.attn_gate.is_none() && q_norm.is_some() {
                             // gemma: v gets a weightless per-head rms norm.
                             // laguna also has per-layer geom but does NOT
-                            // do this (attn_gate marks it).
+                            // do this (attn_gate marks it), and neither does
+                            // gpt-oss (no qk-norm marks it - same
+                            // discriminator as the attention scale above).
                             kernels::gqa_head_rms_norm(&mut st.v, None, n_tok * hkv, hd, eps)?;
                         }
                         if let Some(rot_w) = gm.map(|g| g.rot).filter(|&r| r != 0) {
