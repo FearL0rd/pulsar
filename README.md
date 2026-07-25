@@ -13,7 +13,7 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Ten model architectures running on consumer GPUs: **Hy3 295B**
+Eleven model architectures running on consumer GPUs: **Hy3 295B**
 (hy-v3, GQA), **GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention),
 **Kimi K2.7 1T** (deepseek2, MLA + YaRN), **MiniMax M3** (partial
 rotary, swiglu_oai), **Gemma 4 26B-A4B** (interleaved sliding-window
@@ -32,6 +32,9 @@ needle recall verified at 45k tokens with 19.6 tok/s decode at that
 depth; prefer K-quants for it: the Q4_K_XL decodes at 51.8 tok/s where
 the smaller Q3_K_XL manages 36, because iq3's codebook lookups are
 decode compute the simple K-quant shifts don't pay), and
+**gpt-oss 20B** (gpt-oss: per-head attention sinks in the softmax
+denominator, alternating sliding/full attention, biases on both the
+attention projections and every expert, MXFP4 routed experts), and
 **Laguna-S-2.1 118B** (laguna: hybrid attention with a full-window
 layer every fourth and sliding-window 512 elsewhere, a per-head output
 gate, and per-layer-type RoPE — YaRN on the full-window layers, plain
