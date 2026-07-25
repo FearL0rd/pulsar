@@ -49,6 +49,8 @@ pub enum TensorType {
     F32,
     F16,
     Q4_0,
+    /// 32 values, one f16 delta, 5-bit quants (high bit in a side word).
+    Q5_0,
     Q5_1,
     Q8_0,
     Q2K,
@@ -67,6 +69,10 @@ pub enum TensorType {
     BF16,
     /// Plain int32 tensors (deepseek4 tid2eid hash-routing tables).
     I32,
+    /// OCP microscaling FP4: 32 values sharing one E8M0 exponent byte,
+    /// each a 4-bit E2M1 float. gpt-oss ships its routed experts this way
+    /// and requantizing them away defeats the point of the release.
+    MXFP4,
     /// Anything we do not model yet; the raw id is preserved.
     Other(u32),
 }
@@ -92,8 +98,10 @@ impl TensorType {
             21 => Self::IQ3S,
             22 => Self::IQ2S,
             23 => Self::IQ4XS,
+            6 => Self::Q5_0,
             26 => Self::I32,
             30 => Self::BF16,
+            39 => Self::MXFP4,
             other => Self::Other(other),
         }
     }
@@ -119,8 +127,10 @@ impl TensorType {
             Self::IQ3S => 21,
             Self::IQ2S => 22,
             Self::IQ4XS => 23,
+            Self::Q5_0 => 6,
             Self::I32 => 26,
             Self::BF16 => 30,
+            Self::MXFP4 => 39,
             Self::Other(id) => id,
         }
     }
@@ -131,6 +141,7 @@ impl TensorType {
             Self::F32 | Self::I32 => (1, 4),
             Self::F16 | Self::BF16 => (1, 2),
             Self::Q4_0 => (32, 18),
+            Self::Q5_0 => (32, 22),
             Self::Q5_1 => (32, 24),
             Self::Q8_0 => (32, 34),
             Self::Q2K => (256, 84),
@@ -146,6 +157,8 @@ impl TensorType {
             Self::IQ3S => (256, 110),
             Self::IQ4XS => (256, 136),
             Self::IQ4NL => (32, 18),
+            // one E8M0 scale byte + 32 packed 4-bit values
+            Self::MXFP4 => (32, 17),
             Self::Other(_) => return None,
         })
     }

@@ -457,6 +457,7 @@ mod real {
             TensorType::Q5_1 => kernels::QUANT_Q5_1,
             TensorType::Q8_0 => kernels::QUANT_Q8_0,
             TensorType::IQ4XS => kernels::QUANT_IQ4_XS,
+            TensorType::MXFP4 => kernels::QUANT_MXFP4,
             _ => return None,
         })
     }
