@@ -212,6 +212,10 @@ mod real {
                 // Laguna-only pieces: a per-head output gate (attn_gate,
                 // softplus) and learnable sinks on the sliding layers.
                 Some("laguna") => Family::Gqa,
+                // OpenAI gpt-oss: GQA MoE with per-head attention sinks,
+                // alternating sliding/full attention, q/k/v/output biases,
+                // per-expert biases, and MXFP4 routed experts
+                Some("gpt-oss") => Family::Gqa,
                 // Qwen3.6-35B-A3B hybrid GDN (task #21)
                 Some("qwen35moe") => Family::Qwen35,
                 // Qwen3.6 dense (27B lineage, task #37): same GDN hybrid
@@ -311,7 +315,7 @@ mod real {
                 // 0 = plain silu everywhere else (inkling included)
                 moe_act_op: match g.architecture() {
                     Some("gemma4") => 1,
-                    Some("minimax-m3") => 2,
+                    Some("minimax-m3") | Some("gpt-oss") => 2,
                     _ => 0,
                 },
                 // inkling has no rope at all - the key may be absent
@@ -2616,6 +2620,7 @@ mod real {
             let gemma_arch = gguf.architecture() == Some("gemma4");
             let ink_arch = gguf.architecture() == Some("inkling");
             let laguna_arch = gguf.architecture() == Some("laguna");
+            let oss_arch = gguf.architecture() == Some("gpt-oss");
             // per-layer attention geometry: gemma4 interleaves sliding-
             // window layers (own kv width, head_dim, theta) with full ones
             let geom: Vec<Geom> = if ink_arch {
@@ -2745,6 +2750,28 @@ mod real {
                             factors: false,
                             rot: if full { rot_full } else { rot_swa },
                         }
+                    })
+                    .collect()
+            } else if oss_arch {
+                // gpt-oss alternates sliding and full attention and ships no
+                // sliding_window_pattern array to say so; the reference
+                // pattern is sliding on even layers. Head geometry, rope and
+                // head_dim are uniform, so window is the only thing that
+                // varies per layer.
+                let window = gguf
+                    .arch_meta("attention.sliding_window")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+                    .unwrap_or(128);
+                (0..shape.n_exec_layer as usize)
+                    .map(|il| Geom {
+                        n_head_q: shape.n_head,
+                        n_head_kv: shape.n_head_kv,
+                        head_dim: shape.head_dim,
+                        theta: shape.rope_freq_base,
+                        window: if il % 2 == 0 { window } else { 0 },
+                        factors: false,
+                        rot: shape.head_dim,
                     })
                     .collect()
             } else {
@@ -3442,6 +3469,18 @@ mod real {
     fn build_tiers(m: &Model, mb: u32, primary: i32) -> Result<Vec<ExpertTier>> {
         let s = m.shape;
         if std::env::var("PULSAR_TIERS").ok().as_deref() == Some("off") {
+            return Ok(Vec::new());
+        }
+        // Expert biases live on the primary, and a tier kernel runs on
+        // another device where that pointer is not dereferenceable, so a
+        // tier would fault the moment it read one. Replicating the bias
+        // buffers per tier device is the real fix (they are ~1MB); until
+        // then, decline the tier rather than fault.
+        if m.layers.iter().any(|l| matches!(&l.ffn, Ffn::Moe { exp_bias: Some(_), .. })) {
+            eprintln!(
+                "pulsar: expert tiers disabled - this model carries per-expert biases, \
+                 which are resident on the primary only"
+            );
             return Ok(Vec::new());
         }
 
