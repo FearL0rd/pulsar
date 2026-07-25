@@ -102,6 +102,12 @@ enum ChatStyle {
     /// ... (poolside Laguna; paired open/close role tags, GLM-style thinking
     /// off via an empty <think></think> block)
     Laguna,
+    /// <|start|>role<|message|>text<|end|> ... (OpenAI harmony, gpt-oss).
+    /// Roles are plain text between real marker tokens. The assistant
+    /// answers on channels: it opens with <|channel|>analysis for its
+    /// reasoning and <|channel|>final for the reply, and stops on
+    /// <|return|>. History keeps only the final channel.
+    Harmony,
 }
 
 pub struct ChatMarkers {
@@ -251,6 +257,35 @@ impl ChatMarkers {
                 stops,
             });
         }
+        if let (Some(start), Some(msg), Some(end)) = (
+            t.find_token("<|start|>"),
+            t.find_token("<|message|>"),
+            t.find_token("<|end|>"),
+        ) {
+            // gpt-oss harmony. `assistant` carries <|channel|> because the
+            // role itself is text, not a token, and history needs the
+            // channel marker; open/close roles ride in user/aux1.
+            let mut stops = t.stop_ids.clone();
+            for name in ["<|return|>", "<|call|>"] {
+                if let Some(id) = t.find_token(name) {
+                    if !stops.contains(&id) {
+                        stops.push(id);
+                    }
+                }
+            }
+            stops.sort_unstable();
+            return Ok(ChatMarkers {
+                style: ChatStyle::Harmony,
+                bos: t.bos_id,
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: t.find_token("<|return|>"),
+                user: start,
+                assistant: t.find_token("<|channel|>").unwrap_or(start),
+                aux0: msg,
+                aux1: end,
+                stops,
+            });
+        }
         Ok(ChatMarkers {
             style: ChatStyle::Hy3,
             bos: Some(t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?),
@@ -276,6 +311,14 @@ impl ChatMarkers {
     /// System text ids for the first turn (Hy3: bare text after bos).
     pub fn render_system(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
         match self.style {
+            ChatStyle::Harmony => {
+                let mut v = vec![self.user];
+                v.extend(t.encode("system"));
+                v.push(self.aux0);
+                v.extend(t.encode(text));
+                v.push(self.aux1);
+                v
+            }
             ChatStyle::Hy3 | ChatStyle::Deepseek => t.encode(text),
             ChatStyle::ChatMl => {
                 let mut v = vec![self.user];
@@ -329,6 +372,14 @@ impl ChatMarkers {
     /// A user message (no assistant opener).
     pub fn render_user(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
         match self.style {
+            ChatStyle::Harmony => {
+                let mut v = vec![self.user];
+                v.extend(t.encode("user"));
+                v.push(self.aux0);
+                v.extend(t.encode(text));
+                v.push(self.aux1);
+                v
+            }
             ChatStyle::Hy3 | ChatStyle::Deepseek => {
                 let mut v = vec![self.user];
                 v.extend(t.encode(text));
@@ -374,6 +425,14 @@ impl ChatMarkers {
     /// The assistant opener; generation starts right after this.
     pub fn open_assistant(&self, t: &Tokenizer) -> Vec<u32> {
         match self.style {
+            ChatStyle::Harmony => {
+                // stop at the role: the model emits its own <|channel|>
+                // analysis/final, and forcing one here would cut off the
+                // reasoning it is trained to produce
+                let mut v = vec![self.user];
+                v.extend(t.encode("assistant"));
+                v
+            }
             ChatStyle::Hy3 => vec![self.assistant, self.aux0, self.aux1],
             // <U+FF5C>Assistant<U+FF5C> then </think>: thinking off
             ChatStyle::Deepseek => vec![self.assistant, self.aux1],
@@ -439,6 +498,18 @@ impl ChatMarkers {
             let mut v = vec![self.assistant, self.aux1];
             v.extend(t.encode(text));
             v.push(self.aux0);
+            return v;
+        }
+        if self.style == ChatStyle::Harmony {
+            // prior turns carry the final channel only; the analysis
+            // channel is not replayed back to the model
+            let mut v = vec![self.user];
+            v.extend(t.encode("assistant"));
+            v.push(self.assistant);
+            v.extend(t.encode("final"));
+            v.push(self.aux0);
+            v.extend(t.encode(text));
+            v.push(self.aux1);
             return v;
         }
         let mut v = self.open_assistant(t);
