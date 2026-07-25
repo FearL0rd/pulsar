@@ -43,6 +43,7 @@ Gen5 NVMe.
 | Model | Total | Active / token | gguf | Decode, warm | vs ds4, same box |
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
+| gpt-oss 20B | 20B | 3.6B (top-4 of 32) | 12GB (Q8_0 attn + MXFP4 experts) | **21.2 tok/s** | – |
 | Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 22GB (Q4_K_XL) | **51.8 tok/s** | – |
 | ThinkingCap-Qwen3.6-27B (dense) | 27B | 27B | 16GB (Q4_K_M) | **18.7 tok/s** (27.8 w/ nextn MTP) | – |
 | Laguna-S-2.1 | 118B | 8B (top-10 of 256 + shared) | 36GB (IQ2_XXS, imatrix) | **17.3 tok/s** (22.4 w/ CPU lane) | – |
