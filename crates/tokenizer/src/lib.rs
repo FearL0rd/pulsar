@@ -276,7 +276,11 @@ impl ChatMarkers {
             stops.sort_unstable();
             return Ok(ChatMarkers {
                 style: ChatStyle::Harmony,
-                bos: t.bos_id,
+                // no bos: the harmony template opens on <|start|>system and
+                // the reference tokenizes it without one. Prepending bos
+                // shifts every position by one and the model rambles instead
+                // of answering.
+                bos: None,
                 eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
                 eot: t.find_token("<|return|>"),
                 user: start,

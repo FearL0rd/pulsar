@@ -596,6 +596,23 @@ fn encode_messages(
     });
     let mut ids: Vec<u32> = m.prologue();
     let mut tools_injected = tool_text.is_none();
+    // Styles that require a system block get one even when the caller sends
+    // none. Harmony's channel list is not optional (gpt-oss never closes its
+    // analysis channel without it) and the web UI sends no system turn, so
+    // relying on the client to supply it means the model misbehaves by
+    // default. Returns None for every other style.
+    if !messages
+        .iter()
+        .any(|msg| msg["role"].as_str() == Some("system"))
+    {
+        if let Some(mut sys) = m.default_system() {
+            if !tools_injected {
+                sys.push_str(tool_text.as_deref().unwrap_or(""));
+                tools_injected = true;
+            }
+            ids.extend(m.render_system(tok, &sys));
+        }
+    }
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("");
         let mut content = text_of(&msg["content"]);
@@ -646,6 +663,49 @@ fn encode_messages(
 /// Split generated text into (visible text, parsed tool calls).
 /// Unclosed or unparseable blocks stay in the text untouched.
 #[cfg(target_os = "linux")]
+/// Split harmony channel output into (reasoning, reply).
+///
+/// gpt-oss answers on named channels: `analysis` carries its chain of
+/// thought, `final` the actual reply, fenced by <|channel|>NAME<|message|>.
+/// A client wants the reply in `content`, so everything that is not `final`
+/// becomes reasoning, the way llama.cpp splits it. Text with no channel
+/// markers passes through untouched, which is every other model here.
+fn split_harmony(s: &str) -> (String, String) {
+    if !s.contains("<|channel|>") {
+        return (String::new(), s.to_string());
+    }
+    let mut reasoning = String::new();
+    let mut reply = String::new();
+    for seg in s.split("<|channel|>").skip(1) {
+        // the name runs to the message marker, except the model sometimes
+        // emits a bare ':' in its place, so accept either
+        let (name, rest) = match seg.find("<|message|>") {
+            Some(i) => (&seg[..i], &seg[i + "<|message|>".len()..]),
+            None => match seg.find(':') {
+                Some(i) => (&seg[..i], &seg[i + 1..]),
+                None => (seg, ""),
+            },
+        };
+        let mut body = rest;
+        for end in ["<|end|>", "<|start|>", "<|return|>", "<|call|>"] {
+            if let Some(i) = body.find(end) {
+                body = &body[..i];
+            }
+        }
+        if name.trim() == "final" {
+            reply.push_str(body);
+        } else {
+            reasoning.push_str(body);
+        }
+    }
+    // hit the token cap mid-reasoning and never reached `final`: show the
+    // reasoning rather than hand back an empty reply
+    if reply.trim().is_empty() {
+        return (String::new(), reasoning.trim().to_string());
+    }
+    (reasoning.trim().to_string(), reply.trim().to_string())
+}
+
 fn extract_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
     let mut clean = String::new();
     let mut calls = Vec::new();
@@ -838,7 +898,23 @@ fn handle_chat(
                 if tool_phase.get() {
                     return; // buffering a tool call; nothing streams
                 }
-                bytes.extend_from_slice(&tok.decode(&[t]));
+                {
+                    // harmony control markers are structure, not prose.
+                    // A streaming client cannot be handed the split the
+                    // non-streaming path does, so at least drop the fences
+                    // and leave "analysis ... final ..." readable.
+                    let d = tok.decode(&[t]);
+                    const FENCE: [&[u8]; 5] = [
+                        b"<|channel|>",
+                        b"<|message|>",
+                        b"<|start|>",
+                        b"<|end|>",
+                        b"<|constrain|>",
+                    ];
+                    if !FENCE.contains(&d.as_slice()) {
+                        bytes.extend_from_slice(&d);
+                    }
+                }
                 const MARK: &[u8] = b"<tool_call>";
                 if let Some(p) = bytes.windows(MARK.len()).position(|w| w == MARK) {
                     // stream the text before the call, then go silent
@@ -943,7 +1019,11 @@ fn handle_chat(
         )?;
         let full = String::from_utf8_lossy(&out).into_owned();
         let (clean, calls) = extract_tool_calls(&full);
+        let (reasoning, clean) = split_harmony(&clean);
         let mut message = serde_json::json!({"role": "assistant", "content": clean});
+        if !reasoning.is_empty() {
+            message["reasoning_content"] = serde_json::json!(reasoning);
+        }
         if !calls.is_empty() {
             message["tool_calls"] = serde_json::json!(calls
                 .iter()
