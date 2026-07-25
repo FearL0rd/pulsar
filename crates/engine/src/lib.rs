@@ -2787,7 +2787,10 @@ mod real {
                         theta: shape.rope_freq_base,
                         window: if il % 2 == 0 { window } else { 0 },
                         factors: false,
-                        rot: 0, // EXPERIMENT: take the plain gqa_rope path
+                        // non-zero routes rope through the yarn path, which
+                        // is what gpt-oss needs: uniform scaling with the
+                        // kernel's mscale. Zero here silently drops YaRN.
+                        rot: shape.head_dim,
                     })
                     .collect()
             } else {
