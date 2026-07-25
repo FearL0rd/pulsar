@@ -939,6 +939,13 @@ mod real {
         pub cpu: std::time::Duration,
         pub tail: std::time::Duration,
         pub calls: u64,
+        /// Cross-layer prefetch accuracy: of the experts layer L+1 actually
+        /// routed to, how many did the prediction made at layer L name?
+        /// This gates the only overlap that is structurally possible - the
+        /// layers are serial, so the GPU can ONLY be busy during a disk
+        /// wait if the next layer's weights were already fetched.
+        pub pred_hits: u64,
+        pub pred_total: u64,
     }
 
     impl Prof {
@@ -963,7 +970,16 @@ mod real {
                 s(self.cpu),
                 s(self.tail),
                 self.calls
-            )
+            ) + &if self.pred_total > 0 {
+                format!(
+                    "\npulsar: cross-layer prefetch predicted {}/{} routed experts ({:.1}%)",
+                    self.pred_hits,
+                    self.pred_total,
+                    100.0 * self.pred_hits as f64 / self.pred_total as f64
+                )
+            } else {
+                String::new()
+            }
         }
     }
 
@@ -1111,15 +1127,27 @@ mod real {
                 // once enough reads are in flight (fetch-bench, qd 8+).
                 // Sorted because ascending offsets read faster than the
                 // routing order, deduped because layers share slabs.
+                // Bounded: coalesce up to a cap, then DISCARD whatever is
+                // still queued. Prefetch is speculative, so a backlog is
+                // strictly harmful - stale requests keep the drive busy on
+                // layers the model has already passed while the current
+                // layer waits. Unbounded coalescing let a prefill flood
+                // queue ~177GiB of reads that drained through decode.
                 const COALESCE_MAX: usize = 192;
                 while let Ok(first) = req_rx.recv() {
                     let mut reads = first;
+                    let mut dropped = false;
                     for more in req_rx.try_iter() {
-                        reads.extend(more);
-                        if reads.len() >= COALESCE_MAX {
-                            break;
+                        if dropped || reads.len() >= COALESCE_MAX {
+                            dropped = true; // drain and drop the rest
+                            continue;
                         }
+                        reads.extend(more);
                     }
+                    // note: the FIRST request is never truncated - a real
+                    // 256-token chunk legitimately asks for a whole layer
+                    // (768 reads) and clipping that would gut the case this
+                    // path exists for. The cap only bounds COALESCING.
                     reads.sort_unstable_by_key(|r| r.offset);
                     reads.dedup_by_key(|r| r.offset);
                     let _ = fetcher.fetch_each(&reads, |i, slab| {
@@ -3757,6 +3785,10 @@ mod real {
         logits: DeviceBuf,
         pub store: StreamingStore,
         prefetcher: Prefetcher,
+        /// Last cross-layer prediction and the layer it was made for, so the
+        /// next layer can score it (PULSAR_PROFILE only).
+        pred_prev: Vec<i32>,
+        pred_prev_for: usize,
         pred_logits: DeviceBuf,
         pred_selected: DeviceBuf,
         pred_weights: DeviceBuf,
@@ -4862,6 +4894,8 @@ mod real {
                 },
                 cpu_ret: f32s(1)?, // grows on first CPU-lane hit
                 cpu_hits: 0,
+                pred_prev: Vec::new(),
+                pred_prev_for: usize::MAX,
                 route_counts: vec![0u64; (m.shape.n_layer * m.shape.n_expert.max(1)) as usize],
                 tiers,
                 grp_ptrs: DeviceBuf::alloc(s.n_expert.max(1) as usize * std::mem::size_of::<ExpertPtrs>())?,
@@ -5748,6 +5782,32 @@ mod real {
                             None
                         };
                         st.prof.resolve_d2h += t_d2h.elapsed();
+                        // Score the prediction the PREVIOUS layer made for this
+                        // one. Layers are serial, so prefetch is the only way
+                        // the GPU can be busy during a disk wait; this ratio is
+                        // the ceiling on how much of that wait can ever be
+                        // hidden. Cheap set test - n_expert_used is 8.
+                        if n_tok == 1 && std::env::var_os("PULSAR_PROFILE").is_some() {
+                            if st.pred_prev_for == il && !st.pred_prev.is_empty() {
+                                for &e in &selected {
+                                    if e < 0 || e as u32 >= s.n_expert {
+                                        continue;
+                                    }
+                                    st.prof.pred_total += 1;
+                                    if st.pred_prev.contains(&e) {
+                                        st.prof.pred_hits += 1;
+                                    }
+                                }
+                            }
+                            match &pred_ids {
+                                Some(p) => {
+                                    st.pred_prev.clear();
+                                    st.pred_prev.extend_from_slice(p);
+                                    st.pred_prev_for = il + 1;
+                                }
+                                None => st.pred_prev_for = usize::MAX,
+                            }
+                        }
                         // true routing count: every selection this layer, resident
                         // or streamed (topic atlas / Brain heat, no tier blind spot)
                         {
@@ -5786,7 +5846,24 @@ mod real {
                         // full-layer load, via the host-cache channel).
                         // real prefill chunks only: a 2-row spec-verify
                         // batch must not ship whole layers to the fetcher
-                        if n_tok > 8 && std::env::var_os("PULSAR_NO_PREFETCH").is_none() {
+                        // Only when the chunk really does touch most of the
+                        // layer. t tokens picking top-k of E experts reach
+                        // E*(1-(1-k/E)^t) distinct ones: a 256-token chunk
+                        // gets ~100% and this is the right call, but a
+                        // 12-token prompt gets ~32% and it requests 2.36GiB
+                        // per layer to use a third of it. Ungated (n_tok > 8)
+                        // that was 177GiB of speculative reads across 75
+                        // layers into a ~20GB cache - it saturated the drive,
+                        // thrashed the cache, and the backlog drained into
+                        // decode starving the reads actually being waited on.
+                        // Measured on GLM-5.2: 1.43 tok/s with the flood vs
+                        // 2.63 with prefetch off entirely.
+                        let chunk_covers = {
+                            let p_miss =
+                                1.0 - (s.n_expert_used as f64 / s.n_expert.max(1) as f64);
+                            1.0 - p_miss.powi(n_tok as i32) >= 0.75
+                        };
+                        if chunk_covers && std::env::var_os("PULSAR_NO_PREFETCH").is_none() {
                             if let Some(Ffn::Moe {
                                 gate_exps: ng, up_exps: nu, down_exps: nd, ..
                             }) = self.layers.get(il + 1).map(|nl| &nl.ffn)
