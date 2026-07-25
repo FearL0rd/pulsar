@@ -6091,6 +6091,21 @@ mod real {
                         let mut h2d = std::time::Duration::ZERO;
                         let mut fetch_wait = std::time::Duration::ZERO;
                         let mut async_queued = false;
+                        // TRIED AND REVERTED (2026-07-25): splitting this into
+                        // two waves - launch the experts the host store already
+                        // holds, THEN block on the disk for the rest - so the
+                        // primary GPU computes through the disk wait. It is a
+                        // regression: 2.52/2.53/2.51 tok/s against 2.85/2.54/
+                        // 2.83 interleaved on GLM-5.2. Reason: the MoE kernels
+                        // are launched over the FULL n_expert_used slot range
+                        // with NULL masking, and quantize_q8_k covers
+                        // n_ff_exp * n_expert_used unconditionally, so a second
+                        // wave re-pays the whole width instead of splitting it.
+                        // Any retry has to make the launches slot-sparse first.
+                        // Launching the TIER partials before this wait is also
+                        // neutral (2.84/2.82) - they already overlapped the
+                        // primary MoE, so it just moves them under a different
+                        // shadow.
                         let t_host = std::time::Instant::now();
                         {
                             let dev_cache = &mut st.dev_cache;
