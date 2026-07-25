@@ -5611,6 +5611,21 @@ mod real {
                             if sink_n > 0 { 2 } else { s.router_softmax as u32 },
                             sink_n,
                         )?;
+                        if std::env::var_os("PULSAR_ROUTER_HIST").is_some() && n_tok == 1 {
+                            // Per-token gate weights by rank. The tail of
+                            // this distribution is what a top-p router
+                            // prune would drop, and its mass bounds the
+                            // error that dropping costs - so measure it
+                            // before believing any estimate.
+                            kernels::sync()?;
+                            let w = st.router_weights.read_f32(s.n_expert_used as usize)?;
+                            let sum: f32 = w.iter().sum::<f32>().max(1e-9);
+                            let mut line = String::new();
+                            for v in &w {
+                                line.push_str(&format!("{:.5} ", v / sum));
+                            }
+                            eprintln!("rw L{il} {line}");
+                        }
                         if let Some(ds) = down_scale {
                             // per-expert down scale folds into the route
                             // weight (the down projection is linear)
