@@ -566,6 +566,12 @@ impl ChatMarkers {
     pub fn is_stop(&self, id: u32) -> bool {
         id == self.eos || Some(id) == self.eot || self.stops.binary_search(&id).is_ok()
     }
+
+    /// Harmony output rides named channels; streaming callers need to know
+    /// so they can route analysis/final instead of passing fences through.
+    pub fn is_harmony(&self) -> bool {
+        self.style == ChatStyle::Harmony
+    }
 }
 
 /// Today as YYYY-MM-DD, UTC. Hinnant's civil-from-days so the harmony

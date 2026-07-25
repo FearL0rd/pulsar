@@ -877,6 +877,16 @@ fn handle_chat(
         let mut bytes: Vec<u8> = Vec::new();
         let mut n_out = 0usize;
         let send_err = std::cell::Cell::new(false);
+        // harmony channel state machine: the assistant turn is
+        // <|channel|>analysis<|message|>...<|end|><|start|>assistant
+        // <|channel|>final<|message|>... - header text (channel names,
+        // roles) is swallowed, `final` bodies stream as content, every
+        // other body as reasoning_content, mirroring the non-stream split
+        let harmony = markers.is_harmony();
+        let mut hdr = harmony; // generation opens on a channel header
+        let mut hdr_buf: Vec<u8> = Vec::new();
+        let mut reasoning = false;
+        let mut rbytes: Vec<u8> = Vec::new();
         engine::generate_cancellable(
             model,
             st,
@@ -899,10 +909,6 @@ fn handle_chat(
                     return; // buffering a tool call; nothing streams
                 }
                 {
-                    // harmony control markers are structure, not prose.
-                    // A streaming client cannot be handed the split the
-                    // non-streaming path does, so at least drop the fences
-                    // and leave "analysis ... final ..." readable.
                     let d = tok.decode(&[t]);
                     const FENCE: [&[u8]; 5] = [
                         b"<|channel|>",
@@ -911,8 +917,38 @@ fn handle_chat(
                         b"<|end|>",
                         b"<|constrain|>",
                     ];
-                    if !FENCE.contains(&d.as_slice()) {
+                    if harmony {
+                        match d.as_slice() {
+                            b"<|channel|>" | b"<|start|>" | b"<|end|>" => {
+                                hdr = true;
+                                hdr_buf.clear();
+                            }
+                            b"<|message|>" => {
+                                hdr = false;
+                                reasoning = !hdr_buf.windows(5).any(|w| w == b"final");
+                            }
+                            b"<|constrain|>" => {}
+                            _ if hdr => hdr_buf.extend_from_slice(&d),
+                            _ if reasoning => rbytes.extend_from_slice(&d),
+                            _ => bytes.extend_from_slice(&d),
+                        }
+                    } else if !FENCE.contains(&d.as_slice()) {
                         bytes.extend_from_slice(&d);
+                    }
+                }
+                let rvalid = match std::str::from_utf8(&rbytes) {
+                    Ok(s) => s.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                if rvalid > 0 && !send_err.get() {
+                    let text = String::from_utf8_lossy(&rbytes[..rvalid]).into_owned();
+                    rbytes.drain(..rvalid);
+                    let chunk = serde_json::json!({
+                        "id": id, "object": "chat.completion.chunk", "model": model_name,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}],
+                    });
+                    if write!(stream, "data: {chunk}\n\n").and_then(|_| stream.flush()).is_err() {
+                        send_err.set(true);
                     }
                 }
                 const MARK: &[u8] = b"<tool_call>";

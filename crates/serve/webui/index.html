@@ -839,6 +839,20 @@
   }
   .msg .content p { margin: 0 0 14px; }
   .msg .content p:last-child { margin-bottom: 0; }
+  .msg .content details.think {
+    margin: 0 0 14px;
+    padding: 8px 14px;
+    border-left: 2px solid var(--border, #333);
+    opacity: 0.55;
+    font-size: 14px;
+  }
+  .msg .content details.think summary {
+    cursor: pointer;
+    user-select: none;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
   .msg .content p:has(+ .cursor) { display: inline; }
   .msg .content pre {
     margin: 14px 0;
@@ -1961,6 +1975,7 @@ async function streamAssistant() {
   scrollDown();
 
   let acc = "";
+  let racc = ""; // harmony reasoning_content (analysis channel), shown dimmed
   let ntok = 0;
   let t0 = 0; // decode timer starts at first token, not at fetch (matches pulsar-cli)
   const tSend = performance.now();
@@ -1974,6 +1989,13 @@ async function streamAssistant() {
   // enough for smooth streaming and keeps the socket drained.
   let rafGen = 0;
   let rafPending = false;
+  // reasoning renders as a collapsible block above the reply: open while
+  // the model is still thinking, collapsed once the answer starts
+  const renderTurn = () =>
+    (racc
+      ? '<details class="think"' + (acc ? "" : " open") +
+        "><summary>thinking</summary>" + renderMarkdown(racc) + "</details>"
+      : "") + renderMarkdown(acc);
   const scheduleRender = () => {
     if (rafPending) return;
     rafPending = true;
@@ -1981,7 +2003,7 @@ async function streamAssistant() {
     requestAnimationFrame(() => {
       rafPending = false;
       if (gen !== rafGen) return; // superseded by a finalize / abort / error
-      body.innerHTML = renderMarkdown(acc) + '<span class="cursor"></span>';
+      body.innerHTML = renderTurn() + '<span class="cursor"></span>';
       scrollDown();
       // live generation readout (throttled by the same rAF): keep every chip
       // current WHILE generating, not just at the end
@@ -2030,21 +2052,24 @@ async function streamAssistant() {
         const pt = ev?.usage?.prompt_tokens;
         if (Number.isFinite(pt)) promptToks = pt;
         const delta = ev?.choices?.[0]?.delta;
-        if (delta?.content) {
+        if (delta?.content || delta?.reasoning_content) {
           if (ntok === 0) {
             const prefillS = (performance.now() - tSend) / 1000;
             if (promptToks > 0 && prefillS > 0) prefillTps = promptToks / prefillS;
             t0 = performance.now();
           }
-          acc += delta.content;
+          if (delta.content) acc += delta.content;
+          if (delta.reasoning_content) racc += delta.reasoning_content;
           ntok += 1;
           scheduleRender();
         }
       }
     }
     cancelRender();
-    body.innerHTML = renderMarkdown(acc) || "<p><i>(empty)</i></p>";
-    conversation.push({ role: "assistant", content: acc });
+    body.innerHTML = renderTurn() || "<p><i>(empty)</i></p>";
+    // history replays the reply only; harmony re-renders prior turns on the
+    // final channel and the reference never feeds analysis back either
+    conversation.push({ role: "assistant", content: acc || racc });
     const dtNum = t0 ? (performance.now() - t0) / 1000 : 0;
     const rate = ntok && dtNum > 0 ? (ntok / dtNum).toFixed(1) : "—";
     let summary = `done · ${ntok} tok · ${dtNum.toFixed(1)}s · ${rate} tok/s`;
@@ -2066,7 +2091,7 @@ async function streamAssistant() {
   } catch (err) {
     if (err.name === "AbortError") {
       cancelRender();
-      body.innerHTML = renderMarkdown(acc) + '<p><i>(stopped)</i></p>';
+      body.innerHTML = renderTurn() + '<p><i>(stopped)</i></p>';
       if (acc) conversation.push({ role: "assistant", content: acc });
       setStatus("stopped");
     } else {
