@@ -779,6 +779,28 @@ fn handle_chat(
     let seed = req["seed"].as_u64().unwrap_or(42);
     let streaming = req["stream"].as_bool().unwrap_or(false);
 
+    // Per-request reasoning control, accepting both conventions clients
+    // actually send: OpenAI's top-level `reasoning_effort` and the
+    // vLLM/SGLang `chat_template_kwargs.enable_thinking`. "none"/"off"
+    // disables; anything else is clamped to the style's own vocabulary
+    // (GLM high|max, harmony low|medium|high) by set_reasoning. Markers
+    // are cloned per request so one client's choice cannot leak into the
+    // next - the server holds one engine but many callers.
+    let mut req_markers = markers.clone();
+    if let Some(e) = req["reasoning_effort"].as_str() {
+        match e {
+            "none" | "off" | "disabled" => req_markers.set_think(false),
+            _ => {
+                req_markers.set_think(true);
+                req_markers.set_reasoning(e);
+            }
+        }
+    }
+    if let Some(b) = req["chat_template_kwargs"]["enable_thinking"].as_bool() {
+        req_markers.set_think(b);
+    }
+    let markers = &req_markers;
+
     let tools = req["tools"].as_array().cloned();
     let prompt = encode_messages(tok, markers, messages, tools.as_ref());
     if std::env::var_os("PULSAR_DEBUG_IDS").is_some() {
