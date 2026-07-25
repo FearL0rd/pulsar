@@ -72,6 +72,10 @@ mod real {
         /// qwen3moe: softmax router, no bias, normalize top-k probs.
         /// false = sigmoid router (Hy3/GLM/DeepSeek/MiniMax lineage).
         pub router_softmax: bool,
+        /// YaRN applies to EVERY layer with the standard mscale, rather
+        /// than laguna's scheme of yarn on full-window layers only with the
+        /// kernel mscale cancelled. gpt-oss is the uniform kind.
+        pub rope_yarn_uniform: bool,
         /// expert gate activation: 0 = silu, 1 = gelu tanh (gemma4)
         pub moe_act_op: u32,
         pub rope_freq_base: f32,
@@ -313,6 +317,7 @@ mod real {
                     g.architecture(),
                     Some("qwen3moe") | Some("gemma4") | Some("qwen35moe") | Some("gpt-oss")
                 ),
+                rope_yarn_uniform: g.architecture() == Some("gpt-oss"),
                 // gated-FFN op: 1 = gelu (gemma4), 2 = swiglu_oai (MiniMax
                 // M3: clamp 7, alpha 1.702, up+1 - llama.cpp PR 24523),
                 // 0 = plain silu everywhere else (inkling included)
@@ -366,6 +371,14 @@ mod real {
                 // deepseek2 mscale path does not apply (log_mult 0).
                 s.rope_scale_factor = f("rope.scaling.factor").unwrap_or(1.0);
                 s.rope_orig_ctx = u("rope.scaling.original_context_length").unwrap_or(8192);
+                s.rope_yarn_log_mult = 0.0;
+            }
+            if g.architecture() == Some("gpt-oss") {
+                // yarn factor 32 over a 4096 native window, applied to every
+                // layer; without this parse the factor defaulted to 1.0 and
+                // rope ran unscaled, which is a different model
+                s.rope_scale_factor = f("rope.scaling.factor").unwrap_or(1.0);
+                s.rope_orig_ctx = u("rope.scaling.original_context_length").unwrap_or(4096);
                 s.rope_yarn_log_mult = 0.0;
             }
             if family == Family::Gqa {
@@ -5266,14 +5279,18 @@ mod real {
                             // dims stay unit-scaled. SLIDING layers run
                             // PLAIN rope (theta 10k, rot 128): freq_scale
                             // 1.0 and ext_factor 0, NOT the global yarn.
-                            let yarn = window == 0 && s.rope_scale_factor > 1.0;
+                            // gpt-oss scales every layer and keeps the
+                            // kernel's mscale; laguna scales only the
+                            // full-window ones and cancels it
+                            let uni = s.rope_yarn_uniform;
+                            let yarn = (uni || window == 0) && s.rope_scale_factor > 1.0;
                             let f = s.rope_scale_factor;
                             let rc = kernels::RopeCfg {
                                 n_ctx_orig: s.rope_orig_ctx,
                                 freq_base: theta,
                                 freq_scale: if yarn { 1.0 / f } else { 1.0 },
                                 ext_factor: if yarn { 1.0 } else { 0.0 },
-                                attn_factor: if yarn { 1.0 / (1.0 + 0.1 * f.ln()) } else { 1.0 },
+                                attn_factor: if yarn && !uni { 1.0 / (1.0 + 0.1 * f.ln()) } else { 1.0 },
                                 beta_fast: 32.0,
                                 beta_slow: 1.0,
                                 kq_mult: 1.0,
@@ -5310,7 +5327,12 @@ mod real {
                         // inkling at muP 1/head_dim
                         let scale = if l.ink.is_some() {
                             1.0 / hd as f32
-                        } else if gm.is_some() && l.attn_gate.is_none() {
+                        } else if gm.is_some() && l.attn_gate.is_none() && q_norm.is_some() {
+                            // gemma only, and the reason is the qk-norm: q is
+                            // already per-head normalized, so the scores need
+                            // no 1/sqrt(head_dim). Keyed on that norm rather
+                            // than on "has per-layer geometry", which gpt-oss
+                            // also has while needing the ordinary scale.
                             1.0
                         } else {
                             // laguna: head_dim**-0.5 despite QK-norm
