@@ -1966,7 +1966,14 @@ enum {
  * ONCE, and all of the group's tokens dot against the staged copy. Same
  * DOT templates, so every quant format inherits it. Down partials land in
  * mid-layout [token][slot][out_dim] and a deterministic slot-sum follows
- * (no atomics: prefill logits stay reproducible). */
+ * (no atomics: prefill logits stay reproducible).
+ *
+ * What actually pays here is amortizing DEQUANT, not the raw weight reads,
+ * so the win scales with how costly the format is to unpack. Measured
+ * 2026-07-24 on a 728-token prompt, grouped vs PULSAR_NO_GROUPED: Hy3
+ * iq2_xxs 24.3s vs 31.7s (1.31x), Laguna Q2K 6.39s vs 6.39s (nothing).
+ * Cheap-unpack K-quants get no benefit because L2 already absorbs the
+ * re-reads; do not assume this path is load-bearing on every model. */
 
 #define PULSAR_GROUP_SMEM 49152 /* dynamic smem default ceiling */
 

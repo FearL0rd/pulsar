@@ -50,7 +50,14 @@ else
   [ "$CACHE_GB" -lt 8 ] && CACHE_GB=8
 fi
 ATTN_VRAM_USER="${PULSAR_ATTN_VRAM_GB-}"
-CPU="${PULSAR_CPU:-1}"
+# CPU lane defaults OFF here, unlike bench_kv.sh. This script measures logit
+# fidelity against an f32 baseline, and the lane computes some experts in
+# AVX2 instead of on the GPU with the split decided by timing, so runs are
+# not reproducible. With it on, the f32-vs-f32 noise floor came out at 96.5%
+# top-1 / mean |dlogit| 0.2512, which is high enough to swamp the formats
+# under test; off, the floor is exactly 100% / 0.0000. Set PULSAR_CPU=1 to
+# opt back in if you are deliberately measuring the lane.
+CPU="${PULSAR_CPU:-off}"
 CPU_STEAL="${PULSAR_CPU_STEAL:-0}"
 
 command -v nvidia-smi >/dev/null || { echo "ERROR: nvidia-smi not found" >&2; exit 1; }

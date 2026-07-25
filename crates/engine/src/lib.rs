@@ -4284,7 +4284,14 @@ mod real {
             // logits/lm-head path stays single-row (last token only)
             // big default: each prefill chunk costs roughly one pass over
             // the expert corpus regardless of chunk size, so fewer chunks
-            // win; activations at 512 cost only ~150MB
+            // win; activations at 512 cost only ~150MB.
+            // Regime-dependent, measured 2026-07-24 on a 728-token prompt:
+            // when the corpus streams (Hy3 iq2_xxs, 84GB) a "pass" is real
+            // disk/PCIe traffic and chunk 128/256/768 = 38.2/30.4/24.3s, so
+            // fewer chunks wins 1.6x. When the corpus is already resident in
+            // tiers (Laguna Q2K, 39GB over 48GB of VRAM) there is nothing to
+            // re-fetch and it goes flat: chunk 768/1536/2304 = 45.3/48.0/48.2s
+            // on 4327 tokens. Cost tracks tokens, not chunks, in that regime.
             let spec_rows = (m.mtp_depth + 1)
                 .max(2)
                 // qwen35 DFlash verify reads logits for a whole 16-row block
