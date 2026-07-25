@@ -4432,6 +4432,31 @@ mod real {
                 // MLA/Dsv4 carry their own compact latent caches
                 Family::Mla | Family::Dsv4 => false,
             };
+            // f32 KV projection across exec layers (+ MTP slot), mirroring
+            // the per-layer sizing loop below. Only consulted for kv_ok
+            // families, so the qwen35-dense and MLA/Dsv4 shapes never reach it.
+            let kv_f32_total = || -> usize {
+                let slots = s.n_exec_layer as usize + usize::from(m.mtp.is_some());
+                (0..slots)
+                    .map(|i| {
+                        if s.family == Family::Qwen35 {
+                            if i == s.n_exec_layer as usize
+                                || (i as u32 + 1) % s.full_attn_interval == 0
+                            {
+                                2 * s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4
+                            } else {
+                                8
+                            }
+                        } else {
+                            let (hkv, hd) = match m.geom.get(i) {
+                                Some(g) => (g.n_head_kv as usize, g.head_dim as usize),
+                                None => (s.n_head_kv as usize, s.head_dim as usize),
+                            };
+                            2 * hkv * ctx as usize * hd * 4
+                        }
+                    })
+                    .sum()
+            };
             let (kvq, kvq_rot) = if kv_ok {
                 let (q, rot) = match kv_req.as_deref() {
                     Some("fp8") => (1, false),
@@ -4441,6 +4466,32 @@ mod real {
                     Some("q4_0") | Some("q4") => (5, false),
                     Some("turbo8") | Some("rotq8") | Some("turboq8") => (4, true),
                     Some("turbo4") | Some("rotq4") | Some("turboq4") => (5, true),
+                    None => {
+                        // A too-big f32 KV never OOMs on a streaming model -
+                        // it silently eats the expert cache instead (measured:
+                        // gpt-oss ctx 131072 one card, f32 left 0.4GB of
+                        // expert cache and prefill chunk 4; fp8 left 9.7GB
+                        // and chunk 256). So when nothing was requested and
+                        // the projection is both large and a big share of
+                        // the KV card's free VRAM, default to fp8. The 2GB
+                        // absolute floor keeps small-ctx runs (bench.sh 512,
+                        // check.sh 256) on the bit-exact f32 path.
+                        let total = kv_f32_total();
+                        let kv_dev = m.attn_dev.unwrap_or_else(kernels::get_device);
+                        let free = kernels::mem_info(kv_dev).map(|(f, _)| f).unwrap_or(usize::MAX);
+                        if total > (2usize << 30) && total > free / 3 {
+                            eprintln!(
+                                "pulsar: KV auto: f32 KV at ctx {} would be {:.1}GB of {:.1}GB free -> defaulting to fp8 ({:.1}GB); set PULSAR_KV=f32 to force exact f32 KV",
+                                ctx,
+                                total as f64 / 1e9,
+                                free as f64 / 1e9,
+                                total as f64 / 3.9e9,
+                            );
+                            (1, false)
+                        } else {
+                            (0, false)
+                        }
+                    }
                     _ => (0, false),
                 };
                 // Rotation writes head_dim-strided vectors into qrot, which is
@@ -5045,6 +5096,35 @@ mod real {
                         staging_bytes as f64 / 1e9,
                         st.max_batch,
                     );
+                    // A starved budget still "succeeds" - it just decodes at
+                    // a tenth of the speed (prefill chunk 4, sub-GB cache).
+                    // When the KV cache is the dominant eater on this card,
+                    // say so and name the remedy instead of leaving a
+                    // correct-looking line that hides the cause.
+                    let kv_here: usize = st
+                        .kcache
+                        .iter()
+                        .chain(st.vcache.iter())
+                        .map(|b| b.bytes())
+                        .sum();
+                    let kv_on_primary = m.attn_dev.map_or(true, |d| d == primary) && !dense_split;
+                    if kv_on_primary
+                        && (st.max_batch <= 16 || dev_bytes < (1 << 30))
+                        && kv_here > (free + kv_here) / 3
+                    {
+                        eprintln!(
+                            "pulsar: WARNING: KV cache ({:.1}GB at ctx {}) is starving the expert budget; {}",
+                            kv_here as f64 / 1e9,
+                            st.ctx,
+                            if kv_ok && kvq == 0 {
+                                "set PULSAR_KV=fp8 (~4x smaller) or lower --ctx"
+                            } else if kv_ok {
+                                "lower --ctx (KV is already quantized)"
+                            } else {
+                                "lower --ctx (this arch's KV cannot be quantized yet)"
+                            },
+                        );
+                    }
                 }
             }
 
