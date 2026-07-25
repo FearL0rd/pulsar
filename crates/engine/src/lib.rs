@@ -921,6 +921,19 @@ mod real {
         /// pure io_uring disk-fetch wait for cache misses (was hidden in host)
         pub resolve_fetch: std::time::Duration,
         pub h2d: std::time::Duration,
+        /// draining the disk prefetcher into the host store (absorb), and
+        /// how many slabs went through it - absorb evicts, and eviction
+        /// is the one O(cache) operation on the per-layer path
+        pub resolve_absorb: std::time::Duration,
+        pub absorbed: u64,
+        /// pointer/CSR build after the fetch, plus the blocking
+        /// expert_ptrs upload. That upload is ordered behind the async
+        /// expert H2D, so this bucket is dominated by PCIe drain, NOT by
+        /// the 8-entry pointer loop: measured 12.9s with experts on a
+        /// Gen4 x4 card (6.4 GB/s) vs 1.26s on Gen5 x8 (28.7 GB/s), same
+        /// work either side. A big number here means "wrong card owns the
+        /// experts", not "pointer building is slow".
+        pub resolve_ptrs: std::time::Duration,
         /// CPU expert lane wall time after the stage-A overlap (mid
         /// quantize + down-proj fan-out + join)
         pub cpu: std::time::Duration,
@@ -932,10 +945,10 @@ mod real {
         pub fn report(&self) -> String {
             let s = |d: std::time::Duration| d.as_secs_f64();
             let accounted = self.resolve_d2h + self.resolve_lists + self.resolve_host
-                + self.resolve_fetch + self.h2d;
+                + self.resolve_fetch + self.h2d + self.resolve_absorb + self.resolve_ptrs;
             let other = self.resolve.saturating_sub(accounted);
             format!(
-                "gpu-wait {:.2}s, resolve {:.2}s (d2h {:.2}s, lists {:.2}s, host {:.2}s, disk {:.2}s, h2d {:.2}s, other {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
+                "gpu-wait {:.2}s, resolve {:.2}s (d2h {:.2}s, lists {:.2}s, host {:.2}s, disk {:.2}s, h2d {:.2}s, absorb {:.2}s/{} slabs, ptrs {:.2}s, other {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
                 s(self.sync),
                 s(self.resolve),
                 s(self.resolve_d2h),
@@ -943,6 +956,9 @@ mod real {
                 s(self.resolve_host),
                 s(self.resolve_fetch),
                 s(self.h2d),
+                s(self.resolve_absorb),
+                self.absorbed,
+                s(self.resolve_ptrs),
                 s(other),
                 s(self.cpu),
                 s(self.tail),
@@ -5801,9 +5817,12 @@ mod real {
                             }
                         }
                         // absorb whatever the disk prefetcher finished
+                        let t_absorb = std::time::Instant::now();
                         while let Ok((off, slab)) = st.prefetcher.done_rx.try_recv() {
                             st.store.absorb(off, slab);
+                            st.prof.absorbed += 1;
                         }
+                        st.prof.resolve_absorb += t_absorb.elapsed();
                         let t_lists = std::time::Instant::now();
                         // gate/up/down may use different quants (K-quant
                         // recipes put ffn_down a tier higher); staging
@@ -6104,6 +6123,7 @@ mod real {
                             h2d += t.elapsed();
                         }
                         st.prof.h2d += h2d;
+                        let t_ptrs = std::time::Instant::now();
                         // sink slabs join the routed launch only when the
                         // bank shares quant AND row width; otherwise they
                         // run as a second NULL-masked launch below
@@ -6241,6 +6261,7 @@ mod real {
                                 }
                             }
                         }
+                        st.prof.resolve_ptrs += t_ptrs.elapsed();
                         st.prof.resolve += t_resolve.elapsed();
                         st.prof.calls += 1;
 
