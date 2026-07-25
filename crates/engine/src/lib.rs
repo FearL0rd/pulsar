@@ -1100,9 +1100,28 @@ mod real {
             let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<stream::Read>>();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
+                // Coalesce every pending request rather than keeping only
+                // the newest. Each send is a DIFFERENT layer's predicted
+                // experts, not a refresh of one list, so dropping a request
+                // skips that layer's prefetch entirely and its slabs come
+                // back as synchronous misses on the critical path.
+                // Coalescing also deepens the batch, which is what actually
+                // fills the drive: a ~7-read batch is latency-bound (~6GB/s
+                // measured in decode) while the same NVMe sustains 11GB/s
+                // once enough reads are in flight (fetch-bench, qd 8+).
+                // Sorted because ascending offsets read faster than the
+                // routing order, deduped because layers share slabs.
+                const COALESCE_MAX: usize = 192;
                 while let Ok(first) = req_rx.recv() {
-                    // stale requests are useless; keep only the newest
-                    let reads = req_rx.try_iter().last().unwrap_or(first);
+                    let mut reads = first;
+                    for more in req_rx.try_iter() {
+                        reads.extend(more);
+                        if reads.len() >= COALESCE_MAX {
+                            break;
+                        }
+                    }
+                    reads.sort_unstable_by_key(|r| r.offset);
+                    reads.dedup_by_key(|r| r.offset);
                     let _ = fetcher.fetch_each(&reads, |i, slab| {
                         let _ = done_tx.send((reads[i].offset, slab));
                         Ok(())
