@@ -6096,12 +6096,35 @@ mod real {
                         // holds, THEN block on the disk for the rest - so the
                         // primary GPU computes through the disk wait. It is a
                         // regression: 2.52/2.53/2.51 tok/s against 2.85/2.54/
-                        // 2.83 interleaved on GLM-5.2. Reason: the MoE kernels
-                        // are launched over the FULL n_expert_used slot range
-                        // with NULL masking, and quantize_q8_k covers
-                        // n_ff_exp * n_expert_used unconditionally, so a second
-                        // wave re-pays the whole width instead of splitting it.
-                        // Any retry has to make the launches slot-sparse first.
+                        // 2.83 interleaved on GLM-5.2.
+                        //
+                        // The first explanation here (full-width kernels: NULL-
+                        // masked launches plus an unconditional quantize_q8_k
+                        // over n_ff_exp * n_expert_used) was WRONG. Measured by
+                        // adding exactly that overhead to this path with none of
+                        // the benefit - an extra expert_ptrs upload, then that
+                        // plus the whole three-kernel chain over an all-NULL
+                        // slot array:
+                        //     baseline   2.55  2.56
+                        //     +ptrs      2.63  2.77
+                        //     +full      2.75  2.48
+                        // Both variants land at or above baseline, so the extra
+                        // launches and the extra upload cost nothing findable.
+                        // Making the launches slot-sparse would optimise work
+                        // that is not on the clock.
+                        //
+                        // What the probe did NOT replicate is the one real
+                        // difference: the split calls ensure_with TWICE, and the
+                        // disk batch goes SECOND. Single-wave issues every read,
+                        // disk included, in one call, so io_uring starts filling
+                        // immediately; the split makes the disk reads wait for
+                        // the host-hit batch to finish staging first. Disk is
+                        // ~86% of this model's decode wall, so delaying its
+                        // start lands straight on the critical path - the split
+                        // postponed the bottleneck to overlap something cheaper.
+                        // A retry must issue the cold reads FIRST (the async
+                        // prefetcher already does non-blocking fetch), compute
+                        // the resident experts while they fly, then collect.
                         // Launching the TIER partials before this wait is also
                         // neutral (2.84/2.82) - they already overlapped the
                         // primary MoE, so it just moves them under a different
