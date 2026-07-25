@@ -3,8 +3,9 @@
 //! parse time: the engine maps or streams it later by (offset, size), which
 //! is the whole point for models that dwarf RAM.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Mutex;
 
 pub const GGUF_MAGIC: u32 = 0x4655_4747; // "GGUF" little-endian
 pub const DEFAULT_ALIGNMENT: u64 = 32;
@@ -236,6 +237,11 @@ pub struct Gguf {
     pub alignment: u64,
     /// Absolute file offset where the tensor data section begins.
     pub data_offset: u64,
+    /// Names that `tensor()` has resolved. Keyed by name rather than index
+    /// so `merge_split` reordering cannot invalidate it. Interior-mutable
+    /// to keep lookups on `&Gguf`, and a Mutex because loaders share the
+    /// header across threads. See `unconsumed`.
+    consumed: Mutex<HashSet<String>>,
 }
 
 impl Gguf {
@@ -292,7 +298,14 @@ impl Gguf {
             .unwrap_or(DEFAULT_ALIGNMENT);
         let data_offset = (c.at as u64).next_multiple_of(alignment);
 
-        Ok(Gguf { version, metadata, tensors, alignment, data_offset })
+        Ok(Gguf {
+            version,
+            metadata,
+            tensors,
+            alignment,
+            data_offset,
+            consumed: Mutex::new(HashSet::new()),
+        })
     }
 
     /// Merge split-gguf shard headers into one table over a VIRTUAL file:
@@ -331,7 +344,36 @@ impl Gguf {
     }
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
-        self.tensors.iter().find(|t| t.name == name)
+        let t = self.tensors.iter().find(|t| t.name == name)?;
+        if let Ok(mut c) = self.consumed.lock() {
+            c.insert(t.name.clone());
+        }
+        Some(t)
+    }
+
+    /// Tensors the file ships that nothing ever asked for.
+    ///
+    /// A loader that does not know an architecture's extra weights reads
+    /// the ones it recognizes and silently drops the rest, so the model
+    /// runs and produces plausible but wrong output instead of failing.
+    /// gpt-oss is the worked example: 192 bias tensors that no existing
+    /// code path looks up. Checking this at load turns "why is this arch
+    /// subtly bad" into one line at startup.
+    ///
+    /// Names, not `TensorInfo`, so callers can print without borrowing the
+    /// table. Order follows the file.
+    pub fn unconsumed(&self) -> Vec<&str> {
+        let consumed = match self.consumed.lock() {
+            Ok(c) => c,
+            // a poisoned lock only means some other thread panicked mid
+            // load; the set is still readable and this is a diagnostic
+            Err(p) => p.into_inner(),
+        };
+        self.tensors
+            .iter()
+            .map(|t| t.name.as_str())
+            .filter(|n| !consumed.contains(*n))
+            .collect()
     }
 }
 

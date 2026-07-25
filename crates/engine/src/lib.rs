@@ -3302,6 +3302,39 @@ mod real {
             // allocations (draft models, probes) land on the fast card
             // instead of one the split already filled
             kernels::set_device(kernels::primary_device())?;
+            // Weights the file ships that no load path asked for. Reading a
+            // subset of an architecture's tensors is an error nowhere in the
+            // loader, so a feature we do not model (gpt-oss ships 192 bias
+            // tensors, for one) leaves a model that loads, runs, and answers
+            // plausibly while ignoring part of itself. That is the worst way
+            // to be wrong, and one pass over the table at load rules it out.
+            let n_exec = shape.n_exec_layer as usize;
+            let skipped: Vec<&str> = gguf
+                .unconsumed()
+                .into_iter()
+                .filter(|n| {
+                    // blocks past the executed depth are the MTP/nextn draft
+                    // layer, which only loads when speculation is on (Hy3
+                    // ships blk.80 over 80 exec layers). Leaving it unread is
+                    // the design, not a miss - warning about it every load
+                    // would train the eye to skip this line.
+                    n.strip_prefix("blk.")
+                        .and_then(|r| r.split('.').next())
+                        .and_then(|d| d.parse::<usize>().ok())
+                        .is_none_or(|il| il < n_exec)
+                })
+                .collect();
+            if !skipped.is_empty() {
+                const SHOW: usize = 6;
+                let more = skipped.len().saturating_sub(SHOW);
+                eprintln!(
+                    "pulsar: WARNING {} tensor(s) in this gguf were never read, so output may be \
+                     silently wrong: {}{}",
+                    skipped.len(),
+                    skipped[..skipped.len().min(SHOW)].join(", "),
+                    if more > 0 { format!(", +{more} more") } else { String::new() },
+                );
+            }
             Ok(Model {
                 path: path.to_path_buf(),
                 shards,
