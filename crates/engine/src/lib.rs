@@ -567,6 +567,12 @@ mod real {
             /// whole set is n_expert * (2*mid + out) floats, a rounding
             /// error next to one expert's quantized weights.
             exp_bias: Option<[DeviceBuf; 3]>,
+            /// gpt-oss router bias [n_expert], added to the gate logits
+            /// before selection. Distinct from `probs_b`, which is the
+            /// DeepSeek-style correction that steers selection WITHOUT
+            /// entering the weights: this one is part of the linear layer,
+            /// so it moves the softmax too.
+            gate_inp_b: Option<DeviceBuf>,
         },
     }
 
@@ -631,6 +637,10 @@ mod real {
             /// norm kernel, which still normalizes, just without a scale.
             q_norm: Option<DeviceBuf>,
             k_norm: Option<DeviceBuf>,
+            /// gpt-oss per-head attention sink [n_head]: a learned logit
+            /// that joins the softmax denominator and contributes no value,
+            /// letting a head attend to nothing. None everywhere else.
+            sinks: Option<DeviceBuf>,
         },
         Mla {
             q_a: DeviceBuf,
@@ -2920,6 +2930,11 @@ mod real {
                         // f32 and small enough to stay resident; presence is
                         // decided by the file, so an arch that grows biases
                         // later needs no code here
+                        gate_inp_b: if gguf.tensor(&t("ffn_gate_inp.bias")).is_some() {
+                            Some(upload(&file, &gguf, &t("ffn_gate_inp.bias"))?)
+                        } else {
+                            None
+                        },
                         exp_bias: if gguf.tensor(&t("ffn_gate_exps.bias")).is_some() {
                             Some([
                                 upload(&file, &gguf, &t("ffn_gate_exps.bias"))?,
@@ -2950,6 +2965,11 @@ mod real {
                         },
                         k_norm: if gguf.tensor(&t("attn_k_norm.weight")).is_some() {
                             Some(upload(&file, &gguf, &t("attn_k_norm.weight"))?)
+                        } else {
+                            None
+                        },
+                        sinks: if gguf.tensor(&t("attn_sinks.weight")).is_some() {
+                            Some(upload(&file, &gguf, &t("attn_sinks.weight"))?)
                         } else {
                             None
                         },
@@ -5137,7 +5157,7 @@ mod real {
                     Attn::Dsv4(_) | Attn::Qwen35(_) => {
                         return Err("hybrid-family layer in the shared eval path".into())
                     }
-                    Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm } => {
+                    Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm, sinks } => {
                         let (hkv, hd, theta, window) = match gm {
                             Some(g) => (g.n_head_kv, g.head_dim, g.theta, g.window),
                             None => (s.n_head_kv, s.head_dim, s.rope_freq_base, 0),
@@ -5284,7 +5304,7 @@ mod real {
                         } else {
                             &st.q
                         };
-                        kernels::gqa_attention_rel(&mut st.heads, qsrc, &st.kcache[il], &st.vcache[il], n_tok, nh_q, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq)?;
+                        kernels::gqa_attention_rel(&mut st.heads, qsrc, &st.kcache[il], &st.vcache[il], n_tok, nh_q, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq, sinks.as_ref())?;
 
                         // laguna: per-head output gate. g_proj gives one
                         // logit per (token, head); softplus of it scales
@@ -5478,7 +5498,7 @@ mod real {
                         }
                         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                     }
-                    Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, fused_up_off, down_scale, sink, exp_bias } => {
+                    Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, fused_up_off, down_scale, sink, exp_bias, gate_inp_b } => {
                         let gw = l.gemma.as_ref();
                         // inkling: shared experts ride the router as
                         // always-on slots; per-layer gscale folds into the
@@ -5498,6 +5518,11 @@ mod real {
                             // inkling's gate matmul emits the sink logits
                             // after the n_expert routed ones
                             kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert + sink_n, n_tok)?;
+                        }
+                        // part of the gate's linear layer, so it lands on
+                        // the logits before both the top-k and the softmax
+                        if let Some(gb) = gate_inp_b {
+                            kernels::add_bias_rows(&mut st.router_logits, gb, s.n_expert, n_tok)?;
                         }
                         kernels::router_select(
                             &mut st.router_selected,

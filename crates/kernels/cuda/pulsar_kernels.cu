@@ -4782,36 +4782,39 @@ extern "C" int pulsar_gqa_attention(
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
         float scale, uint32_t window,
-        const void *rel, uint32_t rel_extent, uint32_t kvq) {
+        const void *rel, uint32_t rel_extent, uint32_t kvq,
+        const void *sinks) {
     ds4_gpu_tensor ot = shim(out), qt = shim(q), kt = shim(k_cache),
                    vt = shim(v_cache);
     ds4_gpu_tensor rt = shim(rel);
     const ds4_gpu_tensor *rpt = rel ? &rt : NULL;
+    ds4_gpu_tensor st_ = shim(sinks);
+    const ds4_gpu_tensor *spt = sinks ? &st_ : NULL;
     switch (kvq) {
         case 1:
             return ds4_gpu_gqa_attention_fp8(&ot, &qt, &kt, &vt, n_tok, n_head,
                                              n_kv_head, head_dim, cap, pos0,
-                                             scale, window, rpt, rel_extent);
+                                             scale, window, rpt, rel_extent, spt);
         case 2:
             return ds4_gpu_gqa_attention_fp16(&ot, &qt, &kt, &vt, n_tok, n_head,
                                               n_kv_head, head_dim, cap, pos0,
-                                              scale, window, rpt, rel_extent);
+                                              scale, window, rpt, rel_extent, spt);
         case 3:
             return ds4_gpu_gqa_attention_int8(&ot, &qt, &kt, &vt, n_tok, n_head,
                                               n_kv_head, head_dim, cap, pos0,
-                                              scale, window, rpt, rel_extent);
+                                              scale, window, rpt, rel_extent, spt);
         case 4:
             return ds4_gpu_gqa_attention_q8_0(&ot, &qt, &kt, &vt, n_tok, n_head,
                                               n_kv_head, head_dim, cap, pos0,
-                                              scale, window, rpt, rel_extent);
+                                              scale, window, rpt, rel_extent, spt);
         case 5:
             return ds4_gpu_gqa_attention_q4_0(&ot, &qt, &kt, &vt, n_tok, n_head,
                                               n_kv_head, head_dim, cap, pos0,
-                                              scale, window, rpt, rel_extent);
+                                              scale, window, rpt, rel_extent, spt);
         default:
             return ds4_gpu_gqa_attention(&ot, &qt, &kt, &vt, n_tok, n_head,
                                          n_kv_head, head_dim, cap, pos0, scale,
-                                         window, rpt, rel_extent);
+                                         window, rpt, rel_extent, spt);
     }
 }
 

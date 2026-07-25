@@ -111,7 +111,7 @@ mod real {
         fn pulsar_gqa_head_rms_norm(x: *mut c_void, w: *const c_void, rows: u32, head_dim: u32, eps: f32) -> i32;
         fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
         fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, kvq: u32) -> i32;
-        fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32, rel: *const c_void, rel_extent: u32, kvq: u32) -> i32;
+        fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32, rel: *const c_void, rel_extent: u32, kvq: u32, sinks: *const c_void) -> i32;
 
         fn pulsar_sconv(out: *mut c_void, x: *const c_void, kern: *const c_void, state: *mut c_void, n_tok: u32, w: u32, k: u32) -> i32;
 
@@ -1034,16 +1034,16 @@ mod real {
 
     #[allow(clippy::too_many_arguments)]
     pub fn gqa_attention(out: &mut DeviceBuf, q: &DeviceBuf, k_cache: &DeviceBuf, v_cache: &DeviceBuf, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32) -> Result {
-        gqa_attention_rel(out, q, k_cache, v_cache, n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window, None, 0, 0)
+        gqa_attention_rel(out, q, k_cache, v_cache, n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window, None, 0, 0, None)
     }
 
     /// GQA attention with an optional inkling relative-position bias:
     /// rel is [n_tok][n_head][rel_extent], score(i,j) += rel[i-j] in-band.
     #[allow(clippy::too_many_arguments)]
-    pub fn gqa_attention_rel(out: &mut DeviceBuf, q: &DeviceBuf, k_cache: &DeviceBuf, v_cache: &DeviceBuf, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32, rel: Option<&DeviceBuf>, rel_extent: u32, kvq: u32) -> Result {
+    pub fn gqa_attention_rel(out: &mut DeviceBuf, q: &DeviceBuf, k_cache: &DeviceBuf, v_cache: &DeviceBuf, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32, rel: Option<&DeviceBuf>, rel_extent: u32, kvq: u32, sinks: Option<&DeviceBuf>) -> Result {
         check(
             unsafe {
-                pulsar_gqa_attention(out.ptr_mut(), q.ptr(), k_cache.ptr(), v_cache.ptr(), n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window, rel.map_or(std::ptr::null(), |r| r.ptr()), rel_extent, kvq)
+                pulsar_gqa_attention(out.ptr_mut(), q.ptr(), k_cache.ptr(), v_cache.ptr(), n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window, rel.map_or(std::ptr::null(), |r| r.ptr()), rel_extent, kvq, sinks.map_or(std::ptr::null(), |b| b.ptr()))
             },
             "gqa_attention",
         )
