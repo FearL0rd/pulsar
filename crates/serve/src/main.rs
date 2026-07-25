@@ -762,7 +762,6 @@ fn handle_chat(
     let temp = req["temperature"].as_f64().map(|v| v as f32).unwrap_or(default_temp);
     let top_p = req["top_p"].as_f64().map(|v| v as f32).unwrap_or(1.0);
     let min_p = req["min_p"].as_f64().map(|v| v as f32).unwrap_or(0.0);
-    let max_tokens = req["max_tokens"].as_u64().unwrap_or(1024) as usize;
     let seed = req["seed"].as_u64().unwrap_or(42);
     let streaming = req["stream"].as_bool().unwrap_or(false);
 
@@ -783,6 +782,17 @@ fn handle_chat(
             &serde_json::json!({"error": {"message": format!("prompt exceeds context ({} tokens, ctx {})", prompt.len(), st.ctx())}}),
         );
     }
+    // Default and ceiling are the remaining context, not a fixed number: a
+    // reasoning model spends 1k+ tokens thinking before its final channel,
+    // and a mid-thought cap hands the client a truncated monologue and no
+    // answer. An explicit max_tokens is honoured but still clamped to what
+    // the KV can hold.
+    let room = (st.ctx() as usize).saturating_sub(prompt.len() + 2);
+    let max_tokens = req["max_tokens"]
+        .as_u64()
+        .map(|v| v as usize)
+        .unwrap_or(room)
+        .min(room);
     let mut sampler = engine::Sampler::new(temp, top_p, min_p, seed);
     let id = format!("chatcmpl-{request_id}");
 
