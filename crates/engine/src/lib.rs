@@ -6086,6 +6086,68 @@ mod real {
                             }
                             st.store.pinned = pins;
                         }
+                        // ---- lane B: experts the DISK is about to deliver ----
+                        // Lane A above can only claim experts already in RAM,
+                        // so a disk-missed expert takes the most expensive
+                        // route in the engine: disk -> RAM -> PCIe -> GPU.
+                        // The bytes land in host memory anyway, so compute
+                        // them where they land and skip the bus entirely.
+                        // Unlike lane A this does NOT overlap the fetch (it
+                        // runs after), so it only pays while the CPU finishes
+                        // its share before the GPU finishes its own - hence
+                        // the cap. DEFAULT OFF: the mechanism is confirmed
+                        // (ptrs, the PCIe-drain bucket, falls 4.31 -> 3.05s on
+                        // a Gen4 x4 card) but the throughput gain is inside
+                        // the noise - slow card B=0 2.16/2.13/2.18 vs B=2
+                        // 2.29/2.14, and dead neutral on Gen5 x8 (2.90 vs
+                        // 2.91) where there is barely any PCIe cost to remove.
+                        // Worth having on a box whose experts sit on a slow
+                        // link; not worth changing the default path for.
+                        // PULSAR_CPU_B=N enables, bounding experts per layer.
+                        let lane_b_cap: usize = std::env::var("PULSAR_CPU_B")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        let mut lane_b = cpu_tier::Lane::new(
+                            gate_exps.quant, down_exps.quant,
+                            gate_exps.row_bytes as usize, down_exps.row_bytes as usize,
+                            ne, nf, s.moe_act_op,
+                        );
+                        // planned membership only - Lane::add needs the host
+                        // pointers, which do not exist until the fetch lands
+                        let mut lane_b_plan: Vec<i32> = Vec::new();
+                        let mut lane_b_offs: std::collections::HashMap<u64, i32> =
+                            std::collections::HashMap::new();
+                        if cpu_on && lane_b_cap > 0 {
+                            for &e in &distinct {
+                                if e < 0 || e as u32 >= s.n_expert || tier_of(e).is_some() {
+                                    continue;
+                                }
+                                if lane.idx.contains_key(&e) || lane_b_plan.len() >= lane_b_cap {
+                                    continue;
+                                }
+                                let [g3, u3, d3] = slabs_of(e as u32);
+                                let (go, uo, dno) =
+                                    (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
+                                if self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&go)) {
+                                    continue;
+                                }
+                                // only when ALL THREE need the disk: a mixed
+                                // expert would still pay a PCIe trip for its
+                                // resident slabs and gain nothing
+                                if st.store.contains(go) || st.store.contains(uo) || st.store.contains(dno)
+                                    || st.dev_cache.map.contains_key(&go)
+                                    || st.dev_cache.map.contains_key(&uo)
+                                    || st.dev_cache.map.contains_key(&dno)
+                                {
+                                    continue;
+                                }
+                                lane_b_plan.push(e);
+                                for o in [go, uo, dno] {
+                                    lane_b_offs.insert(o, e);
+                                }
+                            }
+                        }
                         if !lane.is_empty() {
                             let t_cpu_d2h = std::time::Instant::now();
                             let rw = st.router_weights.read_f32(n_tok as usize * n_used)?;
@@ -6163,6 +6225,8 @@ mod real {
                         if stage_total + SLAB_SLACK > st.staging.bytes() {
                             st.staging = DeviceBuf::alloc(stage_total + SLAB_SLACK)?;
                         }
+                        let mut host_ptr: std::collections::HashMap<u64, *const u8> =
+                            std::collections::HashMap::new();
                         let unified = st.unified;
                         let async_h2d = st.async_expert_h2d;
                         let mut h2d = std::time::Duration::ZERO;
@@ -6219,6 +6283,15 @@ mod real {
                                     );
                                     return Ok(());
                                 }
+                                // lane B computes this on the CPU from the
+                                // slab that just landed - keep the host
+                                // pointer and skip the PCIe trip entirely.
+                                // The whole point of the extension: these
+                                // bytes never cross the bus.
+                                if lane_b_offs.contains_key(&off) {
+                                    host_ptr.insert(off, payload.as_ptr());
+                                    return Ok(());
+                                }
                                 let t = std::time::Instant::now();
                                 let p = match dev_cache.maybe_insert(off, payload, &in_use)? {
                                     Some(p) => p,
@@ -6255,6 +6328,37 @@ mod real {
                             st.expert_h2d.record()?;
                             st.expert_h2d.wait_default()?;
                             h2d += t.elapsed();
+                        }
+                        // ---- submit lane B now its slabs are in RAM ----
+                        let mut cpu_guard_b: Option<cpu_tier::WaitGuard> = None;
+                        if !lane_b_plan.is_empty() {
+                            let mut pins = std::mem::take(&mut st.store.pinned);
+                            for &e in &lane_b_plan {
+                                let [g3, u3, d3] = slabs_of(e as u32);
+                                let (go, uo, dno) =
+                                    (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
+                                let (Some(&gp), Some(&up), Some(&dp)) =
+                                    (host_ptr.get(&go), host_ptr.get(&uo), host_ptr.get(&dno))
+                                else {
+                                    continue; // slab came from somewhere else; leave it to the GPU
+                                };
+                                lane_b.add(e, gp, unsafe { up.add(*fused_up_off as usize) }, dp);
+                                // EXTEND, never replace: lane A's pins are
+                                // still live and its workers are still reading
+                                pins.extend([go, uo, dno]);
+                            }
+                            st.store.pinned = pins;
+                            if !lane_b.is_empty() {
+                                let rw = st.router_weights.read_f32(n_tok as usize * n_used)?;
+                                let normed_h = st.normed.read_f32(n_tok as usize * ne)?;
+                                let pool = st.cpu_pool.as_ref().unwrap();
+                                cpu_guard_b = Some(cpu_tier::WaitGuard {
+                                    pool,
+                                    n: lane_b.submit_a(
+                                        pool, &selected, n_used, &normed_h, &rw, n_tok as usize,
+                                    ),
+                                });
+                            }
                         }
                         st.prof.h2d += h2d;
                         let t_ptrs = std::time::Instant::now();
@@ -6321,7 +6425,7 @@ mod real {
                                 }
                                 continue;
                             }
-                            if lane.idx.contains_key(&e) {
+                            if lane.idx.contains_key(&e) || lane_b.idx.contains_key(&e) {
                                 ptrs.push(ExpertPtrs::NULL);
                                 continue;
                             }
@@ -6647,11 +6751,25 @@ mod real {
                         // and the GPU launches above; the down-proj fan-out
                         // runs here while those kernels are in flight, then
                         // one f32 upload joins moe_out on the primary.
-                        if !lane.is_empty() {
+                        if !lane.is_empty() || !lane_b.is_empty() {
                             drop(cpu_guard.take());
+                            drop(cpu_guard_b.take());
                             let t_cpu = std::time::Instant::now();
                             let pool = st.cpu_pool.as_ref().unwrap();
-                            let acc = lane.finish(pool, n_tok as usize);
+                            let mut acc = lane.finish(pool, n_tok as usize);
+                            // fold lane B's partial into the same vector: both
+                            // are sums over disjoint routed slots, so adding
+                            // them is the same reduction the GPU would do
+                            if !lane_b.is_empty() {
+                                let b = lane_b.finish(pool, n_tok as usize);
+                                if acc.is_empty() {
+                                    acc = b;
+                                } else {
+                                    for (a, v) in acc.iter_mut().zip(b.iter()) {
+                                        *a += *v;
+                                    }
+                                }
+                            }
                             if let Some(gpu) = &verify_gpu {
                                 let mut dmax = 0f32;
                                 let mut gmax = 0f32;
@@ -6674,7 +6792,7 @@ mod real {
                                 );
                             }
                             st.store.pinned.clear();
-                            st.cpu_hits += lane.idx.len() as u64;
+                            st.cpu_hits += (lane.idx.len() + lane_b.idx.len()) as u64;
                             st.prof.cpu += t_cpu.elapsed();
                             if st.cpu_ret.bytes() < acc.len() * 4 {
                                 st.cpu_ret = DeviceBuf::alloc(acc.len() * 4)?;
