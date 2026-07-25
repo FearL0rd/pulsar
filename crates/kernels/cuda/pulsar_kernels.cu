@@ -3127,11 +3127,17 @@ extern "C" int pulsar_moe_pair_swiglu(
         uint64_t row_bytes,
         uint32_t quant,
         uint32_t act_op) {
-    if (in_dim == 0 || in_dim % PULSAR_QK_K != 0 || mid_dim == 0 ||
+    if (in_dim == 0 || mid_dim == 0 ||
         n_used == 0 || n_tok == 0 || row_bytes == 0) {
         return 0;
     }
-    const uint32_t in_blocks = in_dim / PULSAR_QK_K;
+    /* ceil, matching pulsar_moe_down: a partial tail superblock rides
+     * zero-quantized activations (see q8_K_quantize_kernel) and the weight
+     * overread lands in the PULSAR_SLAB_SLACK after each expert slab. The
+     * down path has always done this; requiring exact division here just
+     * refused models whose hidden dim is not a multiple of 256, which
+     * gpt-oss (2880) is not. */
+    const uint32_t in_blocks = (in_dim + PULSAR_QK_K - 1) / PULSAR_QK_K;
     dim3 block(32, 4, 1);
     dim3 grid((mid_dim + 3u) / 4u, n_used, n_tok);
     switch (quant) {
