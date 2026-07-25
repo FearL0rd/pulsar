@@ -3592,12 +3592,15 @@ mod real {
                 map: std::collections::HashMap::new(),
                 xin: DeviceBuf::alloc(mb as usize * s.n_embd as usize * 4)?,
                 xq: DeviceBuf::alloc(
-                    mb as usize * s.n_embd as usize / kernels::Q8_K_BLOCK_ELEMS
+                    mb as usize
+                        * (s.n_embd as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 mid: DeviceBuf::alloc(mb as usize * n_used * s.n_ff_exp as usize * 4)?,
                 midq: DeviceBuf::alloc(
-                    mb as usize * n_used * s.n_ff_exp as usize / kernels::Q8_K_BLOCK_ELEMS
+                    mb as usize
+                        * n_used
+                        * (s.n_ff_exp as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 out: DeviceBuf::alloc(mb as usize * s.n_embd as usize * 4)?,
@@ -4740,11 +4743,14 @@ mod real {
                 moe_mid: f32s(mb * s.n_expert_used * s.n_ff_exp)?,
                 moe_out: f32s(mb * s.n_embd)?,
                 xq: DeviceBuf::alloc(
-                    mb as usize * s.n_embd as usize / kernels::Q8_K_BLOCK_ELEMS
+                    mb as usize
+                        * (s.n_embd as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 midq: DeviceBuf::alloc(
-                    mb as usize * n_used * s.n_ff_exp as usize / kernels::Q8_K_BLOCK_ELEMS
+                    mb as usize
+                        * n_used
+                        * (s.n_ff_exp as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 // placeholders: the capacity solver below sizes both from
