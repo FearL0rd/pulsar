@@ -110,6 +110,7 @@ enum ChatStyle {
     Harmony,
 }
 
+#[derive(Clone)]
 pub struct ChatMarkers {
     style: ChatStyle,
     /// None on ChatML models (qwen: add_bos_token=false, no bos id).
@@ -123,6 +124,13 @@ pub struct ChatMarkers {
     aux1: u32,
     /// Full dynamic end-of-generation set from the tokenizer.
     stops: Vec<u32>,
+    /// Reasoning models whose template can suppress it (GLM) default to
+    /// OFF, because a chat UI that shows raw think tokens looks broken.
+    /// Callers that route reasoning somewhere sensible turn it on.
+    think: bool,
+    /// gpt-oss grades its reasoning in the harmony system block rather
+    /// than switching it: low | medium | high.
+    reasoning: &'static str,
 }
 
 impl ChatMarkers {
@@ -139,6 +147,8 @@ impl ChatMarkers {
                 aux0: find("<|im_middle|>")?,
                 aux1: find("<|im_system|>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("<start_of_turn>").is_some() {
@@ -152,6 +162,8 @@ impl ChatMarkers {
                 aux0: find("<end_of_turn>")?,
                 aux1: find("<end_of_turn>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("<|message_user|>").is_some() {
@@ -167,6 +179,8 @@ impl ChatMarkers {
                 aux0: find("<|end_message|>")?,
                 aux1: find("<|content_text|>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("]~b]").is_some() {
@@ -187,6 +201,8 @@ impl ChatMarkers {
                 aux0: find("[e~[")?,
                 aux1: find("<mm:think>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("<｜User｜>").is_some() {
@@ -203,6 +219,8 @@ impl ChatMarkers {
                 aux0: find("<think>")?,
                 aux1: find("</think>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("<sop>").is_some() && t.find_token("<|user|>").is_some() {
@@ -218,6 +236,12 @@ impl ChatMarkers {
                 aux0: find("<|system|>")?,
                 aux1: find("<sop>")?,
                 stops: t.stop_ids.clone(),
+                // GLM's own template defaults thinking ON at effort Max:
+                //   <|assistant|>{{ '<think></think>' if (enable_thinking is
+                //     defined and not enable_thinking) else '<think>' }}
+                // pulsar used to force it off, which is a different model.
+                think: true,
+                reasoning: "max",
             });
         }
         if t.find_token("<|im_start|>").is_some() {
@@ -232,6 +256,8 @@ impl ChatMarkers {
                 aux0: find("<|im_end|>")?,
                 aux1: find("<|im_end|>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("<assistant>").is_some() && t.find_token("</assistant>").is_some() {
@@ -255,6 +281,8 @@ impl ChatMarkers {
                 aux0: find("<think>")?,
                 aux1: find("</think>")?,
                 stops,
+                think: false,
+                reasoning: "medium",
             });
         }
         if let (Some(start), Some(msg), Some(end)) = (
@@ -294,6 +322,8 @@ impl ChatMarkers {
                 aux0: msg,
                 aux1: end,
                 stops,
+                think: false,
+                reasoning: "medium",
             });
         }
         Ok(ChatMarkers {
@@ -306,6 +336,8 @@ impl ChatMarkers {
             aux0: find("<think:opensource>")?,
             aux1: find("</think:opensource>")?,
             stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
         })
     }
 
@@ -322,13 +354,49 @@ impl ChatMarkers {
                 "You are ChatGPT, a large language model trained by OpenAI.\n\
                  Knowledge cutoff: 2024-06\n\
                  Current date: {}\n\n\
-                 Reasoning: medium\n\n\
+                 Reasoning: {}\n\n\
                  # Valid channels: analysis, commentary, final. Channel must \
                  be included for every message.",
-                today_ymd()
+                today_ymd(),
+                self.reasoning
             )),
             _ => None,
         }
+    }
+
+    /// Ask a reasoning model to think. GLM switches its template block;
+    /// gpt-oss grades effort as low|medium|high in the system preamble and
+    /// ignores anything else. Styles without a reasoning mode ignore both.
+    pub fn set_think(&mut self, on: bool) {
+        self.think = on;
+    }
+
+    /// Effort vocabularies differ by model, so clamp to the one the
+    /// template actually understands: GLM grades high|max (default max),
+    /// harmony low|medium|high (default medium). An unknown value falls
+    /// back to that style's default rather than reaching the prompt.
+    pub fn set_reasoning(&mut self, level: &str) {
+        self.reasoning = match (self.style, level) {
+            (ChatStyle::Glm, "high") => "high",
+            (ChatStyle::Glm, _) => "max",
+            (_, "low") => "low",
+            (_, "high") => "high",
+            (_, _) => "medium",
+        };
+    }
+
+    /// True when the assistant opener leaves a reasoning block OPEN, so
+    /// generation starts inside it and the first `</think>` closes it.
+    /// GLM with thinking on is the only such style: `<think>` is the last
+    /// PROMPT token, never a generated one, so a consumer that waits for an
+    /// opening tag would route the whole reply to reasoning.
+    pub fn opens_thinking(&self) -> bool {
+        self.style == ChatStyle::Glm && self.think
+    }
+
+    /// Whether this style has a reasoning mode a caller can steer.
+    pub fn reasoning_capable(&self) -> bool {
+        matches!(self.style, ChatStyle::Glm | ChatStyle::Harmony)
     }
 
     /// Conversation prologue: bos for most styles, [gMASK]<sop> for GLM.
@@ -337,6 +405,20 @@ impl ChatMarkers {
         if self.style == ChatStyle::Glm {
             v.push(self.aux1);
         }
+        v
+    }
+
+    /// GLM states its reasoning budget in a system block right after the
+    /// prologue and before tools, capitalized, and only when thinking is
+    /// on - matching `<|system|>Reasoning Effort: {{ effort | capitalize }}`
+    /// in the shipped template. Empty for every other style.
+    pub fn prologue_effort(&self, t: &Tokenizer) -> Vec<u32> {
+        if self.style != ChatStyle::Glm || !self.think {
+            return Vec::new();
+        }
+        let mut v = vec![self.aux0];
+        let label = if self.reasoning == "high" { "High" } else { "Max" };
+        v.extend(t.encode(&format!("Reasoning Effort: {label}")));
         v
     }
 
@@ -506,12 +588,20 @@ impl ChatMarkers {
             ChatStyle::Glm => {
                 let mut v = vec![self.assistant];
                 v.extend(t.encode("\n"));
-                // thinking off when the vocab carries think tokens
+                // A CLOSED, EMPTY <think></think> is GLM's documented way to
+                // suppress reasoning: the model sees thinking as already done
+                // and goes straight to the answer. Opening the block without
+                // closing it is what asks for reasoning, so `think` picks
+                // between the two rather than adding or removing a marker.
                 if let (Some(ts), Some(te)) =
                     (t.find_token("<think>"), t.find_token("</think>"))
                 {
-                    v.extend([ts, te]);
-                    v.extend(t.encode("\n"));
+                    if self.think {
+                        v.push(ts);
+                    } else {
+                        v.extend([ts, te]);
+                        v.extend(t.encode("\n"));
+                    }
                 }
                 v
             }

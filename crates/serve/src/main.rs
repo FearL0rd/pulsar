@@ -595,6 +595,7 @@ fn encode_messages(
         )
     });
     let mut ids: Vec<u32> = m.prologue();
+    ids.extend(m.prologue_effort(tok));
     let mut tools_injected = tool_text.is_none();
     // Styles that require a system block get one even when the caller sends
     // none. Harmony's channel list is not optional (gpt-oss never closes its
@@ -670,6 +671,19 @@ fn encode_messages(
 /// A client wants the reply in `content`, so everything that is not `final`
 /// becomes reasoning, the way llama.cpp splits it. Text with no channel
 /// markers passes through untouched, which is every other model here.
+/// Split a reply that STARTS inside a reasoning block (GLM with thinking
+/// on: `<think>` is the last prompt token, so the model emits reasoning
+/// first and closes with `</think>`). Everything before the close is
+/// reasoning, everything after is the reply. A reply that never closes hit
+/// the token cap mid-thought - hand it back as reasoning rather than
+/// returning an empty message.
+fn split_open_think(s: &str) -> (String, String) {
+    match s.split_once("</think>") {
+        Some((think, rest)) => (think.trim().to_string(), rest.trim().to_string()),
+        None => (s.trim().to_string(), String::new()),
+    }
+}
+
 fn split_harmony(s: &str) -> (String, String) {
     if !s.contains("<|channel|>") {
         return (String::new(), s.to_string());
@@ -895,7 +909,10 @@ fn handle_chat(
         let harmony = markers.is_harmony();
         let mut hdr = harmony; // generation opens on a channel header
         let mut hdr_buf: Vec<u8> = Vec::new();
-        let mut reasoning = false;
+        // GLM opens the think block in the PROMPT, so the stream begins
+        // inside reasoning and the first </think> ends it.
+        let open_think = markers.opens_thinking();
+        let mut reasoning = open_think;
         let mut rbytes: Vec<u8> = Vec::new();
         engine::generate_cancellable(
             model,
@@ -942,6 +959,10 @@ fn handle_chat(
                             _ if reasoning => rbytes.extend_from_slice(&d),
                             _ => bytes.extend_from_slice(&d),
                         }
+                    } else if open_think && d.as_slice() == b"</think>" {
+                        reasoning = false; // close: the reply starts here
+                    } else if open_think && reasoning {
+                        rbytes.extend_from_slice(&d);
                     } else if !FENCE.contains(&d.as_slice()) {
                         bytes.extend_from_slice(&d);
                     }
@@ -1065,7 +1086,11 @@ fn handle_chat(
         )?;
         let full = String::from_utf8_lossy(&out).into_owned();
         let (clean, calls) = extract_tool_calls(&full);
-        let (reasoning, clean) = split_harmony(&clean);
+        let (reasoning, clean) = if markers.opens_thinking() {
+            split_open_think(&clean)
+        } else {
+            split_harmony(&clean)
+        };
         let mut message = serde_json::json!({"role": "assistant", "content": clean});
         if !reasoning.is_empty() {
             message["reasoning_content"] = serde_json::json!(reasoning);

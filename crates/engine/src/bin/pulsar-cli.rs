@@ -89,6 +89,7 @@ fn run_chat(
         let mut ids = Vec::new();
         if first {
             ids.extend(markers.prologue());
+            ids.extend(markers.prologue_effort(tok));
             let dflt = markers.default_system();
             if let Some(sys) = system.as_deref().or(dflt.as_deref()) {
                 ids.extend(markers.render_system(tok, sys));
