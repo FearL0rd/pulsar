@@ -1022,6 +1022,21 @@ mod real {
         pub host_budget: usize,
         /// model bytes resident in VRAM: fixed expert tiers + the VRAM slab cache
         pub vram_resident: usize,
+        /// total KV complex bytes at the CURRENT ctx (k/v caches + the DSA
+        /// indexer key cache, across every layer and owner device). Divided
+        /// by ctx this gives bytes-per-position, which is how a caller
+        /// projects whether a different ctx would fit.
+        pub kv_bytes: usize,
+        /// The format the KV actually resolved to, after PULSAR_KV and the
+        /// size-aware auto-default were both applied. A caller showing
+        /// "auto" needs this to say WHICH format auto landed on.
+        pub kv_resolved: &'static str,
+        /// Whether that KV is already in a compact format. False means a
+        /// LARGER ctx would likely cost ~3.9x less per position than
+        /// kv_bytes implies, because the auto-sizer switches to fp8 once
+        /// the f32 projection gets big - a projection that ignores this
+        /// rejects context sizes that would in fact load.
+        pub kv_compact: bool,
         /// cumulative per-stage wall time, seconds (see Prof)
         pub prof_gpu_wait: f64,
         pub prof_resolve: f64,
@@ -4226,6 +4241,22 @@ mod real {
                 host_used: self.store.used,
                 host_budget: self.store.budget,
                 vram_resident,
+                kv_resolved: match (self.kvq, self.kvq_lat) {
+                    (1, _) | (_, 1) => "fp8",
+                    (2, _) | (_, 2) => "fp16",
+                    (3, _) => "int8",
+                    (4, _) => if self.kvq_rot { "turbo8" } else { "q8_0" },
+                    (5, _) => if self.kvq_rot { "turbo4" } else { "q4_0" },
+                    _ => "f32",
+                },
+                kv_compact: self.kvq != 0 || self.kvq_lat != 0,
+                kv_bytes: self
+                    .kcache
+                    .iter()
+                    .chain(self.vcache.iter())
+                    .chain(self.idx_kcache.iter())
+                    .map(|b| b.bytes())
+                    .sum(),
                 prof_gpu_wait: s(self.prof.sync),
                 prof_resolve: s(self.prof.resolve),
                 prof_h2d: s(self.prof.h2d),
