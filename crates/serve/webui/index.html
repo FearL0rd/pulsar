@@ -1600,15 +1600,17 @@ let ctxStops = [8192];
 let ctxFit = 0;     // largest ctx whose KV fits VRAM right now (0 = unknown/older server)
 let runningCtx = 0; // what the server is currently running (j.ctx)
 function buildCtxStops(cap, fit) {
-  const stops = [];
-  for (let v = 512; v <= cap; v *= 2) stops.push(v);
-  // The machine's real ceiling gets its own stop. Powers of two alone
-  // strand capacity: a box that fits 330641 would top out at the 262144
-  // stop, losing a fifth of the window it can actually hold.
-  if (fit > 512 && fit < cap && !stops.includes(fit)) stops.push(fit);
-  if (stops.length === 0 || stops[stops.length - 1] < cap) stops.push(cap);
-  stops.sort((a, b) => a - b);
-  return stops;
+  // Set, not array: the machine's ceiling (fit) is inserted out of order,
+  // so a "is the last element < cap" check would compare against fit and
+  // append cap a second time - two identical final stops.
+  const s = new Set();
+  for (let v = 512; v <= cap; v *= 2) s.add(v);
+  // The real ceiling gets its own stop. Powers of two alone strand
+  // capacity: a box that fits 330641 would top out at the 262144 stop,
+  // losing a fifth of the window it can actually hold.
+  if (fit > 512 && fit < cap) s.add(fit);
+  s.add(cap);
+  return [...s].filter((v) => v >= 512 && v <= cap).sort((a, b) => a - b);
 }
 function nearestStop(n) {
   let best = 0;
