@@ -1520,7 +1520,7 @@ async function loadModelList() {
     for (const m of models) {
       const opt = document.createElement("option");
       opt.value = m.id;
-      opt.textContent = stem(m.id) + "  (" + (m.bytes / 1073741824).toFixed(0) + "GB)";
+      opt.textContent = stem(m.id) + "  (" + (m.bytes / 1073741824).toFixed(0) + "GiB)";
       if (m.current) opt.selected = true;
       modelSwitch.appendChild(opt);
     }
@@ -1743,7 +1743,7 @@ function applyKvStats(j) {
   }
   // On "auto" the selected value says nothing about what the size-aware
   // default actually picked, so name the resolved format alongside the size.
-  const size = Number.isFinite(j?.kv_bytes) ? gbB(j.kv_bytes) + " GB" : "";
+  const size = Number.isFinite(j?.kv_bytes) ? gbB(j.kv_bytes) + " GiB" : "";
   const res = typeof j?.kv_resolved === "string" ? j.kv_resolved : "";
   const auto = runningKvFormat === "auto";
   kvCurrent.textContent =
@@ -1918,7 +1918,10 @@ function renderBar(barEl, legEl, segs) {
 }
 
 // Static runtime/hardware/tier rendering from a /stats snapshot.
-const gbB = (b) => (b / 1073741824).toFixed(1); // bytes → GiB, 1 decimal
+// bytes → GiB. Binary units throughout, and LABELLED GiB: these values
+// are compared against card capacities, and a decimal-GB label on a binary
+// number made a 69MiB board difference read as a 0.1GB gap.
+const gbB = (b) => (b / 1073741824).toFixed(1);
 function applyStats(j) {
   const hw = j?.hardware || {};
   const gb = (kb) => (kb / 1048576).toFixed(0);
@@ -1937,14 +1940,14 @@ function applyStats(j) {
     k.textContent = "G" + g.dev;
     const v = document.createElement("span");
     v.className = "v v-name";
-    v.textContent = nm + " · " + gbB(g.vram_total) + " GB";
-    v.title = (g.name || "") + " — " + gbB(g.vram_total) + " GB VRAM";
+    v.textContent = nm + " · " + gbB(g.vram_total) + " GiB";
+    v.title = (g.name || "") + " — " + gbB(g.vram_total) + " GiB VRAM";
     row.appendChild(k);
     row.appendChild(v);
     gEl.appendChild(row);
   });
   $("hw-ram").textContent = Number.isFinite(hw.ram_total_kb)
-    ? gb(hw.ram_total_kb) + " GB (" + gb(hw.ram_available_kb || 0) + " free)"
+    ? gb(hw.ram_total_kb) + " GiB (" + gb(hw.ram_available_kb || 0) + " free)"
     : "—";
   $("hw-cores").textContent = Number.isFinite(hw.cores) ? String(hw.cores) : "—";
   if (j?.model) {
@@ -1969,9 +1972,9 @@ function applyStats(j) {
   const rz = j?.residency || {};
   const rTot = (rz.vram || 0) + (rz.ram || 0) + (rz.disk || 0);
   renderBar($("resid-bar"), $("resid-legend"), [
-    { cls: "seg-a", label: "VRAM", pct: rTot > 0 ? (rz.vram || 0) / rTot * 100 : 0, text: gbB(rz.vram || 0) + " GB" },
-    { cls: "seg-c", label: "RAM", pct: rTot > 0 ? (rz.ram || 0) / rTot * 100 : 0, text: gbB(rz.ram || 0) + " GB" },
-    { cls: "seg-d", label: "disk", pct: rTot > 0 ? (rz.disk || 0) / rTot * 100 : 0, text: gbB(rz.disk || 0) + " GB" },
+    { cls: "seg-a", label: "VRAM", pct: rTot > 0 ? (rz.vram || 0) / rTot * 100 : 0, text: gbB(rz.vram || 0) + " GiB" },
+    { cls: "seg-c", label: "RAM", pct: rTot > 0 ? (rz.ram || 0) / rTot * 100 : 0, text: gbB(rz.ram || 0) + " GiB" },
+    { cls: "seg-d", label: "disk", pct: rTot > 0 ? (rz.disk || 0) / rTot * 100 : 0, text: gbB(rz.disk || 0) + " GiB" },
   ]);
   renderGpuBars(gpus);
   setChips(controller ? "busy" : "idle");
@@ -2041,7 +2044,7 @@ function renderGpuBars(gpus) {
     track.appendChild(fill);
     const val = document.createElement("span");
     val.className = "gpu-val";
-    val.textContent = gbB(g.vram_used) + "/" + (g.vram_total / 1073741824).toFixed(0) + " GB";
+    val.textContent = gbB(g.vram_used) + "/" + (g.vram_total / 1073741824).toFixed(0) + " GiB";
     row.appendChild(label);
     row.appendChild(track);
     row.appendChild(val);

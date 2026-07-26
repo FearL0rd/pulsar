@@ -15,6 +15,13 @@
 
 #[cfg(target_os = "linux")]
 mod real {
+    /// Bytes per GiB. Memory sizes are reported in GiB everywhere so a
+    /// printed number can be compared directly against a card's capacity;
+    /// mixing decimal GB with binary GiB under one "GB" label made a 69MiB
+    /// board difference read as a 0.1GB gap. Throughput stays decimal GB/s,
+    /// which is the convention for PCIe and NVMe.
+    const GIB: f64 = (1u64 << 30) as f64;
+
     mod dsv4;
     mod qwen35;
     pub use qwen35::{generate_dflash, DraftModel};
@@ -2754,9 +2761,9 @@ mod real {
                 }
                 let b1: u64 = lbytes[n0..].iter().sum();
                 eprintln!(
-                    "pulsar: dense split: layers 0..{n0} on device {primary}, {n0}..{} on device {second} ({:.1}GB)",
+                    "pulsar: dense split: layers 0..{n0} on device {primary}, {n0}..{} on device {second} ({:.1}GiB)",
                     lbytes.len(),
-                    b1 as f64 / 1e9
+                    b1 as f64 / GIB
                 );
             }
 
@@ -2971,10 +2978,10 @@ mod real {
                     let cap = (free as i64) - (9i64 << 30);
                     if cap > 0 && attn_vram_budget > cap {
                         eprintln!(
-                            "pulsar: attn VRAM budget clamped {:.1} -> {:.1}GB (free {:.1}GB)",
-                            attn_vram_budget as f64 / 1e9,
-                            cap as f64 / 1e9,
-                            free as f64 / 1e9
+                            "pulsar: attn VRAM budget clamped {:.1} -> {:.1}GiB (free {:.1}GiB)",
+                            attn_vram_budget as f64 / GIB,
+                            cap as f64 / GIB,
+                            free as f64 / GIB
                         );
                         attn_vram_budget = cap;
                     }
@@ -3469,15 +3476,15 @@ mod real {
                                     }
                                 }
                                 eprintln!(
-                                    "pulsar: MTP draft experts resident ({:.1}GB, all {} triples)",
-                                    total as f64 / 1e9,
+                                    "pulsar: MTP draft experts resident ({:.1}GiB, all {} triples)",
+                                    total as f64 / GIB,
                                     shape.n_expert
                                 );
                                 res_pool = pool;
                             }
                             Err(_) => eprintln!(
-                                "pulsar: MTP expert residency didn't fit ({:.1}GB needed) - drafts will stream",
-                                total as f64 / 1e9
+                                "pulsar: MTP expert residency didn't fit ({:.1}GiB needed) - drafts will stream",
+                                total as f64 / GIB
                             ),
                         }
                     }
@@ -3779,9 +3786,9 @@ mod real {
             }
             kernels::set_device(primary)?;
             eprintln!(
-                "pulsar: expert tier on CUDA device {d}: {} triples ({:.1}GB) resident in {:.1}s",
+                "pulsar: expert tier on CUDA device {d}: {} triples ({:.1}GiB) resident in {:.1}s",
                 tier.map.len() / 3,
-                cursor as f64 / 1e9,
+                cursor as f64 / GIB,
                 t0.elapsed().as_secs_f32()
             );
             tiers.push(tier);
@@ -4596,10 +4603,10 @@ mod real {
                 let free = kernels::mem_info(kv_dev).map(|(f, _)| f).unwrap_or(usize::MAX);
                 if total > (2usize << 30) && total > free / 3 {
                     eprintln!(
-                        "pulsar: KV auto: f32 KV at ctx {} would be {:.1}GB of {:.1}GB free -> defaulting to fp8 ({:.1}GB); set PULSAR_KV=f32 to force exact f32 KV",
+                        "pulsar: KV auto: f32 KV at ctx {} would be {:.1}GiB of {:.1}GiB free -> defaulting to fp8 ({:.1}GiB); set PULSAR_KV=f32 to force exact f32 KV",
                         ctx,
-                        total as f64 / 1e9,
-                        free as f64 / 1e9,
+                        total as f64 / GIB,
+                        free as f64 / GIB,
                         total as f64 / 3.9e9,
                     );
                     true
@@ -4720,9 +4727,9 @@ mod real {
                     _ => if kvq_rot { "turbo4" } else { "q4_0" },
                 };
                 eprintln!(
-                    "pulsar: {name} KV cache on ({:.2} GB -> {:.2} GB over {} layers)",
-                    (full * 2 * s.n_exec_layer as usize) as f64 / 1e9,
-                    ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / 1e9,
+                    "pulsar: {name} KV cache on ({:.2} GiB -> {:.2} GiB over {} layers)",
+                    (full * 2 * s.n_exec_layer as usize) as f64 / GIB,
+                    ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / GIB,
                     s.n_exec_layer,
                 );
                 // q8_0/q4_0 kernels require 32-wide blocks; a non-multiple head_dim
@@ -4744,10 +4751,10 @@ mod real {
             if kvq_lat != 0 {
                 let full = (s.n_kv_lora + s.qk_rope) as usize * ctx as usize * 4;
                 eprintln!(
-                    "pulsar: {} MLA latent KV cache on ({:.2} GB -> {:.2} GB over {} layers)",
+                    "pulsar: {} MLA latent KV cache on ({:.2} GiB -> {:.2} GiB over {} layers)",
                     if kvq_lat == 1 { "fp8" } else { "fp16" },
-                    (full * s.n_exec_layer as usize) as f64 / 1e9,
-                    ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / 1e9,
+                    (full * s.n_exec_layer as usize) as f64 / GIB,
+                    ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / GIB,
                     s.n_exec_layer,
                 );
             }
@@ -5320,10 +5327,10 @@ mod real {
                     st.staging_alt = DeviceBuf::alloc(1)?;
                     st.max_batch = (chunk as u32).clamp(1, st.max_batch);
                     eprintln!(
-                        "pulsar: auto budget: {:.1}GB VRAM free -> expert cache {:.1}GB, staging {:.1}GB, prefill chunk {}",
-                        free as f64 / 1e9,
-                        dev_bytes as f64 / 1e9,
-                        staging_bytes as f64 / 1e9,
+                        "pulsar: auto budget: {:.1}GiB VRAM free -> expert cache {:.1}GiB, staging {:.1}GiB, prefill chunk {}",
+                        free as f64 / GIB,
+                        dev_bytes as f64 / GIB,
+                        staging_bytes as f64 / GIB,
                         st.max_batch,
                     );
                     // A starved budget still "succeeds" - it just decodes at
@@ -5343,8 +5350,8 @@ mod real {
                         && kv_here > (free + kv_here) / 3
                     {
                         eprintln!(
-                            "pulsar: WARNING: KV cache ({:.1}GB at ctx {}) is starving the expert budget; {}",
-                            kv_here as f64 / 1e9,
+                            "pulsar: WARNING: KV cache ({:.1}GiB at ctx {}) is starving the expert budget; {}",
+                            kv_here as f64 / GIB,
                             st.ctx,
                             if (kv_ok && kvq == 0) || (kv_lat_ok && kvq_lat == 0) {
                                 "set PULSAR_KV=fp8 (~4x smaller) or lower --ctx"
