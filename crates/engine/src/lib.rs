@@ -4733,9 +4733,13 @@ mod real {
             // n_kv_slots, not n_exec_layer: the MTP draft layer runs the
             // same MLA path as slot n_exec_layer and maintains its own
             // indexer keys
+            // f16 keys by default; fp8 (e4m3 + f32 row scale) rides the
+            // same PULSAR_KV=fp8 that quantizes the latent cache
+            let idx8 = (kvq_lat == 1) as u32;
+            let idx_row = if idx8 != 0 { s.n_idx_dim as usize + 4 } else { s.n_idx_dim as usize * 2 };
             for il in 0..n_kv_slots {
                 idx_kcache.push(if has_idx && uses_full_indexer(il, s.n_leading_dense) {
-                    DeviceBuf::alloc(ctx as usize * s.n_idx_dim as usize * 2)? // f16 keys
+                    DeviceBuf::alloc(ctx as usize * idx_row)?
                 } else {
                     f32s(1)?
                 });
@@ -5670,7 +5674,7 @@ mod real {
                             // maintain this layer's indexer K cache (xin =
                             // the attn-device copy of normed under offload)
                             kernels::matmul_q8_0(&mut st.idx_kraw, &idx.k, xin, s.n_embd, s.n_idx_dim, n_tok)?;
-                            kernels::idx_store_k(&st.idx_kraw, &idx.k_norm, &idx.k_norm_b, &mut st.idx_kcache[il], pos0, n_tok, st.ctx, s.n_idx_dim, s.qk_rope, s.rms_eps, &s.rope_cfg(), 0.0, 1.0)?;
+                            kernels::idx_store_k(&st.idx_kraw, &idx.k_norm, &idx.k_norm_b, &mut st.idx_kcache[il], pos0, n_tok, st.ctx, s.n_idx_dim, s.qk_rope, s.rms_eps, &s.rope_cfg(), 0.0, 1.0, (st.kvq_lat == 1) as u32)?;
                         }
                         let n_sel = if topk == 0 || visible <= topk {
                             kernels::mla_fill_selected_range(&mut st.mla_selected, n_tok, pos0, visible, st.ctx)?;
@@ -5692,13 +5696,13 @@ mod real {
                             }
                             let scale = 1.0 / ((s.n_idx_dim * s.n_idx_head) as f32).sqrt();
                             if n_tok == 1 {
-                                kernels::idx_score_one(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], visible, s.n_idx_head, s.n_idx_dim, scale)?;
+                                kernels::idx_score_one(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], visible, s.n_idx_head, s.n_idx_dim, scale, (st.kvq_lat == 1) as u32)?;
                                 kernels::idx_topk(&mut st.mla_selected, &st.idx_scores, visible, topk)?;
                             } else {
                                 // batch: every token in a post-boundary
                                 // chunk has >= top_k visible rows (the
                                 // forward_rows split guarantees it)
-                                kernels::idx_scores_batch(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], Some(&mut st.idx_q16), visible, n_tok, pos0, s.n_idx_head, s.n_idx_dim, scale)?;
+                                kernels::idx_scores_batch(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], Some(&mut st.idx_q16), visible, n_tok, pos0, s.n_idx_head, s.n_idx_dim, scale, (st.kvq_lat == 1) as u32)?;
                                 kernels::idx_topk_batch(&mut st.mla_selected, &st.idx_scores, visible, n_tok, topk)?;
                             }
                             st.idx_last_sel = topk;
