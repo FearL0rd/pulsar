@@ -153,10 +153,10 @@ mod real {
         fn pulsar_qwen35_row_sigmoid_scale(x: *mut c_void, s: *const c_void, n_rows: u32, dim: u32) -> i32;
         fn pulsar_qwen35_selftest() -> i32;
         fn pulsar_mla_kv_lora_rms_norm(out: *mut c_void, kv_raw: *const c_void, w: *const c_void, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> i32;
-        fn pulsar_mla_store_compact_kv(kv_lora_cache: *mut c_void, k_rope_cache: *mut c_void, kv_norm: *const c_void, kv_raw: *const c_void, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32) -> i32;
+        fn pulsar_mla_store_compact_kv(kv_lora_cache: *mut c_void, k_rope_cache: *mut c_void, kv_norm: *const c_void, kv_raw: *const c_void, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32, kvq: u32) -> i32;
         fn pulsar_mla_fill_selected_range(selected: *mut c_void, n_tok: u32, pos0: u32, n_selected: u32, pad_row: u32) -> i32;
         fn pulsar_mla_qk_lowrank(qk_low: *mut c_void, q: *const c_void, k_b: *const c_void, n_tok: u32, n_head: u32, kv_lora_dim: u32, qk_nope: u32, qk_dim: u32) -> i32;
-        fn pulsar_mla_attention(heads: *mut c_void, q: *const c_void, qk_low: *const c_void, kv_lora_cache: *const c_void, k_rope_cache: *const c_void, v_b: *const c_void, selected: *const c_void, n_tok: u32, n_selected: u32, cache_cap: u32, n_head: u32, kv_lora_dim: u32, qk_nope: u32, qk_rope: u32, value_dim: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, kq_mult: f32) -> i32;
+        fn pulsar_mla_attention(heads: *mut c_void, q: *const c_void, qk_low: *const c_void, kv_lora_cache: *const c_void, k_rope_cache: *const c_void, v_b: *const c_void, selected: *const c_void, n_tok: u32, n_selected: u32, cache_cap: u32, n_head: u32, kv_lora_dim: u32, qk_nope: u32, qk_rope: u32, value_dim: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, kq_mult: f32, kvq: u32) -> i32;
     }
 
     /// RoPE/YaRN configuration for the MLA family. GLM-5.2 ships
@@ -1312,10 +1312,10 @@ mod real {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn mla_store_compact_kv(kv_lora_cache: &mut DeviceBuf, k_rope_cache: &mut DeviceBuf, kv_norm: &DeviceBuf, kv_raw: &DeviceBuf, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32) -> Result {
+    pub fn mla_store_compact_kv(kv_lora_cache: &mut DeviceBuf, k_rope_cache: &mut DeviceBuf, kv_norm: &DeviceBuf, kv_raw: &DeviceBuf, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32, kvq: u32) -> Result {
         check(
             unsafe {
-                pulsar_mla_store_compact_kv(kv_lora_cache.ptr_mut(), k_rope_cache.ptr_mut(), kv_norm.ptr(), kv_raw.ptr(), pos0, n_tok, cache_cap, kv_raw_dim, kv_lora_dim, qk_rope)
+                pulsar_mla_store_compact_kv(kv_lora_cache.ptr_mut(), k_rope_cache.ptr_mut(), kv_norm.ptr(), kv_raw.ptr(), pos0, n_tok, cache_cap, kv_raw_dim, kv_lora_dim, qk_rope, kvq)
             },
             "mla_store_compact_kv",
         )
@@ -1339,10 +1339,10 @@ mod real {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn mla_attention(heads: &mut DeviceBuf, q: &DeviceBuf, qk_low: &DeviceBuf, kv_lora_cache: &DeviceBuf, k_rope_cache: &DeviceBuf, v_b: &DeviceBuf, selected: &DeviceBuf, n_tok: u32, n_selected: u32, cache_cap: u32, n_head: u32, kv_lora_dim: u32, qk_nope: u32, qk_rope: u32, value_dim: u32, r: &RopeCfg) -> Result {
+    pub fn mla_attention(heads: &mut DeviceBuf, q: &DeviceBuf, qk_low: &DeviceBuf, kv_lora_cache: &DeviceBuf, k_rope_cache: &DeviceBuf, v_b: &DeviceBuf, selected: &DeviceBuf, n_tok: u32, n_selected: u32, cache_cap: u32, n_head: u32, kv_lora_dim: u32, qk_nope: u32, qk_rope: u32, value_dim: u32, r: &RopeCfg, kvq: u32) -> Result {
         check(
             unsafe {
-                pulsar_mla_attention(heads.ptr_mut(), q.ptr(), qk_low.ptr(), kv_lora_cache.ptr(), k_rope_cache.ptr(), v_b.ptr(), selected.ptr(), n_tok, n_selected, cache_cap, n_head, kv_lora_dim, qk_nope, qk_rope, value_dim, r.n_ctx_orig, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor, r.beta_fast, r.beta_slow, r.kq_mult)
+                pulsar_mla_attention(heads.ptr_mut(), q.ptr(), qk_low.ptr(), kv_lora_cache.ptr(), k_rope_cache.ptr(), v_b.ptr(), selected.ptr(), n_tok, n_selected, cache_cap, n_head, kv_lora_dim, qk_nope, qk_rope, value_dim, r.n_ctx_orig, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor, r.beta_fast, r.beta_slow, r.kq_mult, kvq)
             },
             "mla_attention",
         )

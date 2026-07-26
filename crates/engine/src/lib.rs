@@ -3763,9 +3763,13 @@ mod real {
         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
         /// 5=q4_0. All lossy formats opt-in via PULSAR_KV=<fmt>; the
-        /// default f32 path keeps bit-exact guarantees. MLA/Dsv4 keep
-        /// their own caches as-is.
+        /// default f32 path keeps bit-exact guarantees. Dsv4 keeps its
+        /// own cache as-is.
         kvq: u32,
+        /// MLA latent KV storage format. 0=f32, 1=fp8 e4m3 + per-row
+        /// scale, 2=fp16. Applies to both the latent rows and the rope
+        /// tail; strides must match mla_lat_stride on the kernel side.
+        kvq_lat: u32,
         /// Whether K/Q are rotated by `pi` (orthogonal Π) before block-quant.
         /// turbo4/turbo8 set this true. Drops back to false with a warning if
         /// qk_dim exceeds head_dim (q and qrot strides would disagree) or if Π
@@ -4432,14 +4436,21 @@ mod real {
                 // MLA/Dsv4 carry their own compact latent caches
                 Family::Mla | Family::Dsv4 => false,
             };
+            // The MLA latent cache has its own quantized formats (fp8/fp16,
+            // kvq_lat below) through mla_store_compact_kv/mla_attention;
+            // Dsv4 keeps its reference fp8-sim path and stays f32 here.
+            let kv_lat_ok = s.family == Family::Mla;
             // f32 KV projection across exec layers (+ MTP slot), mirroring
-            // the per-layer sizing loop below. Only consulted for kv_ok
-            // families, so the qwen35-dense and MLA/Dsv4 shapes never reach it.
+            // the per-layer sizing loop below. Only consulted for kv_ok /
+            // kv_lat_ok families, so the qwen35-dense and Dsv4 shapes never
+            // reach it.
             let kv_f32_total = || -> usize {
                 let slots = s.n_exec_layer as usize + usize::from(m.mtp.is_some());
                 (0..slots)
                     .map(|i| {
-                        if s.family == Family::Qwen35 {
+                        if s.family == Family::Mla {
+                            (s.n_kv_lora + s.qk_rope) as usize * ctx as usize * 4
+                        } else if s.family == Family::Qwen35 {
                             if i == s.n_exec_layer as usize
                                 || (i as u32 + 1) % s.full_attn_interval == 0
                             {
@@ -4456,6 +4467,26 @@ mod real {
                         }
                     })
                     .sum()
+            };
+            // Shared adaptive-default rule (see the None arm below for the
+            // full rationale): big f32 KV on a streaming model silently
+            // starves the expert cache, so above 2GB absolute AND a third
+            // of the KV card's free VRAM the default flips to fp8.
+            let kv_auto_fp8 = |total: usize| -> bool {
+                let kv_dev = m.attn_dev.unwrap_or_else(kernels::get_device);
+                let free = kernels::mem_info(kv_dev).map(|(f, _)| f).unwrap_or(usize::MAX);
+                if total > (2usize << 30) && total > free / 3 {
+                    eprintln!(
+                        "pulsar: KV auto: f32 KV at ctx {} would be {:.1}GB of {:.1}GB free -> defaulting to fp8 ({:.1}GB); set PULSAR_KV=f32 to force exact f32 KV",
+                        ctx,
+                        total as f64 / 1e9,
+                        free as f64 / 1e9,
+                        total as f64 / 3.9e9,
+                    );
+                    true
+                } else {
+                    false
+                }
             };
             let (kvq, kvq_rot) = if kv_ok {
                 let (q, rot) = match kv_req.as_deref() {
@@ -4476,21 +4507,7 @@ mod real {
                         // the KV card's free VRAM, default to fp8. The 2GB
                         // absolute floor keeps small-ctx runs (bench.sh 512,
                         // check.sh 256) on the bit-exact f32 path.
-                        let total = kv_f32_total();
-                        let kv_dev = m.attn_dev.unwrap_or_else(kernels::get_device);
-                        let free = kernels::mem_info(kv_dev).map(|(f, _)| f).unwrap_or(usize::MAX);
-                        if total > (2usize << 30) && total > free / 3 {
-                            eprintln!(
-                                "pulsar: KV auto: f32 KV at ctx {} would be {:.1}GB of {:.1}GB free -> defaulting to fp8 ({:.1}GB); set PULSAR_KV=f32 to force exact f32 KV",
-                                ctx,
-                                total as f64 / 1e9,
-                                free as f64 / 1e9,
-                                total as f64 / 3.9e9,
-                            );
-                            (1, false)
-                        } else {
-                            (0, false)
-                        }
+                        if kv_auto_fp8(kv_f32_total()) { (1, false) } else { (0, false) }
                     }
                     _ => (0, false),
                 };
@@ -4513,13 +4530,34 @@ mod real {
                     (q, rot)
                 }
             } else {
-                if kv_req.as_deref().is_some_and(|v| !v.is_empty() && v != "f32") {
+                if !kv_lat_ok && kv_req.as_deref().is_some_and(|v| !v.is_empty() && v != "f32") {
                     eprintln!(
                         "pulsar: PULSAR_KV={} ignored - this arch keeps its f32 KV cache (quantized KV unsupported here)",
                         kv_req.as_deref().unwrap_or("")
                     );
                 }
                 (0, false)
+            };
+            // MLA latent storage format: 0=f32 (exact), 1=fp8 e4m3 +
+            // per-row scale (~3.9x), 2=fp16 (2x). Block formats need
+            // head-shaped rows, which the flat latent is not.
+            let kvq_lat: u32 = if kv_lat_ok {
+                match kv_req.as_deref() {
+                    Some("fp8") => 1,
+                    Some("fp16") | Some("f16") => 2,
+                    None => {
+                        if kv_auto_fp8(kv_f32_total()) { 1 } else { 0 }
+                    }
+                    Some(v) if !v.is_empty() && v != "f32" => {
+                        eprintln!(
+                            "pulsar: PULSAR_KV={v} unsupported for the MLA latent cache (fp8|fp16|f32 only) - keeping f32"
+                        );
+                        0
+                    }
+                    _ => 0,
+                }
+            } else {
+                0
             };
             let kv_row = |hd: usize| match kvq {
                 0 => hd * 4,
@@ -4529,14 +4567,21 @@ mod real {
                 5 => (hd / 32) * 18,  // q4_0: 18 B / 32 elems
                 _ => hd * 4,
             };
+            // fp8 latent rows carry one f32 scale at the tail, mirroring
+            // the GQA fp8 layout (and mla_lat_stride on the kernel side)
+            let lat_row = |d: usize| match kvq_lat {
+                1 => d + 4,
+                2 => d * 2,
+                _ => d * 4,
+            };
             let (k_bytes, v_bytes) = match s.family {
                 Family::Gqa => {
                     let b = s.n_head_kv as usize * ctx as usize * kv_row(s.head_dim as usize);
                     (b, b)
                 }
                 Family::Mla => (
-                    ctx as usize * s.n_kv_lora as usize * 4,
-                    ctx as usize * s.qk_rope as usize * 4,
+                    ctx as usize * lat_row(s.n_kv_lora as usize),
+                    ctx as usize * lat_row(s.qk_rope as usize),
                 ),
                 // raw SWA ring in kcache; the compressed-row cache rides
                 // vcache, sized per layer in the loop below
@@ -4576,6 +4621,16 @@ mod real {
                         s.head_dim,
                     );
                 }
+            }
+            if kvq_lat != 0 {
+                let full = (s.n_kv_lora + s.qk_rope) as usize * ctx as usize * 4;
+                eprintln!(
+                    "pulsar: {} MLA latent KV cache on ({:.2} GB -> {:.2} GB over {} layers)",
+                    if kvq_lat == 1 { "fp8" } else { "fp16" },
+                    (full * s.n_exec_layer as usize) as f64 / 1e9,
+                    ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / 1e9,
+                    s.n_exec_layer,
+                );
             }
             // batch prefill: activations sized for max_batch tokens; the
             // logits/lm-head path stays single-row (last token only)
@@ -4887,6 +4942,7 @@ mod real {
                 kcache,
                 vcache,
                 kvq,
+                kvq_lat,
                 kvq_rot,
                 pi,
                 krot,
@@ -5116,9 +5172,9 @@ mod real {
                             "pulsar: WARNING: KV cache ({:.1}GB at ctx {}) is starving the expert budget; {}",
                             kv_here as f64 / 1e9,
                             st.ctx,
-                            if kv_ok && kvq == 0 {
+                            if (kv_ok && kvq == 0) || (kv_lat_ok && kvq_lat == 0) {
                                 "set PULSAR_KV=fp8 (~4x smaller) or lower --ctx"
-                            } else if kv_ok {
+                            } else if kv_ok || kv_lat_ok {
                                 "lower --ctx (KV is already quantized)"
                             } else {
                                 "lower --ctx (this arch's KV cannot be quantized yet)"
@@ -5601,7 +5657,7 @@ mod real {
                         kernels::mla_rope_tail(&mut st.q, n_tok, s.n_head, s.qk_dim(), s.qk_rope, pos0, &rope)?;
                         kernels::matmul_q8_0(&mut st.kv_raw, kv_a_w, xin, s.n_embd, kv_raw_dim, n_tok)?;
                         kernels::mla_kv_lora_rms_norm(&mut st.kv_norm, &st.kv_raw, kv_a_norm, n_tok, kv_raw_dim, s.n_kv_lora, eps)?;
-                        kernels::mla_store_compact_kv(&mut st.kcache[il], &mut st.vcache[il], &st.kv_norm, &st.kv_raw, pos0, n_tok, st.ctx, kv_raw_dim, s.n_kv_lora, s.qk_rope)?;
+                        kernels::mla_store_compact_kv(&mut st.kcache[il], &mut st.vcache[il], &st.kv_norm, &st.kv_raw, pos0, n_tok, st.ctx, kv_raw_dim, s.n_kv_lora, s.qk_rope, st.kvq_lat)?;
                         // DSA selection: within top_k every token sees the
                         // full range (bit-identical to the pre-indexer
                         // path). Beyond it, indexer layers score + top-k
@@ -5655,7 +5711,7 @@ mod real {
                             st.idx_last_sel
                         };
                         kernels::mla_qk_lowrank(&mut st.qk_low, &st.q, k_b_w, n_tok, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_dim())?;
-                        kernels::mla_attention(&mut st.heads, &st.q, &st.qk_low, &st.kcache[il], &st.vcache[il], v_b_w, &st.mla_selected, n_tok, n_sel, st.ctx, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_rope, s.value_mla, &rope)?;
+                        kernels::mla_attention(&mut st.heads, &st.q, &st.qk_low, &st.kcache[il], &st.vcache[il], v_b_w, &st.mla_selected, n_tok, n_sel, st.ctx, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_rope, s.value_mla, &rope, st.kvq_lat)?;
 
                         // output projection on the attn GPU, hop back,
                         // restore the primary for the ffn/expert half
