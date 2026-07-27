@@ -1185,6 +1185,18 @@ typedef struct {
     uint8_t qs[3 * PULSAR_QK_K / 8]; /* 256 grid bytes + 8 aux u32 */
 } block_iq3_xxs;
 
+/* iq2_s: 256 values in 82 bytes. qs holds BOTH the 32 low index bytes and,
+ * from offset QK_K/8, 32 explicit sign bytes; qh supplies 2 more index bits
+ * per element (10-bit index into the 1024-entry grid); scales carries two
+ * 4-bit scales per group of 32. Scale convention matches iq2_xs:
+ * d*(0.5+n)*0.25 == 0.125*d*(2n+1), so the integer accumulate is identical. */
+typedef struct {
+    uint16_t d;
+    uint8_t qs[PULSAR_QK_K / 4];    /* 64: 32 index bytes then 32 sign bytes */
+    uint8_t qh[PULSAR_QK_K / 32];   /* 8:  2 index bits per element */
+    uint8_t scales[PULSAR_QK_K / 32]; /* 8: two 4-bit scales each */
+} block_iq2_s;                      /* 82 bytes */
+
 /* iq3_s: 256 values. Unlike iq3_xxs (which packs a 7-bit ksigns INDEX and a
  * 5-bit scale into an aux u32), iq3_s stores explicit sign BYTES, a 9th grid
  * bit per pair in qh, and 4-bit scales - 110 bytes total. */
@@ -1643,6 +1655,41 @@ __device__ static float dev_dot_iq2_xs_q8_K_block(
     return 0.125f * xd * y->d * sumf;
 }
 
+/* iq2_s: same 8-groups-of-32, 4-subgroups-of-8 shape as iq2_xs, and the same
+ * two-scales-per-group accumulate. Differences are only in how the grid index
+ * and the sign mask are built: a 10-bit index (qs byte + 2 bits from qh)
+ * instead of 9, and explicit sign BYTES instead of a ksigns lookup. */
+__device__ static float dev_dot_iq2_s_q8_K_block(
+        const block_iq2_s *x, const block_q8_K *y, const uint64_t *grid) {
+    const float xd = f16_to_f32(x->d);
+    const int8_t *q8 = y->qs;
+    const uint8_t *sgn_base = x->qs + PULSAR_QK_K / 8; /* 32 sign bytes */
+    float sumf = 0.0f;
+    for (int g = 0; g < 8; g++) { /* 8 groups of 32 values */
+        const int ls1 = 2 * (x->scales[g] & 0x0f) + 1;
+        const int ls2 = 2 * (x->scales[g] >> 4) + 1;
+        const uint32_t qh = x->qh[g];
+        int s1 = 0, s2 = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const uint32_t idx = (uint32_t)x->qs[g * 4 + j]
+                               | ((qh << (8 - 2 * j)) & 0x300u);
+            const uint64_t gr = grid[idx];
+            const uint32_t sgn = (uint32_t)sgn_base[g * 4 + j] * 0x01010101u;
+            const int32_t sm0 = __vcmpne4(sgn & 0x08040201u, 0);
+            const int32_t sm1 = __vcmpne4(sgn & 0x80402010u, 0);
+            const int32_t w0 = __vsub4((int32_t)(uint32_t)gr ^ sm0, sm0);
+            const int32_t w1 = __vsub4((int32_t)(uint32_t)(gr >> 32) ^ sm1, sm1);
+            int acc = 0;
+            acc = __dp4a(w0, *(const int32_t *)(q8 + (g * 32 + j * 8)), acc);
+            acc = __dp4a(w1, *(const int32_t *)(q8 + (g * 32 + j * 8 + 4)), acc);
+            if (j < 2) s1 += acc; else s2 += acc;
+        }
+        sumf += (float)(ls1 * s1 + ls2 * s2);
+    }
+    return 0.125f * xd * y->d * sumf;
+}
+
 /* iq3_xxs: first 64 qs bytes = 256 values via u32 grid rows of 4; the
  * trailing 8 u32 hold 7-bit sign indices (ksigns) + a 4-bit scale. */
 __device__ static float dev_dot_iq3_xxs_q8_K_block(
@@ -1885,6 +1932,12 @@ struct dot_mxfp4 {
     __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
         /* 8 mxfp4 blocks per 256-element q8_K block */
         return dev_dot_mxfp4_q8_K_block(row + (uint64_t)b * 8u * sizeof(block_mxfp4), xq + b);
+    }
+};
+
+struct dot_iq2_s {
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
+        return dev_dot_iq2_s_q8_K_block((const block_iq2_s *)row + b, xq + b, cuda_iq2s_grid);
     }
 };
 
@@ -2158,6 +2211,7 @@ enum {
     PULSAR_QUANT_MXFP4 = 12,
     PULSAR_QUANT_IQ4_NL = 13,
     PULSAR_QUANT_IQ3_S = 14,
+    PULSAR_QUANT_IQ2_S = 15,
 };
 
 /* ---- grouped batch MoE: amortize weight reads across the prefill batch.
@@ -2396,6 +2450,34 @@ struct unpack_iq3_xxs {
             out[j * 2u + 1u] = __vsub4((int32_t)g1 ^ sm1, sm1);
         }
         *scale = f16_to_f32(x->d) * (0.5f + (float)(aux >> 28)) * 0.5f;
+    }
+};
+
+struct unpack_iq2_s {
+    static const bool HAS_MIN = false;
+    static const uint32_t SB_BYTES = sizeof(block_iq2_s);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
+        const block_iq2_s *x = (const block_iq2_s *)block;
+        const uint32_t g = c >> 1;   /* group of 32 */
+        const uint32_t h = c & 1u;   /* which half -> which scale nibble */
+        const uint8_t *sgn_base = x->qs + PULSAR_QK_K / 8;
+        const uint32_t qh = x->qh[g];
+        #pragma unroll
+        for (uint32_t k = 0; k < 2; k++) {
+            const uint32_t j = h * 2u + k; /* sub-group of 8 within g */
+            const uint32_t idx = (uint32_t)x->qs[g * 4u + j]
+                               | ((qh << (8u - 2u * j)) & 0x300u);
+            const uint64_t gr = cuda_iq2s_grid[idx];
+            const uint32_t sgn = (uint32_t)sgn_base[g * 4u + j] * 0x01010101u;
+            const int32_t sm0 = __vcmpne4(sgn & 0x08040201u, 0);
+            const int32_t sm1 = __vcmpne4(sgn & 0x80402010u, 0);
+            out[k * 2u] = __vsub4((int32_t)(uint32_t)gr ^ sm0, sm0);
+            out[k * 2u + 1u] = __vsub4((int32_t)(uint32_t)(gr >> 32) ^ sm1, sm1);
+        }
+        const uint32_t n = h ? (uint32_t)(x->scales[g] >> 4) : (uint32_t)(x->scales[g] & 0x0f);
+        *scale = 0.125f * f16_to_f32(x->d) * (float)(2u * n + 1u);
     }
 };
 
@@ -2888,6 +2970,7 @@ __global__ static void moe_grouped_mma_kernel(
         case PULSAR_QUANT_MXFP4:   kern<dot_mxfp4><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         case PULSAR_QUANT_IQ4_NL:  kern<dot_iq4_nl><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         case PULSAR_QUANT_IQ3_S:   kern<dot_iq3_s><<<grid, block, shmem>>>(__VA_ARGS__); break; \
+        case PULSAR_QUANT_IQ2_S:   kern<dot_iq2_s><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         default: return 0;                                                    \
         }                                                                     \
     } while (0)
@@ -2923,6 +3006,7 @@ extern "C" int pulsar_moe_pair_swiglu_grouped(
         PULSAR_MMA_PAIR(PULSAR_QUANT_MXFP4, unpack_mxfp4);
         PULSAR_MMA_PAIR(PULSAR_QUANT_IQ4_NL, unpack_iq4_nl);
         PULSAR_MMA_PAIR(PULSAR_QUANT_IQ3_S, unpack_iq3_s);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_IQ2_S, unpack_iq2_s);
         PULSAR_MMA_PAIR(PULSAR_QUANT_Q5_1, unpack_q5_1);
         PULSAR_MMA_PAIR(PULSAR_QUANT_Q2_K, unpack_q2_K);
         PULSAR_MMA_PAIR(PULSAR_QUANT_Q3_K, unpack_q3_K);
@@ -2977,6 +3061,7 @@ extern "C" int pulsar_moe_down_grouped(
         PULSAR_MMA_DOWN(PULSAR_QUANT_MXFP4, unpack_mxfp4);
         PULSAR_MMA_DOWN(PULSAR_QUANT_IQ4_NL, unpack_iq4_nl);
         PULSAR_MMA_DOWN(PULSAR_QUANT_IQ3_S, unpack_iq3_s);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_IQ2_S, unpack_iq2_s);
         PULSAR_MMA_DOWN(PULSAR_QUANT_Q5_1, unpack_q5_1);
         PULSAR_MMA_DOWN(PULSAR_QUANT_Q2_K, unpack_q2_K);
         PULSAR_MMA_DOWN(PULSAR_QUANT_Q3_K, unpack_q3_K);
@@ -3394,6 +3479,12 @@ extern "C" int pulsar_moe_pair_swiglu(
                 (const float *)weights_dev, (const block_q8_K *)xq_dev,
                 in_blocks, mid_dim, n_used, n_tok, row_bytes, act_op);
         break;
+    case PULSAR_QUANT_IQ2_S:
+        moe_pair_swiglu_kernel<dot_iq2_s><<<grid, block>>>(
+                (float *)mid_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const float *)weights_dev, (const block_q8_K *)xq_dev,
+                in_blocks, mid_dim, n_used, n_tok, row_bytes, act_op);
+        break;
     case PULSAR_QUANT_IQ3_S:
         moe_pair_swiglu_kernel<dot_iq3_s><<<grid, block>>>(
                 (float *)mid_dev, (const pulsar_expert_ptrs *)ptrs_dev,
@@ -3511,6 +3602,12 @@ extern "C" int pulsar_moe_down(
                 (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
                 n_tok, row_bytes);
         break;
+    case PULSAR_QUANT_IQ2_S:
+        moe_down_kernel<dot_iq2_s><<<grid, block>>>(
+                (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
+                n_tok, row_bytes);
+        break;
     case PULSAR_QUANT_IQ3_S:
         moe_down_kernel<dot_iq3_s><<<grid, block>>>(
                 (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
@@ -3549,6 +3646,9 @@ static uint64_t h_grid[256];
  * reference reads the SAME table the kernel does - a hand-copied second
  * table could drift and would validate nothing. */
 static uint32_t h_iq3s_grid[512];
+/* host mirror of cuda_iq2s_grid, same reasoning: the reference must read
+ * the table the kernel reads, not a second transcription. */
+static uint64_t h_iq2s_grid[1024];
 
 /* mirror of q8_K_quantize_kernel, incl. the first-max tiebreak */
 static void host_quantize_q8_K(block_q8_K *out, const float *x,
@@ -3710,6 +3810,7 @@ static float host_dot_iq3_xxs_block(const char *row, const block_q8_K *xq, uint3
 /* host reference for iq3_s, transcribed from ggml's dequantize_row_iq3_s:
  * scalar, no dp4a, no SIMD sign tricks - the independent check. */
 static float host_dot_iq3_s_block(const char *row, const block_q8_K *xq, uint32_t bi);
+static float host_dot_iq2_s_block(const char *row, const block_q8_K *xq, uint32_t bi);
 static float host_dot_iq4_nl_block(const char *row, const block_q8_K *xq, uint32_t bi) {
     static const int kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
                                1, 13, 25, 38, 53, 69, 89, 113};
@@ -3728,6 +3829,35 @@ static float host_dot_iq4_nl_block(const char *row, const block_q8_K *xq, uint32
             sumi += kv[q >> 4] * (int)q8[b * 32 + 16 + i];
         }
         if (sumi != 0) sumf += f16_to_f32_host(d16) * (float)sumi;
+    }
+    return y->d * sumf;
+}
+
+static float host_dot_iq2_s_block(const char *row, const block_q8_K *xq, uint32_t bi) {
+    static const uint8_t kmask[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+    const block_iq2_s *x = (const block_iq2_s *)row + bi;
+    const block_q8_K *y = xq + bi;
+    const int8_t *q8 = y->qs;
+    const uint8_t *sgn_base = x->qs + PULSAR_QK_K / 8;
+    const float d = f16_to_f32_host(x->d);
+    float sumf = 0.0f;
+    for (int g = 0; g < 8; g++) {
+        const unsigned qh = x->qh[g];
+        for (int j = 0; j < 4; j++) {
+            const unsigned idx = (unsigned)x->qs[g * 4 + j] | ((qh << (8 - 2 * j)) & 0x300u);
+            const uint64_t gr = h_iq2s_grid[idx];
+            const uint8_t *gb = (const uint8_t *)&gr;
+            const uint8_t sb = sgn_base[g * 4 + j];
+            /* l=0,1 take the low scale nibble; l=2,3 the high one */
+            const int n = (j < 2) ? (x->scales[g] & 0x0f) : (x->scales[g] >> 4);
+            const float dl = d * (0.5f + (float)n) * 0.25f;
+            int acc = 0;
+            for (int k = 0; k < 8; k++) {
+                const int w = (sb & kmask[k]) ? -(int)gb[k] : (int)gb[k];
+                acc += w * (int)q8[g * 32 + j * 8 + k];
+            }
+            sumf += dl * (float)acc;
+        }
     }
     return y->d * sumf;
 }
@@ -4020,6 +4150,11 @@ static void fill_slab(char *slab, uint32_t n_rows, uint32_t n_el,
                 q->d = f32_to_f16_bits(fabsf(gqa_test_randf()) * 0.1f + 0.001f);
                 break;
             }
+            case PULSAR_QUANT_IQ2_S: {
+                block_iq2_s *q = (block_iq2_s *)row + blk;
+                q->d = dv;
+                break;
+            }
             case PULSAR_QUANT_IQ3_S: {
                 block_iq3_s *q = (block_iq3_s *)row + blk;
                 q->d = dv;
@@ -4176,6 +4311,7 @@ static int moe_selftest_one2(uint32_t quant, const char *name, uint32_t mid_dim)
     case PULSAR_QUANT_MXFP4:  block_bytes = 8 * sizeof(block_mxfp4); dot = host_dot_mxfp4_block; break;
     case PULSAR_QUANT_IQ4_NL: block_bytes = 8 * sizeof(block_iq4_nl); dot = host_dot_iq4_nl_block; break;
     case PULSAR_QUANT_IQ3_S:  block_bytes = sizeof(block_iq3_s);      dot = host_dot_iq3_s_block; break;
+    case PULSAR_QUANT_IQ2_S:  block_bytes = sizeof(block_iq2_s);      dot = host_dot_iq2_s_block; break;
     case PULSAR_QUANT_Q4_K:   block_bytes = sizeof(block_q4_K);    dot = host_dot_q4_K_block;    break;
     case PULSAR_QUANT_Q5_K:   block_bytes = sizeof(block_q5_K);    dot = host_dot_q5_K_block;    break;
     case PULSAR_QUANT_Q6_K:   block_bytes = sizeof(block_q6_K);    dot = host_dot_q6_K_block;    break;
@@ -4431,7 +4567,9 @@ extern "C" int pulsar_moe_selftest(void) {
         !cuda_ok(cudaMemcpyFromSymbol(h_grid, cuda_iq2xxs_grid,
                                       sizeof(h_grid)), "grid fetch") ||
         !cuda_ok(cudaMemcpyFromSymbol(h_iq3s_grid, cuda_iq3s_grid,
-                                      sizeof(h_iq3s_grid)), "iq3s grid fetch")) {
+                                      sizeof(h_iq3s_grid)), "iq3s grid fetch") ||
+        !cuda_ok(cudaMemcpyFromSymbol(h_iq2s_grid, cuda_iq2s_grid,
+                                      sizeof(h_iq2s_grid)), "iq2s grid fetch")) {
         return 0;
     }
     return q8_K_quantize_selftest() &&
@@ -4450,13 +4588,15 @@ extern "C" int pulsar_moe_selftest(void) {
            moe_selftest_one(PULSAR_QUANT_MXFP4, "mxfp4") &&
            moe_selftest_one(PULSAR_QUANT_IQ4_NL, "iq4_nl") &&
            moe_selftest_one(PULSAR_QUANT_IQ3_S, "iq3_s") &&
+           moe_selftest_one(PULSAR_QUANT_IQ2_S, "iq2_s") &&
            /* gemma4 shape: 704-wide experts, ceil-superblock tail */
            moe_selftest_one2(PULSAR_QUANT_Q5_1, "q5_1-704", 704) &&
            moe_selftest_one2(PULSAR_QUANT_Q8_0, "q8_0-704", 704) &&
            moe_selftest_one2(PULSAR_QUANT_IQ4_XS, "iq4_xs-704", 704) &&
            moe_selftest_one2(PULSAR_QUANT_MXFP4, "mxfp4-704", 704) &&
            moe_selftest_one2(PULSAR_QUANT_IQ4_NL, "iq4_nl-704", 704) &&
-           moe_selftest_one2(PULSAR_QUANT_IQ3_S, "iq3_s-704", 704);
+           moe_selftest_one2(PULSAR_QUANT_IQ3_S, "iq3_s-704", 704) &&
+           moe_selftest_one2(PULSAR_QUANT_IQ2_S, "iq2_s-704", 704);
 }
 
 /* ---- forward-graph glue: rms-norm, f32 matmul, swiglu, add, embed ------
