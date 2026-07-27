@@ -47,11 +47,13 @@ const CTX_SANITY_MAX: u32 = 8_388_608;
 /// since the re-exec REPLACES this process a failure leaves nothing
 /// serving - hence a guard at all.
 ///
-/// `reclaimable` must include the resident expert TIERS, not just free
-/// VRAM: tiers are sized from whatever the KV leaves over, so at steady
-/// state free VRAM is near zero by construction and a resize simply
-/// rebuilds them smaller. Counting only free space made this report 14k
-/// on a box that had been serving 262144 minutes earlier.
+/// `reclaimable` is Stats.kv_headroom, computed by the engine because only
+/// it knows placement. Two corrections are baked into that number: expert
+/// TIERS count (they are sized from what KV leaves over, so free VRAM is
+/// near zero at steady state and a resize rebuilds them smaller), and only
+/// the cards that HOST KV count - summing every GPU let a Gqa model whose
+/// KV lives on the primary borrow 28GiB of tier sitting on two other
+/// cards, and the resize died at cudaMalloc with the server gone.
 fn ctx_fit(ctx: u32, kv_bytes: usize, kv_compact: bool, reclaimable: usize) -> u32 {
     if ctx == 0 || kv_bytes == 0 {
         return CTX_SANITY_MAX;
@@ -76,14 +78,6 @@ fn ctx_fit(ctx: u32, kv_bytes: usize, kv_compact: bool, reclaimable: usize) -> u
 #[cfg(target_os = "linux")]
 fn kv_format() -> String {
     std::env::var("PULSAR_KV").unwrap_or_else(|_| "auto".into())
-}
-
-/// VRAM a resize can actually spend on KV: what is free now plus the
-/// resident expert tiers, which the next load re-sizes around the new KV.
-#[cfg(target_os = "linux")]
-fn reclaimable_vram(s: &engine::Stats) -> usize {
-    s.gpus.iter().map(|g| g.vram_free).sum::<usize>()
-        + s.tiers.iter().map(|t| t.bytes).sum::<usize>()
 }
 
 #[cfg(target_os = "linux")]
@@ -272,8 +266,9 @@ fn run() -> engine::Result {
                         // the live KV cost per position - past it the resize
                         // would re-exec into a failed load.
                         "ctx_max": ctx_model_max,
-                        "ctx_fit": ctx_fit(s.ctx, s.kv_bytes, s.kv_compact, reclaimable_vram(&s)),
+                        "ctx_fit": ctx_fit(s.ctx, s.kv_bytes, s.kv_compact, s.kv_headroom),
                         "kv_bytes": s.kv_bytes,
+                        "kv_headroom": s.kv_headroom,
                         "kv_format": kv_format(),
                         "kv_compact": s.kv_compact,
                         "kv_resolved": s.kv_resolved,
@@ -454,7 +449,7 @@ fn run() -> engine::Result {
                     let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                     let n = req["ctx"].as_u64().unwrap_or(0) as u32;
                     let fs = st.stats();
-                    let fit = ctx_fit(fs.ctx, fs.kv_bytes, fs.kv_compact, reclaimable_vram(&fs));
+                    let fit = ctx_fit(fs.ctx, fs.kv_bytes, fs.kv_compact, fs.kv_headroom);
                     if !(512..=ctx_model_max as u32).contains(&n) {
                         respond_json(&mut stream, 400, &serde_json::json!({"error": {"message":
                             format!("ctx out of range (512..{ctx_model_max}, the checkpoint's trained context)")}}))

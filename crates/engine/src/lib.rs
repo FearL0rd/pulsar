@@ -1034,6 +1034,12 @@ mod real {
         /// by ctx this gives bytes-per-position, which is how a caller
         /// projects whether a different ctx would fit.
         pub kv_bytes: usize,
+        /// VRAM a LARGER ctx could actually spend, on the cards that host
+        /// KV: their free VRAM plus the expert tiers resident there (tiers
+        /// are sized from what KV leaves over, so a resize rebuilds them
+        /// smaller). Excludes cards that hold no KV - their free space is
+        /// unreachable for this purpose.
+        pub kv_headroom: usize,
         /// The format the KV actually resolved to, after PULSAR_KV and the
         /// size-aware auto-default were both applied. A caller showing
         /// "auto" needs this to say WHICH format auto landed on.
@@ -1269,6 +1275,12 @@ mod real {
     }
 
     impl DeviceSlabCache {
+        /// Reserved capacity of the slab pool. Reclaimable by a larger KV:
+        /// the auto budget sizes this from what the KV leaves over.
+        pub fn pool_bytes(&self) -> usize {
+            self.pool.bytes()
+        }
+
         fn new(budget_bytes: usize, slab_bytes: usize) -> Result<DeviceSlabCache> {
             let slots = (budget_bytes / slab_bytes.max(1)).max(1);
             Ok(DeviceSlabCache {
@@ -3864,6 +3876,8 @@ mod real {
         /// owner in attn_layer_dev. Single-card offload = one entry.
         /// Non-Mla families keep the flat fields below.
         attn_sc: Vec<MlaScratch>,
+        /// Cards that host KV/idx caches; see Stats.kv_headroom.
+        kv_devs: Vec<i32>,
         /// Device holding the live DSA selection list (mla_selected of
         /// that device's scratch); -1 = none written yet. Reuse layers on
         /// a different owner copy the list across before attending.
@@ -4248,6 +4262,27 @@ mod real {
                 host_used: self.store.used,
                 host_budget: self.store.budget,
                 vram_resident,
+                kv_headroom: {
+                    let primary = kernels::get_device();
+                    self.kv_devs
+                        .iter()
+                        .map(|&d| {
+                            let free = kernels::mem_info(d).map(|(f, _)| f).unwrap_or(0);
+                            let tier: usize = self
+                                .tiers
+                                .iter()
+                                .filter(|t| t.dev == d)
+                                .map(|t| t.pool.bytes())
+                                .sum();
+                            // the primary's expert slab cache is reclaimable
+                            // too: the auto budget sizes it from whatever the
+                            // KV leaves over, so a bigger KV simply gets a
+                            // smaller cache rather than failing
+                            let slab = if d == primary { self.dev_cache.pool_bytes() } else { 0 };
+                            free + tier + slab
+                        })
+                        .sum()
+                },
                 kv_resolved: match (self.kvq, self.kvq_lat) {
                     (1, _) | (_, 1) => "fp8",
                     (2, _) | (_, 2) => "fp16",
@@ -4798,6 +4833,24 @@ mod real {
             let n_kv_slots = s.n_exec_layer as usize + usize::from(m.mtp.is_some());
             let dense_split = m.layer_dev.iter().any(|&d| d != primary);
             let attn_split = m.attn_layer_dev.windows(2).any(|w| w[0] != w[1]);
+            // Which cards actually host KV. A caller projecting a larger ctx
+            // must count headroom on THESE devices only: KV cannot migrate to
+            // a card that holds expert tiers. Summing every GPU's free VRAM
+            // let a Gqa model (KV on the primary) borrow 28GiB of tier sitting
+            // on two other cards, and the resize died at cudaMalloc.
+            let mut kv_devs: Vec<i32> = Vec::new();
+            for i in 0..n_kv_slots {
+                let d = if dense_split {
+                    m.layer_dev.get(i).copied().unwrap_or(primary)
+                } else if attn_split {
+                    m.attn_layer_dev.get(i).copied().unwrap_or(primary)
+                } else {
+                    m.attn_dev.unwrap_or(primary)
+                };
+                if !kv_devs.contains(&d) {
+                    kv_devs.push(d);
+                }
+            }
             for i in 0..n_kv_slots {
                 if dense_split {
                     // dense split: KV lives with its layer (MTP slot ->
@@ -5121,6 +5174,7 @@ mod real {
                 kcache,
                 vcache,
                 kvq,
+                kv_devs,
                 kvq_lat,
                 kvq_rot,
                 pi,
