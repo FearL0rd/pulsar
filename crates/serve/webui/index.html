@@ -1333,8 +1333,9 @@
           <label><span class="field-label">max_tokens <span class="hint" id="max-tokens-hint">blank = use all remaining context</span></span>
             <input type="number" id="max-tokens" step="32" min="1" placeholder="auto" />
           </label>
-          <label><span class="field-label">min_p</span>
-            <input type="number" id="min-p" step="0.01" min="0" max="1" placeholder="0" />
+          <label><span class="field-label">min_p <span class="hint">0.05 recommended</span></span>
+            <input type="number" id="min-p" step="0.01" min="0" max="1" placeholder="0 (blank = off)" />
+            <div class="hint">drops tokens scoring under this fraction of the top one. 0.05 is antirez's recommendation for Laguna at low quant</div>
           </label>
           <label><span class="field-label">seed</span>
             <input type="number" id="seed" step="1" placeholder="42" />
