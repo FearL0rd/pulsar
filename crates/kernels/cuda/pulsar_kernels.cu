@@ -1503,9 +1503,21 @@ __device__ static float dev_dot_q5_K_q8_K_block(const block_q5_K *x, const block
     return d * (float)isum - dmin * (float)msum;
 }
 
-/* iq4_xs non-linear codebook (ggml kvalues_iq4nl) */
-__device__ static const int8_t kd_iq4nl[16] = {
+/* iq4_xs non-linear codebook (ggml kvalues_iq4nl). __constant__ like every
+ * other codebook here: the whole warp indexes it with the same address
+ * pattern, which the constant cache broadcasts in one shot where a global
+ * load goes through L1 per thread. */
+__device__ __constant__ static const int8_t kd_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+/* Resolve four 4-bit codebook indices (one per byte of `nib4`, already
+ * masked) into four int8 weights packed as one int, ready for __dp4a. */
+__device__ __forceinline__ static int iq4nl_lut4(uint32_t nib4) {
+    return (int)(((uint32_t)(uint8_t)kd_iq4nl[(nib4      ) & 0xfu])
+               | ((uint32_t)(uint8_t)kd_iq4nl[(nib4 >>  8) & 0xfu] << 8)
+               | ((uint32_t)(uint8_t)kd_iq4nl[(nib4 >> 16) & 0xfu] << 16)
+               | ((uint32_t)(uint8_t)kd_iq4nl[(nib4 >> 24) & 0xfu] << 24));
+}
 
 __device__ static float dev_dot_iq4_xs_q8_K_block(const block_iq4_xs *x, const block_q8_K *y) {
     const uint8_t *qs = x->qs;
@@ -1517,11 +1529,20 @@ __device__ static float dev_dot_iq4_xs_q8_K_block(const block_iq4_xs *x, const b
         const int ls = (int)(((x->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0xf) |
                              (((sh >> (2 * ib)) & 3) << 4)) - 32;
         int sumi = 0;
+        /* Four nibbles at a time through __dp4a, the same integer-SIMD path
+         * the K-quants use: 64 four-wide MACs per block where the scalar
+         * version did 256. Exact integer arithmetic, so regrouping the
+         * accumulation cannot change the result.
+         * block_iq4_xs is 136 bytes (multiple of 4) and qs sits at offset 8,
+         * so qs stays 4-byte aligned in every block and direct u32 loads are
+         * safe - unlike q6_K at 210 bytes, which needs load_u32_bytes. */
         #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            const uint8_t b = qs[j];
-            sumi += kd_iq4nl[b & 0xf] * (int)q8[j];
-            sumi += kd_iq4nl[b >> 4] * (int)q8[j + 16];
+        for (int j = 0; j < 16; j += 4) {
+            const uint32_t b4 = *(const uint32_t *)(qs + j);
+            sumi = __dp4a(iq4nl_lut4(b4 & 0x0f0f0f0fu),
+                          *(const int32_t *)(q8 + j), sumi);
+            sumi = __dp4a(iq4nl_lut4((b4 >> 4) & 0x0f0f0f0fu),
+                          *(const int32_t *)(q8 + 16 + j), sumi);
         }
         /* tail guard: a zero-quantized activation block dots to 0; leaving
          * the super-scale x->d untouched keeps overread garbage from NaNs */
@@ -2318,14 +2339,14 @@ struct unpack_iq4_xs {
         const block_iq4_xs *x = (const block_iq4_xs *)block;
         const uint32_t s = c >> 1;
         const uint32_t shift = (c & 1u) * 4u;
+        /* one word load + one packed lookup per 4 values, mirroring
+         * unpack_mxfp4 below; the byte-at-a-time version did 4 separate
+         * loads and 4 scalar lookups for the same work */
         #pragma unroll
         for (uint32_t j = 0; j < 4; j++) {
-            int8_t r[4];
-            #pragma unroll
-            for (uint32_t k = 0; k < 4; k++) {
-                r[k] = kd_iq4nl[(x->qs[s * 16u + j * 4u + k] >> shift) & 0xfu];
-            }
-            memcpy(&out[j], r, 4u);
+            uint32_t v;
+            memcpy(&v, x->qs + s * 16u + j * 4u, 4u);
+            out[j] = iq4nl_lut4((v >> shift) & 0x0f0f0f0fu);
         }
         const int ls = (int)(((x->scales_l[s >> 1] >> (4u * (s & 1u))) & 0xfu) |
                              (((x->scales_h >> (2u * s)) & 3u) << 4u)) - 32;
