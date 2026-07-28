@@ -238,8 +238,32 @@ fn run() -> engine::Result {
                         .collect();
                     // model residency: VRAM (resident tiers + slab cache), RAM (host
                     // cache), disk (the streamed remainder of the gguf on disk)
-                    let model_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+                    // A split model's -m points at shard 1, so metadata() on
+                    // it reports 638MB for a 528GB model and the streamed
+                    // remainder saturates to zero - the panel then shows only
+                    // the caches, as if the whole model were resident.
+                    let model_bytes = {
+                        let p = std::path::Path::new(&model_path);
+                        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        match (split_shard(name), p.parent()) {
+                            (Some(_), Some(d)) => dir_gguf_bytes(d, name),
+                            _ => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+                        }
+                    };
                     let ram = s.host_used as u64;
+                    // Only the routed experts stream; everything else was
+                    // uploaded at load and never leaves VRAM. vram_resident
+                    // counts the expert tiers and slab cache ONLY, so without
+                    // this the resident remainder reads as "on disk" - 31GB of
+                    // it on K3, whose attention and shared-expert stack dwarfs
+                    // its expert cache.
+                    let expert_pool: u64 = model
+                        .gguf
+                        .tensors
+                        .iter()
+                        .filter(|t| t.name.ends_with("_exps.weight"))
+                        .filter_map(|t| t.byte_size())
+                        .sum();
                     // Dense models (no MoE experts) are placed via per-layer card
                     // ownership - fully resident in VRAM, but not counted by the
                     // MoE tier residency counter, which made the whole model show
@@ -248,9 +272,15 @@ fn run() -> engine::Result {
                     let vram = if dense {
                         model_bytes.saturating_sub(ram)
                     } else {
-                        s.vram_resident as u64
+                        // resident non-expert weights + whatever of the expert
+                        // pool is cached in VRAM
+                        model_bytes.saturating_sub(expert_pool) + s.vram_resident as u64
                     };
-                    let disk = if dense { 0 } else { model_bytes.saturating_sub(vram + ram) };
+                    let disk = if dense {
+                        0
+                    } else {
+                        expert_pool.saturating_sub(s.vram_resident as u64 + ram)
+                    };
                     let json = serde_json::json!({
                         "model": model_name,
                         "ctx": s.ctx,
