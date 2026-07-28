@@ -22,3 +22,4 @@ selftest!(mla_selftest);
 selftest!(idx_selftest);
 selftest!(dsv4_selftest);
 selftest!(qwen35_selftest);
+selftest!(k3_selftest);

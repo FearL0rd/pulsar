@@ -1965,7 +1965,8 @@ mod real {
         }
 
         /// mirrors pulsar_glu in pulsar_kernels.cu (0 = silu, 1 = gelu
-        /// tanh, 2 = swiglu_oai, 3 = deepseek4 clamped silu)
+        /// tanh, 2 = swiglu_oai, 3 = deepseek4 clamped silu, 4 = kimi-k3
+        /// SiTU-GLU)
         pub fn glu(g: f32, u: f32, op: u32) -> f32 {
             match op {
                 1 => {
@@ -1982,6 +1983,11 @@ mod real {
                     let g = g.min(10.0);
                     let u = u.clamp(-10.0, 10.0);
                     g / (1.0 + (-g).exp()) * u
+                }
+                4 => {
+                    // kimi-k3 SiTU-GLU; betas baked in as in pulsar_glu
+                    let a = 4.0 * (g / 4.0).tanh() / (1.0 + (-g).exp());
+                    a * (25.0 * (u / 25.0).tanh())
                 }
                 _ => g / (1.0 + (-g).exp()) * u,
             }

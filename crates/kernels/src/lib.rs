@@ -156,6 +156,11 @@ mod real {
         fn pulsar_qwen35_gdn_coeffs(g_alpha: *mut c_void, beta: *mut c_void, a: *const c_void, dt: *const c_void, n_tok: u32, n_head: u32) -> i32;
         fn pulsar_qwen35_row_sigmoid_scale(x: *mut c_void, s: *const c_void, n_rows: u32, dim: u32) -> i32;
         fn pulsar_qwen35_selftest() -> i32;
+        #[allow(clippy::too_many_arguments)]
+        fn pulsar_k3_kda_coeffs(g: *mut c_void, beta: *mut c_void, a: *const c_void, dt: *const c_void, n_tok: u32, n_head: u32, head_dim: u32, g_min: f32) -> i32;
+        fn pulsar_k3_kda_step(out: *mut c_void, state: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, g: *const c_void, beta: *const c_void, n_head: u32, dim: u32) -> i32;
+        fn pulsar_k3_attn_res(out: *mut c_void, cur: *const c_void, ckpt: *const c_void, w: *const c_void, n_tok: u32, n_embd: u32, n_ckpt: u32, eps: f32) -> i32;
+        fn pulsar_k3_selftest() -> i32;
         fn pulsar_mla_kv_lora_rms_norm(out: *mut c_void, kv_raw: *const c_void, w: *const c_void, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> i32;
         fn pulsar_mla_store_compact_kv(kv_lora_cache: *mut c_void, k_rope_cache: *mut c_void, kv_norm: *const c_void, kv_raw: *const c_void, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32, kvq: u32) -> i32;
         fn pulsar_mla_fill_selected_range(selected: *mut c_void, n_tok: u32, pos0: u32, n_selected: u32, pad_row: u32) -> i32;
@@ -1304,6 +1309,36 @@ mod real {
 
     pub fn qwen35_selftest() -> bool {
         unsafe { pulsar_qwen35_selftest() != 0 }
+    }
+
+    /// KDA mixing coefficients in place: g becomes the lower-bounded
+    /// channel-wise log-decay `g_min * sigmoid(exp(A_log) * (z + dt))`
+    /// (g holds [n_tok][n_head][head_dim], `a` holds -exp(A_log)), and
+    /// beta becomes sigmoid(beta) per head.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k3_kda_coeffs(g: &mut DeviceBuf, beta: &mut DeviceBuf, a: &DeviceBuf, dt: &DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, g_min: f32) -> Result {
+        check(unsafe { pulsar_k3_kda_coeffs(g.ptr_mut(), beta.ptr_mut(), a.ptr(), dt.ptr(), n_tok, n_head, head_dim, g_min) }, "k3_kda_coeffs")
+    }
+
+    /// Kimi Delta Attention autoregressive step (one token, all heads).
+    /// Like `qwen35_gdn_step` but the forget gate is per key channel, so
+    /// `g` is [n_head][dim] rather than [n_head]; q/k/v are all n_head-wide.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k3_kda_step(out: &mut DeviceBuf, state: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, g: &DeviceBuf, beta: &DeviceBuf, n_head: u32, dim: u32) -> Result {
+        check(unsafe { pulsar_k3_kda_step(out.ptr_mut(), state.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), g.ptr(), beta.ptr(), n_head, dim) }, "k3_kda_step")
+    }
+
+    /// Attention Residuals: softmax over depth (the banked block
+    /// checkpoints plus the live stream) scored by `w`, mixing the raw
+    /// vectors. `n_ckpt == 0` copies `cur` through unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k3_attn_res(out: &mut DeviceBuf, cur: &DeviceBuf, ckpt: Option<&DeviceBuf>, w: &DeviceBuf, n_tok: u32, n_embd: u32, n_ckpt: u32, eps: f32) -> Result {
+        let ck = ckpt.map(|b| b.ptr()).unwrap_or(std::ptr::null());
+        check(unsafe { pulsar_k3_attn_res(out.ptr_mut(), cur.ptr(), ck, w.ptr(), n_tok, n_embd, n_ckpt, eps) }, "k3_attn_res")
+    }
+
+    pub fn k3_selftest() -> bool {
+        unsafe { pulsar_k3_selftest() != 0 }
     }
 
     pub fn mla_kv_lora_rms_norm(out: &mut DeviceBuf, kv_raw: &DeviceBuf, w: &DeviceBuf, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> Result {

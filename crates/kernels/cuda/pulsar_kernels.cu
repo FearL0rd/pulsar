@@ -116,7 +116,11 @@ __device__ __forceinline__ static float pulsar_gate_act(float g, uint32_t op) {
  *   M3): gate one-side clamped to 7, up clamped to +-7, alpha-sharpened
  *   sigmoid (1.702), and the +1 on up - llama.cpp ggml_swiglu_oai,
  *   3 = deepseek4 clamped silu: gate one-side clamped to 10, up clamped
- *   to +-10 (DS4_SWIGLU_CLAMP_EXP, both Flash and Pro), plain silu. */
+ *   to +-10 (DS4_SWIGLU_CLAMP_EXP, both Flash and Pro), plain silu,
+ *   4 = kimi-k3 SiTU-GLU: both branches soft-capped by beta*tanh(x/beta)
+ *   instead of clamped, gate keeps the plain sigmoid. betas are baked in
+ *   like the clamps above (K3 ships situ_beta 4 / situ_linear_beta 25 in
+ *   its gguf; re-check those keys before reusing this op for a new model). */
 __device__ __forceinline__ static float pulsar_glu(float g, float u, uint32_t op) {
     if (op == 2u) {
         g = fminf(g, 7.0f);
@@ -127,6 +131,11 @@ __device__ __forceinline__ static float pulsar_glu(float g, float u, uint32_t op
         g = fminf(g, 10.0f);
         u = fminf(fmaxf(u, -10.0f), 10.0f);
         return g / (1.0f + expf(-g)) * u;
+    }
+    if (op == 4u) {
+        const float b1 = 4.0f, b2 = 25.0f;
+        const float a = b1 * tanhf(g / b1) / (1.0f + expf(-g));
+        return a * (b2 * tanhf(u / b2));
     }
     return pulsar_gate_act(g, op) * u;
 }
@@ -5723,3 +5732,4 @@ extern "C" int pulsar_mla_selftest(void) {
 #include "dsa_indexer.inc"
 #include "dsv4_kernels.inc"
 #include "qwen35_kernels.inc"
+#include "k3_kernels.inc"
