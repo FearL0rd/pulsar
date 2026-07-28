@@ -2617,6 +2617,15 @@ mod real {
                 file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
                 Ok(DeviceBuf::from_f32(&quant::cpu_dot::dequant_q4_k(&buf, n))?)
             }
+            // pulsar-quant falls back to q8_0 for rows that are a multiple
+            // of 32 but not 256, which is how ssm_alpha/ssm_beta arrive on
+            // some GDN models. Dequantize rather than refuse the file.
+            TensorType::Q8_0 => {
+                let n = t.n_elements() as usize;
+                let mut buf = vec![0u8; n / 32 * 34];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                Ok(DeviceBuf::from_f32(&quant::cpu_dot::dequant_q8_0(&buf, n))?)
+            }
             other => Err(format!("{name}: no f32 path for {other:?}").into()),
         }
     }

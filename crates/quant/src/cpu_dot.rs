@@ -200,6 +200,22 @@ pub fn vec_dot_q3_k_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
     total
 }
 
+/// Full q8_0 dequant to f32. Same loader case as `dequant_q4_k`: a small
+/// tensor the graph wants in f32 that the quantizer emitted as q8_0
+/// (ssm_alpha/ssm_beta fall here when their row width is a multiple of 32
+/// but not 256, which is the q8_0 fallback in pulsar-quant).
+pub fn dequant_q8_0(row: &[u8], n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    for b in 0..n / 32 {
+        let blk = &row[b * 34..(b + 1) * 34];
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        for i in 0..32 {
+            out.push(blk[2 + i] as i8 as f32 * d);
+        }
+    }
+    out
+}
+
 /// Full q4_K dequant to f32 (loader use: small f32-expected tensors that
 /// arrive K-quantized, e.g. qwen35-dense ssm_alpha/ssm_beta).
 pub fn dequant_q4_k(row: &[u8], n: usize) -> Vec<f32> {
@@ -776,6 +792,29 @@ pub fn dequant_row_iq2_xxs(row: &[u8], n: usize, out: &mut Vec<f32>) {
 
 #[cfg(test)]
 mod tests {
+    /// dequant_q8_0 against a hand-rolled q8_0 encode: the loader path for
+    /// tensors the graph wants in f32 but the quantizer emitted as q8_0.
+    #[test]
+    fn dequant_q8_0_roundtrips() {
+        let n = 96usize;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+        let mut bytes = Vec::new();
+        for blk in x.chunks(32) {
+            let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let d = amax / 127.0;
+            bytes.extend_from_slice(&super::super::f32_to_f16(d).to_le_bytes());
+            for &v in blk {
+                bytes.push((if d > 0.0 { (v / d).round() } else { 0.0 }) as i8 as u8);
+            }
+        }
+        let got = super::dequant_q8_0(&bytes, n);
+        assert_eq!(got.len(), n);
+        for (a, b) in x.iter().zip(got.iter()) {
+            // q8_0 keeps ~1% of the block amax
+            assert!((a - b).abs() < 0.05, "{a} vs {b}");
+        }
+    }
+
     use super::*;
 
     fn lcg(state: &mut u64) -> f32 {

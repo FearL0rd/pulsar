@@ -225,8 +225,14 @@ fn run() -> Result<(), String> {
     );
 
     // ---- decide output types
+    // Tensors the graph reads as f32 whatever the requested quant. These
+    // are tiny (a few hundred KB) so the saving is nil, and ssm_alpha/beta
+    // feed the GDN decay through an exponential, where requant error is
+    // worth the least. Quantizing them also made the loader refuse the
+    // file outright ("no f32 path for Q8_0") after a 7 hour run.
+    const KEEP_F32: &[&str] = &["ssm_alpha", "ssm_beta", "ssm_a", "ssm_dt", "ssm_norm"];
     let pick = |name: &str, dims: &[u64]| -> TensorType {
-        if dims.len() < 2 {
+        if dims.len() < 2 || KEEP_F32.iter().any(|k| name.contains(k)) {
             return TensorType::F32;
         }
         let want = maps
