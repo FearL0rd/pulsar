@@ -58,6 +58,12 @@ mod real {
         /// prefill loops tokens (conv window + delta state are
         /// sequential).
         Qwen35,
+        /// Kimi-K3 (kimi-k3): 3 KDA layers + 1 NoPE gated-MLA layer per
+        /// block, Attention Residuals over depth, and a latent MoE whose
+        /// 896 routed experts run in a half-width space. KDA is Qwen35's
+        /// Gated DeltaNet with a per-key-channel forget gate. Decode-only
+        /// graph; prefill loops tokens (the KDA recurrence is sequential).
+        K3,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -131,6 +137,17 @@ mod real {
         /// SwiGLU clamp for routed AND shared experts (10.0 on V4;
         /// the per-layer metadata array is constant per model)
         pub clamp_exp: f32,
+        // kimi-k3 (zero elsewhere)
+        /// KDA head width; d_inner = n_head * kda_head_dim.
+        pub kda_head_dim: u32,
+        /// g_min in `g = g_min * sigmoid(exp(A_log) * z)`. Negative.
+        pub kda_gate_lb: f32,
+        /// Width the routed experts live in (< n_embd), with
+        /// ffn_routed_down/up projecting into and out of it.
+        pub n_expert_latent: u32,
+        /// Layers per AttnRes block; a checkpoint is banked every
+        /// `attn_res_block` layers. Zero disables AttnRes.
+        pub attn_res_block: u32,
     }
 
     impl Shape {
@@ -142,7 +159,11 @@ mod real {
         fn heads_dim(&self) -> u32 {
             match self.family {
                 Family::Gqa | Family::Dsv4 | Family::Qwen35 => self.n_head * self.head_dim,
-                Family::Mla => self.n_head * self.value_mla,
+                // K3's two layer flavours agree here: the MLA half is
+                // n_head * value_mla and the KDA half n_head *
+                // kda_head_dim, both 12288, which is why one attn_output
+                // shape serves both.
+                Family::Mla | Family::K3 => self.n_head * self.value_mla,
             }
         }
 
@@ -187,7 +208,10 @@ mod real {
     }
 
     impl Shape {
-        fn from_gguf(g: &Gguf) -> Result<Shape> {
+        /// Resolve a parsed gguf header into a Shape. Public so config
+        /// parsing for a new architecture can be checked against the real
+        /// file (see examples/k3-shape.rs) before its weights exist.
+        pub fn from_gguf(g: &Gguf) -> Result<Shape> {
             let u = |k: &str| -> Result<u32> {
                 Ok(g.arch_meta(k).and_then(Value::as_u64).ok_or_else(|| meta_err(k))? as u32)
             };
@@ -233,6 +257,8 @@ mod real {
                 // stack; the dense FFN loads as a single always-on expert
                 // so placement/caching/tiering machinery applies unchanged
                 Some("qwen35") => Family::Qwen35,
+                // Kimi-K3 2.8T: hybrid KDA/MLA + AttnRes + latent MoE
+                Some("kimi-k3") => Family::K3,
                 other => return Err(format!("unsupported architecture {other:?}").into()),
             };
             let inkling = g.architecture() == Some("inkling");
@@ -331,6 +357,9 @@ mod real {
                 moe_act_op: match g.architecture() {
                     Some("gemma4") => 1,
                     Some("minimax-m3") | Some("gpt-oss") => 2,
+                    // kimi-k3 SiTU-GLU, on the routed AND shared experts
+                    // and the leading dense FFN
+                    Some("kimi-k3") => 4,
                     _ => 0,
                 },
                 // inkling has no rope at all - the key may be absent
@@ -371,6 +400,10 @@ mod real {
                 ssm_v_heads: 0,
                 ssm_inner: 0,
                 full_attn_interval: 0,
+                kda_head_dim: 0,
+                kda_gate_lb: 0.0,
+                n_expert_latent: 0,
+                attn_res_block: 0,
             };
             if g.architecture() == Some("laguna") {
                 // laguna ships real YaRN (factor 32 over an 8192 native
@@ -430,6 +463,34 @@ mod real {
                 s.ssm_v_heads = u("ssm.time_step_rank").unwrap_or(32);
                 s.ssm_inner = u("ssm.inner_size").unwrap_or(4096);
                 s.full_attn_interval = u("full_attention_interval").unwrap_or(4);
+            }
+            if family == Family::K3 {
+                // MLA half: identical shape to the deepseek2/GLM lineage,
+                // except nothing is ever rotated. The 64 rope-tail dims
+                // still exist in the K/Q rows (attn_kv_a_mqa is
+                // kv_lora + 64 wide) - K3 just never applies rope to
+                // them, so qk_rope stays the slice width and no rope
+                // kernel runs. rope.freq_base is present but unused
+                // ("defaults_used: rope_theta" in the conversion keys).
+                s.n_lora_q = u("attention.q_lora_rank").unwrap_or(1536);
+                s.n_kv_lora = u("attention.kv_lora_rank").unwrap_or(512);
+                s.qk_rope = u("rope.dimension_count").unwrap_or(64);
+                let qk_mla = u("attention.key_length_mla").unwrap_or(192);
+                s.qk_nope = qk_mla - s.qk_rope;
+                s.value_mla = u("attention.value_length_mla").unwrap_or(128);
+                // KDA half. head_count (96) is the KDA head count too, so
+                // d_inner = 96 * 128 = 12288 = the ssm_* projection width.
+                s.kda_head_dim = u("kda.head_dim").unwrap_or(128);
+                s.ssm_conv_k = u("ssm.conv_kernel").unwrap_or(4);
+                s.ssm_inner = s.n_head * s.kda_head_dim;
+                s.ssm_k_heads = s.n_head;
+                s.ssm_v_heads = s.n_head;
+                s.ssm_state = s.kda_head_dim;
+                s.kda_gate_lb = f("kda.gate_lower_bound").unwrap_or(-5.0);
+                s.n_expert_latent = u("expert_latent_length").unwrap_or(0);
+                s.attn_res_block = u("attn_res.block_size").unwrap_or(0);
+                s.rope_orig_ctx = u("rope.scaling.original_context_length")
+                    .unwrap_or(1_048_576);
             }
             if family == Family::Dsv4 {
                 s.n_lora_q = u("attention.q_lora_rank").unwrap_or(1024);
@@ -2583,7 +2644,10 @@ mod real {
             // PULSAR_ATTN_GPU=<idx> forces, =off disables auto-detection.
             let primary = kernels::get_device();
             let attn_dev = match shape.family {
-                Family::Mla => match std::env::var("PULSAR_ATTN_GPU").ok().as_deref() {
+                // K3 joins Mla here for the same reason: its non-expert
+                // stack is far too big for one card, so the per-layer
+                // planner has to be allowed to spread it.
+                Family::Mla | Family::K3 => match std::env::var("PULSAR_ATTN_GPU").ok().as_deref() {
                     Some("off") | Some("-1") => None,
                     Some(v) => v.trim().parse::<i32>().ok().filter(|&d| {
                         let ok = d != primary && d >= 0 && d < kernels::device_count();
@@ -2986,6 +3050,10 @@ mod real {
                 (Family::Dsv4, _) => env_budget.unwrap_or(8 << 30),
                 // qwen35: the whole non-expert stack is ~2GB - resident
                 (Family::Qwen35, _) => env_budget.unwrap_or(i64::MAX),
+                // K3's attention+KDA+shared-expert stack is ~29GB of Q4_K
+                // over 93 layers: it cannot fit one card, so let the
+                // layer-split planner place it and do not cap it here.
+                (Family::K3, _) => env_budget.unwrap_or(i64::MAX),
             };
             // No-attn-GPU Mla: an oversized budget OOMs the load instead
             // of degrading (measured: 8GB+ on a 16GB primary fails at
@@ -3161,6 +3229,16 @@ mod real {
                     kernels::set_device(a_dev)?;
                 }
                 let attn = match shape.family {
+                    // K3 needs its own Attn variant: the KDA layers carry
+                    // conv/gate/decay tensors no other family has, and the
+                    // MLA quarter needs the output gate beside the usual
+                    // latent stack. Refuse rather than load a half-model.
+                    Family::K3 => {
+                        return Err("kimi-k3: per-layer tensor loading not implemented \
+                                    (kernels and config are in; Attn::K3, KV sizing and \
+                                    forward_k3 remain)"
+                            .into())
+                    }
                     Family::Gqa => Attn::Gqa {
                         attn_q: upload_attn(&file, &gguf, &t("attn_q.weight"), &mut *attn_vram_budget)?,
                         attn_k: upload_attn(&file, &gguf, &t("attn_k.weight"), &mut *attn_vram_budget)?,
@@ -4604,8 +4682,10 @@ mod real {
                 // kernels understand; qwen35's full-attention layers use the
                 // same one, minus the dense split path
                 Family::Gqa | Family::Qwen35 => !kv_dense,
-                // MLA/Dsv4 carry their own compact latent caches
-                Family::Mla | Family::Dsv4 => false,
+                // MLA/Dsv4 carry their own compact latent caches; K3's
+                // MLA quarter does too, and its KDA layers keep no KV at
+                // all
+                Family::Mla | Family::Dsv4 | Family::K3 => false,
             };
             // The MLA latent cache has its own quantized formats (fp8/fp16,
             // kvq_lat below) through mla_store_compact_kv/mla_attention;
@@ -4761,6 +4841,11 @@ mod real {
                     let b = s.n_head_kv as usize * ctx as usize * kv_row(s.head_dim as usize);
                     (b, b)
                 }
+                // K3 is per-layer mixed: only the MLA quarter holds a
+                // latent cache, the KDA layers hold a fixed-size state
+                // instead, so one (k, v) pair cannot describe it. Sized
+                // per layer when Attn::K3 lands.
+                Family::K3 => (0, 0),
             };
             if kvq != 0 {
                 let full = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
@@ -5492,6 +5577,11 @@ mod real {
                 Family::Qwen35 => return self.forward_qwen35(st, tokens, pos0, rows),
                 // pure-KV attention: a row's whole history is the cache, so
                 // batching rows is safe
+                // K3's KDA conv window and delta state advance per token,
+                // exactly like qwen35's GDN
+                Family::K3 => {
+                    return Err("kimi-k3: forward_k3 not implemented".into())
+                }
                 Family::Gqa | Family::Mla => {}
             }
             // a batch must not straddle the indexer top_k boundary: rows
@@ -5607,7 +5697,8 @@ mod real {
             // cannot be rewound, which corrupts the stream rather than
             // failing. sconv_k > 1 catches inkling's shortconv on top.
             let by_family = match self.shape.family {
-                Family::Dsv4 | Family::Qwen35 => true,
+                // K3's KDA layers carry a conv window and a delta state
+                Family::Dsv4 | Family::Qwen35 | Family::K3 => true,
                 Family::Gqa | Family::Mla => false,
             };
             by_family || self.shape.sconv_k > 1
