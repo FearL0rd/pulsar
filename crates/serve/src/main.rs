@@ -435,11 +435,26 @@ fn run() -> engine::Result {
                         .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| dir.clone());
                     let target = base.join(name);
+                    // Path::join with an ABSOLUTE name discards the base
+                    // entirely, so the component checks alone would let
+                    // "/x.gguf" escape; the pre-subdirectory version was
+                    // safe only because it rejected every '/'. Verify
+                    // containment after canonicalizing, which also
+                    // settles symlinks.
+                    let contained = || {
+                        match (target.canonicalize(), base.canonicalize()) {
+                            (Ok(t), Ok(b)) => t.starts_with(&b),
+                            _ => false,
+                        }
+                    };
                     let ok = !name.is_empty()
+                        && !std::path::Path::new(name).is_absolute()
                         && !name.contains("..")
+                        && !name.contains('\\')
                         && name.matches('/').count() <= 1
                         && name.ends_with(".gguf")
-                        && target.is_file();
+                        && target.is_file()
+                        && contained();
                     if !ok {
                         respond_json(&mut stream, 400, &serde_json::json!({"error": {"message": "invalid or unknown model"}}))
                     } else {
