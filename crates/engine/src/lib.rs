@@ -787,7 +787,10 @@ mod real {
         conv_v: DeviceBuf,
         /// decay logits factor through a rank-head_dim bottleneck
         f_a: MatW, // [n_embd -> head_dim]
-        f_b: MatW, // [head_dim -> d_inner]
+        /// [head_dim -> d_inner], kept f32. It is small (6MB a layer) and
+        /// it feeds an exponential, so the decay path is the last place to
+        /// want requant error.
+        f_b: DeviceBuf,
         beta_w: MatW, // [n_embd -> n_head]
         /// -exp(A_log), folded at conversion time, f32 [n_head]
         a: DeviceBuf,
@@ -2804,6 +2807,8 @@ mod real {
                     "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
                     "attn_k_b.weight", "attn_v_b.weight", "attn_gate.weight",
                     "attn_output.weight",
+                    // rides the layer's card (see the shexp load below)
+                    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
                 ];
                 let sufs = if shape.family == Family::K3 { K3_SUF } else { MLA_SUF };
                 let mut lb = vec![0u64; shape.n_exec_layer as usize];
@@ -3351,7 +3356,7 @@ mod real {
                                     conv_k: upload(&file, &gguf, &t("ssm_conv1d_k.weight"))?,
                                     conv_v: upload(&file, &gguf, &t("ssm_conv1d_v.weight"))?,
                                     f_a: MatW::load(&file, &gguf, &t("ssm_f_a.weight"))?,
-                                    f_b: MatW::load(&file, &gguf, &t("ssm_f_b.weight"))?,
+                                    f_b: upload_f16_as_f32(&file, &gguf, &t("ssm_f_b.weight"))?,
                                     beta_w: MatW::load(&file, &gguf, &t("ssm_beta.weight"))?,
                                     a: upload_as_f32(&file, &gguf, &t("ssm_a"))?,
                                     dt_bias: upload(&file, &gguf, &t("ssm_dt.bias"))?,
@@ -3404,15 +3409,20 @@ mod real {
                                 None // leading dense layer
                             },
                             shexp: if gguf.tensor(&t("ffn_gate_shexp.weight")).is_some() {
-                                let sh = K3Shexp {
-                                    gate: MatW::load(&file, &gguf, &t("ffn_gate_shexp.weight"))?,
-                                    up: MatW::load(&file, &gguf, &t("ffn_up_shexp.weight"))?,
-                                    down: MatW::load(&file, &gguf, &t("ffn_down_shexp.weight"))?,
-                                };
+                                // 6.8GB across 92 layers: far too much to
+                                // pile on the primary beside the router,
+                                // latent projections and embeddings. It
+                                // reads the layer's own input, so it rides
+                                // the layer's card and the ffn-normed row
+                                // hops over with it (28KB per layer).
                                 if a_dev != primary {
                                     kernels::set_device(a_dev)?;
                                 }
-                                Some(sh)
+                                Some(K3Shexp {
+                                    gate: MatW::load(&file, &gguf, &t("ffn_gate_shexp.weight"))?,
+                                    up: MatW::load(&file, &gguf, &t("ffn_up_shexp.weight"))?,
+                                    down: MatW::load(&file, &gguf, &t("ffn_down_shexp.weight"))?,
+                                })
                             } else {
                                 None
                             },
@@ -5026,11 +5036,14 @@ mod real {
                     let b = s.n_head_kv as usize * ctx as usize * kv_row(s.head_dim as usize);
                     (b, b)
                 }
-                // K3 is per-layer mixed: only the MLA quarter holds a
-                // latent cache, the KDA layers hold a fixed-size state
-                // instead, so one (k, v) pair cannot describe it. Sized
-                // per layer when Attn::K3 lands.
-                Family::K3 => (0, 0),
+                // K3 is per-layer mixed: these are the MLA-layer sizes
+                // (same compact latent cache as Family::Mla). The KDA
+                // layers take a placeholder in the loop below - their
+                // history is the delta state in K3Rt, not a cache.
+                Family::K3 => (
+                    ctx as usize * lat_row(s.n_kv_lora as usize),
+                    ctx as usize * lat_row(s.qk_rope as usize),
+                ),
             };
             if kvq != 0 {
                 let full = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
@@ -5150,6 +5163,12 @@ mod real {
                     } else {
                         (4, 4)
                     }
+                } else if s.family == Family::K3 {
+                    // only the MLA layers cache anything; ask the loaded
+                    // weights rather than recomputing the 3-then-1 pattern
+                    let is_mla = matches!(m.layers.get(i).map(|l| &l.attn),
+                                          Some(Attn::K3(w)) if w.mla.is_some());
+                    if is_mla { (k_bytes, v_bytes) } else { (4, 4) }
                 } else if s.family == Family::Dsv4 {
                     let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
                     let comp = if ratio > 0 {

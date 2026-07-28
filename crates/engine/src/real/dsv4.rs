@@ -1145,7 +1145,7 @@ impl Model {
             kernels::zero(&mut st.shared_out, (t * s.n_embd) as usize * 4)?;
         }
         kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
-        self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 3, t)?;
+        self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 3, t, self.shape.n_embd)?;
         if std::env::var_os("PULSAR_L0_LOG").is_some() && il <= 2 && (2046..2051).contains(&pos0) {
             kernels::sync()?;
             eprintln!("stage L{il} @{pos0} t={t} moe={:x} shexp={:x} sel={:?}", l0_hash(&st.moe_out, s.n_embd as usize), l0_hash(&st.shared_out, s.n_embd as usize), &selected[..s.n_expert_used.min(8) as usize]);
@@ -1159,7 +1159,15 @@ impl Model {
     /// the shared Moe arm: VRAM cache -> host LFU -> io_uring, staged
     /// per-slab. ponytail: no tiers/prefetch/grouped here; unify with
     /// eval_layer's resolve when the dsv4 perf pass starts.
-    pub(super) fn dsv4_moe(&self, st: &mut State, selected: &[i32], gate_exps: &super::ExpertTensor, up_exps: &super::ExpertTensor, down_exps: &super::ExpertTensor, act_op: u32, n_tok: u32) -> Result {
+    /// `w_exp` is the routed experts' input AND output width. It equals
+    /// n_embd for every family whose experts consume the residual
+    /// stream directly, but kimi-k3 runs them in a narrower latent
+    /// space, so it cannot be read off the shape here. The caller is
+    /// also responsible for `st.normed` holding that same input: the
+    /// tier and CPU-lane paths re-read and re-quantize it rather than
+    /// reusing st.xq.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dsv4_moe(&self, st: &mut State, selected: &[i32], gate_exps: &super::ExpertTensor, up_exps: &super::ExpertTensor, down_exps: &super::ExpertTensor, act_op: u32, n_tok: u32, w_exp: u32) -> Result {
         let s = self.shape;
         let primary = kernels::get_device();
         let mut distinct: Vec<i32> = selected
@@ -1193,7 +1201,7 @@ impl Model {
         let cpu_on = st.cpu_pool.is_some()
             && n_tok <= 8
             && !st.unified
-            && s.n_embd % 256 == 0
+            && w_exp % 256 == 0
             && s.n_ff_exp % 256 == 0
             && gate_exps.quant == up_exps.quant
             && [gate_exps.quant, down_exps.quant]
@@ -1204,7 +1212,7 @@ impl Model {
             down_exps.quant,
             gate_exps.row_bytes as usize,
             down_exps.row_bytes as usize,
-            s.n_embd as usize,
+            w_exp as usize,
             s.n_ff_exp as usize,
             act_op,
         );
@@ -1245,7 +1253,7 @@ impl Model {
         }
         if !lane.is_empty() {
             let rw = st.router_weights.read_f32(n_tok as usize * s.n_expert_used as usize)?;
-            let normed_h = st.normed.read_f32(n_tok as usize * s.n_embd as usize)?;
+            let normed_h = st.normed.read_f32(n_tok as usize * w_exp as usize)?;
             let pool = st.cpu_pool.as_ref().unwrap();
             cpu_guard = Some(super::cpu_tier::WaitGuard {
                 pool,
@@ -1369,14 +1377,14 @@ impl Model {
             if tier_slots[ti] == 0 {
                 continue;
             }
-            let normed_bytes = (n_tok * s.n_embd) as usize * 4;
+            let normed_bytes = (n_tok * w_exp) as usize * 4;
             let weight_bytes = (n_tok * s.n_expert_used) as usize * 4;
             let tier = &mut st.tiers[ti];
             tier.hits += tier_slots[ti];
             kernels::copy_across(&mut tier.xin, &st.normed, normed_bytes)?;
             kernels::copy_across(&mut tier.weights, &st.router_weights, weight_bytes)?;
             kernels::set_device(tier.dev)?;
-            kernels::quantize_q8_k(&mut tier.xq, &tier.xin, s.n_embd, n_tok)?;
+            kernels::quantize_q8_k(&mut tier.xq, &tier.xin, w_exp, n_tok)?;
             let mut ran_grouped = false;
             if grouped {
                 // CSR: distinct expert -> [(token << 4) | slot]
@@ -1412,19 +1420,19 @@ impl Model {
                     kernels::moe_pair_swiglu_grouped(
                         &mut tier.mid, &tier.grp_ptrs, &tier.grp_starts, &tier.grp_pairs,
                         &tier.weights, &tier.xq,
-                        s.n_embd, s.n_ff_exp, s.n_expert_used, n_group,
+                        w_exp, s.n_ff_exp, s.n_expert_used, n_group,
                         gate_exps.row_bytes, gate_exps.quant, act_op,
                     )?;
                     kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
-                    let pbytes = n_tok as usize * s.n_expert_used as usize * s.n_embd as usize * 4;
+                    let pbytes = n_tok as usize * s.n_expert_used as usize * w_exp as usize * 4;
                     kernels::zero(&mut tier.grp_partial, pbytes)?;
                     kernels::moe_down_grouped(
                         &mut tier.grp_partial, &tier.grp_ptrs, &tier.grp_starts, &tier.grp_pairs,
                         &tier.midq,
-                        s.n_ff_exp, s.n_embd, s.n_expert_used, n_group,
+                        s.n_ff_exp, w_exp, s.n_expert_used, n_group,
                         down_exps.row_bytes, down_exps.quant,
                     )?;
-                    kernels::moe_slot_sum(&mut tier.out, &tier.grp_partial, s.n_embd, s.n_expert_used, n_tok)?;
+                    kernels::moe_slot_sum(&mut tier.out, &tier.grp_partial, w_exp, s.n_expert_used, n_tok)?;
                     ran_grouped = true;
                 }
             }
@@ -1432,12 +1440,12 @@ impl Model {
                 tier.ptrs.write(0, kernels::as_bytes(&tptrs[ti]))?;
                 kernels::moe_pair_swiglu(
                     &mut tier.mid, &tier.ptrs, &tier.weights, &tier.xq,
-                    s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, act_op,
+                    w_exp, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, act_op,
                 )?;
                 kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
                 kernels::moe_down(
                     &mut tier.out, &tier.ptrs, &tier.midq,
-                    s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+                    s.n_ff_exp, w_exp, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
                 )?;
             }
             kernels::set_device(primary)?;
@@ -1448,12 +1456,12 @@ impl Model {
         // act_op 3 = deepseek4 clamped silu, 0 = plain silu (qwen35)
         kernels::moe_pair_swiglu(
             &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
-            s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, act_op,
+            w_exp, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, act_op,
         )?;
         kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
         kernels::moe_down(
             &mut st.moe_out, &st.expert_ptrs, &st.midq,
-            s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+            s.n_ff_exp, w_exp, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
         )?;
 
         // gather tier partials (blocking copy issued on the tier device
@@ -1461,12 +1469,12 @@ impl Model {
         // float adds vs the single-device loop - the documented tier
         // drift class; PULSAR_TIERS=off restores exact.
         for ti in active {
-            let n = (n_tok * s.n_embd) as usize * 4;
+            let n = (n_tok * w_exp) as usize * 4;
             let tier = &st.tiers[ti];
             kernels::set_device(tier.dev)?;
             kernels::copy_across(&mut st.tier_ret, &tier.out, n)?;
             kernels::set_device(primary)?;
-            kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * s.n_embd)?;
+            kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * w_exp)?;
         }
 
         // CPU-lane join: stage A ran under ensure_with + the launches
@@ -1484,7 +1492,7 @@ impl Model {
                 st.cpu_ret = DeviceBuf::alloc(acc.len() * 4)?;
             }
             st.cpu_ret.write(0, kernels::as_bytes(&acc))?;
-            kernels::add_assign(&mut st.moe_out, &st.cpu_ret, n_tok * s.n_embd)?;
+            kernels::add_assign(&mut st.moe_out, &st.cpu_ret, n_tok * w_exp)?;
         }
         Ok(())
     }

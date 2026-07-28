@@ -66,6 +66,17 @@ struct K3Scratch {
     /// hop buffers for the residual in / attention out
     normed_a: DeviceBuf,
     attn_out_a: DeviceBuf,
+    /// ffn-side hop: the shared experts live on this card too, and they
+    /// read the ffn-normed row, which is a different vector from the
+    /// attention-normed one above
+    ffn_normed_a: DeviceBuf,
+    shexp_out: DeviceBuf,
+    /// q8_K of the ffn-normed row / the shared-expert mid
+    xq_ffn: DeviceBuf,
+    xq_mid: DeviceBuf,
+    gate_sh: DeviceBuf,
+    up_sh: DeviceBuf,
+    mid_sh: DeviceBuf,
     xq: DeviceBuf,
     // KDA
     q: DeviceBuf,
@@ -102,6 +113,13 @@ impl K3Scratch {
             dev,
             normed_a: f32s(s.n_embd as usize)?,
             attn_out_a: f32s(s.n_embd as usize)?,
+            ffn_normed_a: f32s(s.n_embd as usize)?,
+            shexp_out: f32s(s.n_embd as usize)?,
+            xq_ffn: DeviceBuf::alloc((s.n_embd as usize).div_ceil(256) * 292)?,
+            xq_mid: DeviceBuf::alloc((s.n_ff_shexp.max(1) as usize).div_ceil(256) * 292)?,
+            gate_sh: f32s(s.n_ff_shexp.max(1) as usize)?,
+            up_sh: f32s(s.n_ff_shexp.max(1) as usize)?,
+            mid_sh: f32s(s.n_ff_shexp.max(1) as usize)?,
             // q8_K blocks: 256 values -> 292 bytes, over the widest input
             // any matw on this card sees (n_embd or the latent width)
             xq: DeviceBuf::alloc(
@@ -133,6 +151,13 @@ impl K3Scratch {
 }
 
 pub(super) struct K3Rt {
+    /// The primary device, captured at construction. Do NOT re-derive it
+    /// with get_device() inside the forward: the expert warm-start and
+    /// the tier/slab machinery legitimately leave another card current,
+    /// and a layer that mistakes device 0 for the primary hands a
+    /// device-1 pointer to a device-0 kernel - an illegal access that
+    /// only shows up once the census is warm enough to trigger it.
+    primary: i32,
     states: Vec<Option<KdaState>>,
     scratch: Vec<K3Scratch>,
     /// AttnRes checkpoint bank, [n_ckpt][n_embd] on the primary. One
@@ -202,6 +227,7 @@ impl K3Rt {
         };
         let lat = if s.n_expert_latent > 0 { s.n_expert_latent } else { s.n_embd };
         Ok(K3Rt {
+            primary,
             states,
             scratch,
             ckpt: f32s((max_ckpt.max(1) * s.n_embd) as usize)?,
@@ -243,6 +269,9 @@ impl Model {
         if pos0 + tokens.len() as u32 > st.ctx {
             return Err("position exceeds context".into());
         }
+        if std::env::var_os("PULSAR_K3_DEBUG").is_some() {
+            eprintln!("  k3 forward: {} tokens, pos0 {pos0}, rows {rows}", tokens.len());
+        }
         let mut rt = st.k3.take().ok_or("k3 state missing")?;
         let r = self.forward_k3_inner(st, &mut rt, tokens, pos0, rows);
         st.k3 = Some(rt);
@@ -254,15 +283,24 @@ impl Model {
         if pos0 == 0 {
             rt.reset()?;
         }
-        let primary = kernels::get_device();
+        let primary = rt.primary;
+        kernels::set_device(primary)?;
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = pos0 + i as u32;
             let ids = [tok as i32];
             st.tok.write(0, kernels::as_bytes(&ids))?;
             kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, 1)?;
             rt.n_ckpt = 0;
+            let dbg = std::env::var_os("PULSAR_K3_DEBUG").is_some();
             for il in 0..s.n_exec_layer as usize {
                 self.eval_k3_layer(st, rt, il, &self.layers[il], pos)?;
+                if dbg {
+                    kernels::sync()?;
+                    let v = st.cur.read_f32(s.n_embd as usize)?;
+                    let n = (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+                    let bad = v.iter().filter(|x| !x.is_finite()).count();
+                    eprintln!("  k3 L{il:>2}: rms {n:.4e} nonfinite {bad} head {:.4} {:.4}", v[0], v[1]);
+                }
             }
             kernels::set_device(primary)?;
         }
@@ -299,7 +337,7 @@ impl Model {
     fn eval_k3_layer(&self, st: &mut State, rt: &mut K3Rt, il: usize, l: &LayerW, pos: u32) -> Result {
         let s = self.shape;
         let eps = s.rms_eps;
-        let primary = kernels::get_device();
+        let primary = rt.primary;
         let Attn::K3(w) = &l.attn else {
             return Err("k3 layer without K3 attn weights".into());
         };
@@ -359,8 +397,23 @@ impl Model {
             // decay logits through the rank-head_dim bottleneck, then
             // beta per head; both finished on-device by k3_kda_coeffs
             matw(&mut sc.fa, &kda.f_a, xin, &sc.xq, n_embd, s.kda_head_dim, 1)?;
-            matw(&mut sc.g, &kda.f_b, &sc.fa, &sc.xq, s.kda_head_dim, d_inner, 1)?;
+            kernels::matmul_f32(&mut sc.g, &kda.f_b, &sc.fa, s.kda_head_dim, d_inner, 1)?;
             matw(&mut sc.beta, &kda.beta_w, xin, &sc.xq, n_embd, s.n_head, 1)?;
+            if std::env::var("PULSAR_K3_PROBE").ok().and_then(|v| v.parse::<usize>().ok()) == Some(il) {
+                kernels::sync()?;
+                let st_ = |b: &DeviceBuf, n: usize| -> Result<String> {
+                    let v = b.read_f32(n)?;
+                    let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+                    let nf = v.iter().filter(|x| !x.is_finite()).count();
+                    let mx = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mn = v.iter().cloned().fold(f32::INFINITY, f32::min);
+                    Ok(format!("rms {rms:.3e} nf {nf} min {mn:.3e} max {mx:.3e}"))
+                };
+                eprintln!("    L{il} fa      {}", st_(&sc.fa, s.kda_head_dim as usize)?);
+                eprintln!("    L{il} g_raw   {}", st_(&sc.g, d_inner as usize)?);
+                eprintln!("    L{il} dt_bias {}", st_(&kda.dt_bias, d_inner as usize)?);
+                eprintln!("    L{il} a       {}", st_(&kda.a, s.n_head as usize)?);
+            }
             kernels::k3_kda_coeffs(
                 &mut sc.g, &mut sc.beta, &kda.a, &kda.dt_bias,
                 1, s.n_head, s.kda_head_dim, s.kda_gate_lb,
@@ -372,10 +425,36 @@ impl Model {
             kernels::qwen35_conv_step(&mut sc.cv, &sc.v, &kda.conv_v, &mut ks.conv_v, d_inner, s.ssm_conv_k)?;
             kernels::qwen35_l2_norm(&mut sc.cq, s.n_head, s.kda_head_dim, eps)?;
             kernels::qwen35_l2_norm(&mut sc.ck, s.n_head, s.kda_head_dim, eps)?;
+            let probe = std::env::var("PULSAR_K3_PROBE").ok()
+                .and_then(|v| v.parse::<usize>().ok()) == Some(il);
+            if probe {
+                kernels::sync()?;
+                let r = |b: &DeviceBuf, n: usize| -> Result<String> {
+                    let v = b.read_f32(n)?;
+                    let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+                    let nf = v.iter().filter(|x| !x.is_finite()).count();
+                    Ok(format!("rms {rms:.3e} nf {nf}"))
+                };
+                eprintln!("    L{il} in    {}", r(xin, n_embd as usize)?);
+                eprintln!("    L{il} q     {}", r(&sc.q, d_inner as usize)?);
+                eprintln!("    L{il} cq    {}", r(&sc.cq, d_inner as usize)?);
+                eprintln!("    L{il} ck    {}", r(&sc.ck, d_inner as usize)?);
+                eprintln!("    L{il} cv    {}", r(&sc.cv, d_inner as usize)?);
+                eprintln!("    L{il} g     {}", r(&sc.g, d_inner as usize)?);
+                eprintln!("    L{il} beta  {}", r(&sc.beta, s.n_head as usize)?);
+                eprintln!("    L{il} state {}", r(&ks.s, (s.n_head * s.kda_head_dim * s.kda_head_dim) as usize)?);
+            }
             kernels::k3_kda_step(
                 &mut sc.o, &mut ks.s, &sc.cq, &sc.ck, &sc.cv, &sc.g, &sc.beta,
                 s.n_head, s.kda_head_dim,
             )?;
+            if probe {
+                kernels::sync()?;
+                let v = sc.o.read_f32(d_inner as usize)?;
+                let rms = (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+                let nf = v.iter().filter(|x| !x.is_finite()).count();
+                eprintln!("    L{il} o     rms {rms:.3e} nf {nf}");
+            }
             // per-head rms norm, then the full-rank sigmoid output gate
             kernels::gqa_head_rms_norm(&mut sc.o, Some(&kda.ssm_norm), s.n_head, s.kda_head_dim, eps)?;
             kernels::qwen35_sigmoid_gate(&mut sc.o, &sc.gate, d_inner)?;
@@ -443,6 +522,13 @@ impl Model {
         } else {
             kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, n_embd)?;
         }
+        if false {
+            kernels::sync()?;
+            let a = st.attn_out.read_f32(n_embd as usize)?;
+            let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+            eprintln!("    L{il:>2} {} attn_out rms {:.3e} banked {} nckpt {}",
+                      if w.kda.is_some() { "kda" } else { "mla" }, rms(&a), banked, rt.n_ckpt);
+        }
 
         // ---- FFN half: AttnRes mix #2, then dense or latent MoE
         if s.attn_res_block > 0 {
@@ -480,6 +566,7 @@ impl Model {
             return Err("k3 layer without a dense or MoE ffn".into());
         };
         let routed = w.routed.as_ref().ok_or("k3 MoE layer without latent projections")?;
+        let rt_primary = rt.primary;
 
         // The router scores the FULL-WIDTH input while the experts consume
         // the latent one, so the logits come off `normed`, not lat_in.
@@ -497,31 +584,53 @@ impl Model {
             0,
         )?;
 
-        // shared experts stay at n_embd and read the un-projected input
+        // Shared experts read the un-projected input and live on the
+        // layer's card, so the ffn-normed row hops over and the result
+        // hops back. Two 28KB copies per layer.
         let _ = shexp; // K3 carries its own native-quant triple in K3W
+        let primary = rt.primary;
         if let Some(sh) = &w.shexp {
             let ffw = s.n_ff_shexp;
-            kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, 1)?;
-            matw(&mut st.gate_act, &sh.gate, &st.normed, &st.xq, s.n_embd, ffw, 1)?;
-            matw(&mut st.up_act, &sh.up, &st.normed, &st.xq, s.n_embd, ffw, 1)?;
-            kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, ffw, 0.0, 1.0, act)?;
-            kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, ffw, 1)?;
-            matw(&mut st.shared_out, &sh.down, &st.ffn_mid, &st.midq, ffw, s.n_embd, 1)?;
+            let a_dev = self.attn_layer_dev.get(il).copied().unwrap_or(primary);
+            let sc = rt.scratch.iter_mut().find(|x| x.dev == a_dev).ok_or("k3 scratch")?;
+            if a_dev != primary {
+                kernels::copy_across(&mut sc.ffn_normed_a, &st.normed, s.n_embd as usize * 4)?;
+                kernels::set_device(a_dev)?;
+            } else {
+                kernels::copy_d2d(&mut sc.ffn_normed_a, 0, &st.normed, 0, s.n_embd as usize * 4)?;
+            }
+            kernels::quantize_q8_k(&mut sc.xq_ffn, &sc.ffn_normed_a, s.n_embd, 1)?;
+            matw(&mut sc.gate_sh, &sh.gate, &sc.ffn_normed_a, &sc.xq_ffn, s.n_embd, ffw, 1)?;
+            matw(&mut sc.up_sh, &sh.up, &sc.ffn_normed_a, &sc.xq_ffn, s.n_embd, ffw, 1)?;
+            kernels::swiglu(&mut sc.mid_sh, &sc.gate_sh, &sc.up_sh, ffw, 0.0, 1.0, act)?;
+            kernels::quantize_q8_k(&mut sc.xq_mid, &sc.mid_sh, ffw, 1)?;
+            matw(&mut sc.shexp_out, &sh.down, &sc.mid_sh, &sc.xq_mid, ffw, s.n_embd, 1)?;
+            if a_dev != primary {
+                kernels::copy_across(&mut st.shared_out, &sc.shexp_out, s.n_embd as usize * 4)?;
+                kernels::set_device(primary)?;
+            } else {
+                kernels::copy_d2d(&mut st.shared_out, 0, &sc.shexp_out, 0, s.n_embd as usize * 4)?;
+            }
         } else {
             kernels::zero(&mut st.shared_out, s.n_embd as usize * 4)?;
         }
 
         // routed half runs in the latent space
-        let sc_dev = kernels::get_device();
-        let sc = rt.scratch.iter_mut().find(|x| x.dev == sc_dev).ok_or("k3 scratch")?;
+        let sc = rt.scratch.iter_mut().find(|x| x.dev == rt_primary).ok_or("k3 scratch")?;
         if matches!(routed.down, MatW::Kq(_)) {
             kernels::quantize_q8_k(&mut sc.xq, &st.normed, s.n_embd, 1)?;
         }
         matw(&mut rt.lat_in, &routed.down, &st.normed, &sc.xq, s.n_embd, s.n_expert_latent, 1)?;
+        // The tier and CPU-lane paths inside dsv4_moe re-read st.normed as
+        // the expert input rather than reusing st.xq, so the latent row has
+        // to land there too. Safe here: the router logits and the shared
+        // experts have both already consumed the full-width normed, and
+        // nothing reads it again this layer.
+        kernels::copy_d2d(&mut st.normed, 0, &rt.lat_in, 0, s.n_expert_latent as usize * 4)?;
         kernels::quantize_q8_k(&mut st.xq, &rt.lat_in, s.n_expert_latent, 1)?;
         kernels::sync()?;
         let selected = st.router_selected.read_i32(s.n_expert_used as usize)?;
-        self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 0, 1)?;
+        self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 0, 1, s.n_expert_latent)?;
         // moe_out is latent-wide here, not n_embd
         if let Some(n) = &routed.norm {
             kernels::rms_norm(&mut rt.lat_out, &st.moe_out, n, s.n_expert_latent, 1, s.rms_eps)?;

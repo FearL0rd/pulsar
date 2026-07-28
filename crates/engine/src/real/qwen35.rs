@@ -1200,7 +1200,7 @@ impl Model {
         kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
         kernels::sync()?;
         let selected = st.router_selected.read_i32((t * s.n_expert_used) as usize)?;
-        self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 0, t)?;
+        self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 0, t, s.n_embd)?;
         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, t * s.n_embd)?;
         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
         Ok(())

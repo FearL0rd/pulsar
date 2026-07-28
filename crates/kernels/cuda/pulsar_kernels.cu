@@ -902,10 +902,20 @@ extern "C" int pulsar_router_select(
         uint32_t n_shexp) {
     if (n_expert == 0 || k_used == 0 || k_used > n_expert || n_tok == 0 ||
         (softmax_mode != 2u && n_shexp != 0) ||
-        n_expert + (softmax_mode == 2u ? n_shexp : 0u) > 512u) {
+        n_expert + (softmax_mode == 2u ? n_shexp : 0u) > 1024u) {
         return 0;
     }
     dim3 block(32, 4, 1);
+    const uint32_t n_route = n_expert + (softmax_mode == 2u ? n_shexp : 0u);
+    /* J = per-lane slots, so the warp covers J*32 experts. kimi-k3 routes
+     * 896 of them, past what J=16 holds. */
+    if (n_route > 512u) {
+        router_select_kernel<32><<<(n_tok + 3u) / 4u, block>>>(
+                (int32_t *)selected_dev, (float *)weights_dev,
+                (const float *)logits_dev, (const float *)bias_dev,
+                n_expert, k_used, weight_scale, n_tok, softmax_mode, n_shexp);
+        return cuda_ok(cudaGetLastError(), "router select launch");
+    }
     if (n_expert > 256u || (softmax_mode == 2u && n_expert + n_shexp > 256u)) {
         router_select_kernel<16><<<(n_tok + 3u) / 4u, block>>>(
                 (int32_t *)selected_dev, (float *)weights_dev,
@@ -938,9 +948,13 @@ static int router_selftest_one(uint32_t n_expert, uint32_t k_used,
     for (uint32_t e = 0; e < n_expert; e++)
         bias[e] = softmax ? 0.0f : gqa_test_randf();
 
+    /* heap, not stack: these were fixed [512] arrays, which n_expert 896
+     * (kimi-k3) walked straight past - the resulting "kernel mismatch"
+     * was the reference corrupting its own frame. */
+    float *prob = (float *)malloc((uint64_t)n_expert * sizeof(float));
+    float *score = (float *)malloc((uint64_t)n_expert * sizeof(float));
     for (uint32_t t = 0; t < n_tok; t++) {
         const float *log = logits + (uint64_t)t * n_expert;
-        float prob[512], score[512];
         float lmax = -INFINITY, lsum = 0.0f;
         if (softmax) {
             for (uint32_t e = 0; e < n_expert; e++) lmax = fmaxf(lmax, log[e]);
@@ -1002,6 +1016,7 @@ static int router_selftest_one(uint32_t n_expert, uint32_t k_used,
     if (bias_dev) cudaFree(bias_dev);
     if (sel_dev) cudaFree(sel_dev);
     if (w_dev) cudaFree(w_dev);
+    free(prob); free(score);
     free(logits); free(bias); free(sel_ref); free(w_ref); free(sel_gpu); free(w_gpu);
     return ok;
 }
@@ -1096,12 +1111,15 @@ static int router_sink_selftest_one(uint32_t n_expert, uint32_t k_used,
 extern "C" int pulsar_router_selftest(void) {
     /* Hy3-like (64 experts, top-8), GLM-like (256, top-8), odd token
      * count; qwen3moe-like softmax (128, top-8) + wide softmax (384);
-     * inkling sink (256 routed + 2 shared, top-6) */
+     * inkling sink (256 routed + 2 shared, top-6); kimi-k3 (896, top-16,
+     * the J=32 path) */
     return router_selftest_one(64, 8, 2.5f, 7, 0) &&
            router_selftest_one(256, 8, 1.0f, 5, 0) &&
            router_selftest_one(96, 6, 1.5f, 1, 0) &&
            router_selftest_one(128, 8, 1.0f, 6, 1) &&
            router_selftest_one(384, 8, 1.0f, 3, 1) &&
+           router_selftest_one(896, 16, 1.0f, 3, 0) &&
+           router_selftest_one(896, 16, 1.0f, 2, 1) &&
            router_sink_selftest_one(256, 6, 2, 8.0f, 5) &&
            router_sink_selftest_one(64, 4, 1, 1.0f, 3);
 }
