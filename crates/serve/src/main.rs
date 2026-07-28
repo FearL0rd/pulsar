@@ -352,11 +352,31 @@ fn run() -> engine::Result {
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("");
-                    let mut models: Vec<_> = std::fs::read_dir(&dir)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .filter_map(|e| {
+                    // A split model lives in its own directory, so the
+                    // listing has to look one level down - and when the
+                    // CURRENT model is one of those, one level up as well,
+                    // or switching back to a top-level model is impossible.
+                    let base = dir
+                        .parent()
+                        .filter(|p| has_gguf(p))
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| dir.clone());
+                    let mut scan = vec![base.clone()];
+                    scan.extend(
+                        std::fs::read_dir(&base)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .map(|e| e.path())
+                            .filter(|p| p.is_dir()),
+                    );
+                    let cur_rel = std::path::Path::new(&model_path)
+                        .strip_prefix(&base)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| cur.to_string());
+                    let mut models: Vec<serde_json::Value> = Vec::new();
+                    for d in scan {
+                        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
                             let name = e.file_name().to_string_lossy().into_owned();
                             // skip non-servable: MTP draft sidecars, and full-
                             // precision source checkpoints (the -F16/-BF16 quant
@@ -366,13 +386,36 @@ fn run() -> engine::Result {
                                 || name.ends_with("-F16.gguf")
                                 || name.ends_with("-BF16.gguf")
                             {
-                                return None;
+                                continue;
                             }
-                            let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
-                            Some(serde_json::json!({"id": name, "bytes": bytes, "current": name == cur}))
-                        })
-                        .collect();
-                    models.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+                            // One entry per MODEL, not per file: a split gguf
+                            // is served by opening shard 1, so the later
+                            // shards are not separately loadable and listing
+                            // them offers 93 broken choices.
+                            let split = split_shard(&name);
+                            if matches!(split, Some(n) if n != 1) {
+                                continue;
+                            }
+                            let path = e.path();
+                            let bytes = if split.is_some() {
+                                // the whole model, not the 638MB first shard
+                                dir_gguf_bytes(&d, &name)
+                            } else {
+                                e.metadata().map(|m| m.len()).unwrap_or(0)
+                            };
+                            let id = path
+                                .strip_prefix(&base)
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_else(|_| name.clone());
+                            models.push(serde_json::json!({
+                                "id": id,
+                                "label": pretty_model_name(&name),
+                                "bytes": bytes,
+                                "current": id == cur_rel,
+                            }));
+                        }
+                    }
+                    models.sort_by(|a, b| a["label"].as_str().cmp(&b["label"].as_str()));
                     respond_json(&mut stream, 200, &serde_json::json!({"models": models}))
                 }
                 // Switch model: validate, ack, then re-exec with the new -m.
@@ -383,9 +426,18 @@ fn run() -> engine::Result {
                         .parent()
                         .map(|p| p.to_path_buf())
                         .unwrap_or_default();
-                    let target = dir.join(name);
+                    // ids may carry one directory component (split models
+                    // live in their own folder); resolve against the same
+                    // base the listing used, and refuse traversal.
+                    let base = dir
+                        .parent()
+                        .filter(|p| has_gguf(p))
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| dir.clone());
+                    let target = base.join(name);
                     let ok = !name.is_empty()
-                        && !name.contains('/')
+                        && !name.contains("..")
+                        && name.matches('/').count() <= 1
                         && name.ends_with(".gguf")
                         && target.is_file();
                     if !ok {
@@ -561,6 +613,62 @@ fn cpu_name() -> String {
 /// Re-exec this process with a different `-m` model, keeping every other arg
 /// (host/port/ctx). Same PID/systemd unit; the new image reloads the model.
 /// Only returns (with an error) if exec fails. The model path is validated by
+/// True when `d` directly contains at least one .gguf.
+fn has_gguf(d: &std::path::Path) -> bool {
+    std::fs::read_dir(d)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().ends_with(".gguf"))
+}
+
+/// `Some(n)` when `name` is shard n of a split gguf (`-00007-of-00094.gguf`).
+fn split_shard(name: &str) -> Option<u32> {
+    let stem = name.strip_suffix(".gguf")?;
+    let (head, total) = stem.rsplit_once("-of-")?;
+    if total.len() != 5 || !total.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (_, n) = head.rsplit_once('-')?;
+    if n.len() != 5 || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
+}
+
+/// Total bytes of every shard of the split model `first` belongs to.
+fn dir_gguf_bytes(d: &std::path::Path, first: &str) -> u64 {
+    let prefix = match first.rsplit_once("-of-") {
+        Some((head, _)) => match head.rsplit_once('-') {
+            Some((p, _)) => p.to_string(),
+            None => return 0,
+        },
+        None => return 0,
+    };
+    std::fs::read_dir(d)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(&prefix) && n.ends_with(".gguf") && split_shard(&n).is_some()
+        })
+        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+        .sum()
+}
+
+/// Display name: drop the .gguf and the `-00001-of-00094` shard suffix.
+fn pretty_model_name(name: &str) -> String {
+    let stem = name.strip_suffix(".gguf").unwrap_or(name);
+    match stem.rsplit_once("-of-") {
+        Some((head, _)) => match head.rsplit_once('-') {
+            Some((p, n)) if n.len() == 5 && n.bytes().all(|b| b.is_ascii_digit()) => p.to_string(),
+            _ => stem.to_string(),
+        },
+        None => stem.to_string(),
+    }
+}
+
 /// the caller to be a .gguf inside the current model's directory.
 #[cfg(target_os = "linux")]
 fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>, mtp: bool, kv: Option<&str>) -> std::io::Error {

@@ -1521,7 +1521,8 @@ async function loadModelList() {
     for (const m of models) {
       const opt = document.createElement("option");
       opt.value = m.id;
-      opt.textContent = stem(m.id) + "  (" + (m.bytes / 1073741824).toFixed(0) + "GiB)";
+      // label is the model name with the shard suffix already stripped
+      opt.textContent = (m.label || stem(m.id)) + "  (" + (m.bytes / 1073741824).toFixed(0) + "GiB)";
       if (m.current) opt.selected = true;
       modelSwitch.appendChild(opt);
     }
