@@ -775,6 +775,7 @@ mod real {
         /// input is projected down and the result normed and projected
         /// back up. Absent on the leading dense layer.
         routed: Option<K3Routed>,
+        shexp: Option<K3Shexp>,
     }
     struct K3Kda {
         wq: MatW, // [n_embd -> d_inner]
@@ -809,6 +810,15 @@ mod real {
         /// reads the NORMED layer input, not the attention result
         gate: MatW, // [n_embd -> n_head*value_mla]
         out: MatW,
+    }
+    /// K3's shared experts stay in native K-quant. The generic Ffn::Moe
+    /// slot requants to q8_0, which for K3's 2x6144 fused pair is 12.9GB
+    /// across 92 layers - more than the primary card holds on its own.
+    /// Native Q4_K halves that. Loaded on the primary, like Ffn::Moe's.
+    struct K3Shexp {
+        gate: MatW,
+        up: MatW,
+        down: MatW,
     }
     struct K3Routed {
         down: MatW,           // [n_embd -> latent]
@@ -2769,11 +2779,14 @@ mod real {
                 && attn_dev.is_none()
                 && std::env::var("PULSAR_ATTN_GPU").ok().as_deref().is_none_or(|v| v != "off" && v != "-1")
             {
-                // K3 weighs both layer flavours plus the per-layer pieces
-                // that ride with them (shared experts and the latent
-                // projections are resident too, and dwarf the KDA stack
-                // on MoE layers - leaving them out plans a split that
-                // does not fit).
+                // K3 weighs exactly what the loader puts on the layer's
+                // card: everything built inside the Attn::K3 arm. The
+                // shared experts, the router and the dense FFN are
+                // uploaded after the device is restored, so they live on
+                // the primary and counting them here plans a split that
+                // pushes layers onto an already-loaded primary until it
+                // OOMs (measured: 10 layers overflowed, cudaMalloc died
+                // 42s into the load).
                 const MLA_SUF: &[&str] = &[
                     "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
                     "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
@@ -2791,12 +2804,6 @@ mod real {
                     "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
                     "attn_k_b.weight", "attn_v_b.weight", "attn_gate.weight",
                     "attn_output.weight",
-                    "attn_norm.weight", "ffn_norm.weight",
-                    "attn_res_score.weight", "ffn_res_score.weight",
-                    "ffn_routed_down.weight", "ffn_routed_up.weight",
-                    "ffn_routed_norm.weight", "ffn_gate_inp.weight",
-                    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
-                    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
                 ];
                 let sufs = if shape.family == Family::K3 { K3_SUF } else { MLA_SUF };
                 let mut lb = vec![0u64; shape.n_exec_layer as usize];
@@ -3265,7 +3272,9 @@ mod real {
                         },
                         // inkling's ffn_*_shexp are 3D BANKS (the sink
                         // ExpertTensors below), not the 2D dense triple
-                        shexp: if !ink_arch && gguf.tensor(&t("ffn_gate_shexp.weight")).is_some() {
+                        shexp: if !ink_arch
+                            && shape.family != Family::K3
+                            && gguf.tensor(&t("ffn_gate_shexp.weight")).is_some() {
                             Some((
                                 upload(&file, &gguf, &t("ffn_gate_shexp.weight"))?,
                                 upload(&file, &gguf, &t("ffn_up_shexp.weight"))?,
@@ -3368,10 +3377,20 @@ mod real {
                                     out: MatW::load(&file, &gguf, &t("attn_output.weight"))?,
                                 })
                             },
-                            attn_res_score: upload(&file, &gguf, &t("attn_res_score.weight"))?,
+                            // These four are consumed on the PRIMARY (the
+                            // AttnRes mix and the FFN half both run against
+                            // the primary's residual stream), so they must
+                            // live there whatever card the attention half
+                            // landed on. Reading a peer pointer from the
+                            // wrong device is an illegal access, not a slow
+                            // path.
+                            attn_res_score: {
+                                kernels::set_device(primary)?;
+                                upload(&file, &gguf, &t("attn_res_score.weight"))?
+                            },
                             ffn_res_score: upload(&file, &gguf, &t("ffn_res_score.weight"))?,
                             routed: if gguf.tensor(&t("ffn_routed_down.weight")).is_some() {
-                                Some(K3Routed {
+                                let r = K3Routed {
                                     down: MatW::load(&file, &gguf, &t("ffn_routed_down.weight"))?,
                                     up: MatW::load(&file, &gguf, &t("ffn_routed_up.weight"))?,
                                     norm: if gguf.tensor(&t("ffn_routed_norm.weight")).is_some() {
@@ -3379,9 +3398,23 @@ mod real {
                                     } else {
                                         None
                                     },
-                                })
+                                };
+                                Some(r)
                             } else {
                                 None // leading dense layer
+                            },
+                            shexp: if gguf.tensor(&t("ffn_gate_shexp.weight")).is_some() {
+                                let sh = K3Shexp {
+                                    gate: MatW::load(&file, &gguf, &t("ffn_gate_shexp.weight"))?,
+                                    up: MatW::load(&file, &gguf, &t("ffn_up_shexp.weight"))?,
+                                    down: MatW::load(&file, &gguf, &t("ffn_down_shexp.weight"))?,
+                                };
+                                if a_dev != primary {
+                                    kernels::set_device(a_dev)?;
+                                }
+                                Some(sh)
+                            } else {
+                                None
                             },
                         }))
                     }
@@ -5556,7 +5589,7 @@ mod real {
                     None
                 },
                 k3: if s.family == Family::K3 {
-                    Some(k3::K3Rt::new(m)?)
+                    Some(k3::K3Rt::new(m, ctx)?)
                 } else {
                     None
                 },

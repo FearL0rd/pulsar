@@ -91,7 +91,7 @@ struct K3Scratch {
 }
 
 impl K3Scratch {
-    fn new(m: &Model, dev: i32) -> Result<K3Scratch> {
+    fn new(m: &Model, dev: i32, ctx: u32) -> Result<K3Scratch> {
         let s = m.shape;
         kernels::set_device(dev)?;
         let f32s = |n: usize| DeviceBuf::alloc(n * 4);
@@ -125,7 +125,9 @@ impl K3Scratch {
             kv_norm: f32s(s.n_kv_lora as usize)?,
             qk_low: f32s((s.n_head * s.n_kv_lora) as usize)?,
             heads: f32s((s.n_head * s.value_mla) as usize)?,
-            selected: DeviceBuf::alloc(0)?,
+            // one u32 per visible row: mla_fill_selected_range writes
+            // `visible` entries, which grows to the full context
+            selected: DeviceBuf::alloc(ctx as usize * 4)?,
         })
     }
 }
@@ -150,7 +152,7 @@ pub(super) struct K3Rt {
 }
 
 impl K3Rt {
-    pub fn new(m: &Model) -> Result<K3Rt> {
+    pub fn new(m: &Model, ctx: u32) -> Result<K3Rt> {
         let s = m.shape;
         let primary = kernels::get_device();
         let d_inner = (s.n_head * s.kda_head_dim) as usize;
@@ -188,7 +190,7 @@ impl K3Rt {
         devs.dedup();
         let mut scratch = Vec::with_capacity(devs.len());
         for d in devs {
-            scratch.push(K3Scratch::new(m, d)?);
+            scratch.push(K3Scratch::new(m, d, ctx)?);
         }
 
         kernels::set_device(primary)?;
@@ -496,12 +498,15 @@ impl Model {
         )?;
 
         // shared experts stay at n_embd and read the un-projected input
-        if let Some((sg, su, sd)) = shexp {
+        let _ = shexp; // K3 carries its own native-quant triple in K3W
+        if let Some(sh) = &w.shexp {
             let ffw = s.n_ff_shexp;
-            kernels::matmul_q8_0(&mut st.gate_act, sg, &st.normed, s.n_embd, ffw, 1)?;
-            kernels::matmul_q8_0(&mut st.up_act, su, &st.normed, s.n_embd, ffw, 1)?;
+            kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, 1)?;
+            matw(&mut st.gate_act, &sh.gate, &st.normed, &st.xq, s.n_embd, ffw, 1)?;
+            matw(&mut st.up_act, &sh.up, &st.normed, &st.xq, s.n_embd, ffw, 1)?;
             kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, ffw, 0.0, 1.0, act)?;
-            kernels::matmul_q8_0(&mut st.shared_out, sd, &st.ffn_mid, ffw, s.n_embd, 1)?;
+            kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, ffw, 1)?;
+            matw(&mut st.shared_out, &sh.down, &st.ffn_mid, &st.midq, ffw, s.n_embd, 1)?;
         } else {
             kernels::zero(&mut st.shared_out, s.n_embd as usize * 4)?;
         }
