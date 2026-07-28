@@ -746,11 +746,68 @@ mod real {
         },
         Dsv4(Box<Dsv4W>),
         Qwen35(Box<Qwen35W>),
+        K3(Box<K3W>),
     }
 
     /// qwen35moe per-layer stack: exactly one of attn/gdn is Some.
     /// The MoE half reuses Ffn::Moe; LayerW.attn_norm doubles as the
     /// pre-attention norm and LayerW.ffn_norm as post_attention_norm.
+    /// One K3 layer: exactly one of `kda`/`mla` is present (the gguf's
+    /// attention.head_count_kv array marks KDA layers with 0), plus the
+    /// two AttnRes score vectors every layer carries and the latent-MoE
+    /// projections that wrap the routed experts.
+    struct K3W {
+        kda: Option<K3Kda>,
+        mla: Option<K3Mla>,
+        /// AttnRes score weights, f32 [n_embd]: one for the mix before
+        /// attention, one for the mix before the FFN.
+        attn_res_score: DeviceBuf,
+        ffn_res_score: DeviceBuf,
+        /// Latent MoE: routed experts run at n_expert_latent, so the
+        /// input is projected down and the result normed and projected
+        /// back up. Absent on the leading dense layer.
+        routed: Option<K3Routed>,
+    }
+    struct K3Kda {
+        wq: MatW, // [n_embd -> d_inner]
+        wk: MatW,
+        wv: MatW,
+        /// separate depthwise conv per stream, f32 [d_inner][conv_k]
+        conv_q: DeviceBuf,
+        conv_k: DeviceBuf,
+        conv_v: DeviceBuf,
+        /// decay logits factor through a rank-head_dim bottleneck
+        f_a: MatW, // [n_embd -> head_dim]
+        f_b: MatW, // [head_dim -> d_inner]
+        beta_w: MatW, // [n_embd -> n_head]
+        /// -exp(A_log), folded at conversion time, f32 [n_head]
+        a: DeviceBuf,
+        dt_bias: DeviceBuf, // f32 [d_inner]
+        /// K3 uses one full-rank output gate where kimi-linear factors
+        /// it as g_b(g_a(x))
+        wg: MatW,           // [n_embd -> d_inner]
+        ssm_norm: DeviceBuf, // f32 [head_dim]
+        out: MatW,          // [d_inner -> n_embd]
+    }
+    struct K3Mla {
+        q_a: DeviceBuf,
+        q_a_norm: DeviceBuf,
+        q_b: DeviceBuf,
+        kv_a_mqa: DeviceBuf,
+        kv_a_norm: DeviceBuf,
+        k_b: DeviceBuf,
+        v_b: DeviceBuf,
+        /// sigmoid output gate applied before the output projection;
+        /// reads the NORMED layer input, not the attention result
+        gate: MatW, // [n_embd -> n_head*value_mla]
+        out: MatW,
+    }
+    struct K3Routed {
+        down: MatW,           // [n_embd -> latent]
+        up: MatW,             // [latent -> n_embd]
+        norm: Option<DeviceBuf>, // f32 [latent]
+    }
+
     struct Qwen35W {
         attn: Option<Qwen35Attn>,
         gdn: Option<Qwen35Gdn>,
@@ -3229,15 +3286,64 @@ mod real {
                     kernels::set_device(a_dev)?;
                 }
                 let attn = match shape.family {
-                    // K3 needs its own Attn variant: the KDA layers carry
-                    // conv/gate/decay tensors no other family has, and the
-                    // MLA quarter needs the output gate beside the usual
-                    // latent stack. Refuse rather than load a half-model.
                     Family::K3 => {
-                        return Err("kimi-k3: per-layer tensor loading not implemented \
-                                    (kernels and config are in; Attn::K3, KV sizing and \
-                                    forward_k3 remain)"
-                            .into())
+                        // Probe rather than compute the 3-KDA-then-MLA
+                        // pattern: the gguf marks KDA layers with
+                        // head_count_kv 0, and the tensors are the same
+                        // truth without trusting an interval constant.
+                        let is_kda = gguf.tensor(&t("ssm_a")).is_some();
+                        Attn::K3(Box::new(K3W {
+                            kda: if is_kda {
+                                Some(K3Kda {
+                                    wq: MatW::load(&file, &gguf, &t("attn_q.weight"))?,
+                                    wk: MatW::load(&file, &gguf, &t("attn_k.weight"))?,
+                                    wv: MatW::load(&file, &gguf, &t("attn_v.weight"))?,
+                                    conv_q: upload(&file, &gguf, &t("ssm_conv1d_q.weight"))?,
+                                    conv_k: upload(&file, &gguf, &t("ssm_conv1d_k.weight"))?,
+                                    conv_v: upload(&file, &gguf, &t("ssm_conv1d_v.weight"))?,
+                                    f_a: MatW::load(&file, &gguf, &t("ssm_f_a.weight"))?,
+                                    f_b: MatW::load(&file, &gguf, &t("ssm_f_b.weight"))?,
+                                    beta_w: MatW::load(&file, &gguf, &t("ssm_beta.weight"))?,
+                                    a: upload_as_f32(&file, &gguf, &t("ssm_a"))?,
+                                    dt_bias: upload(&file, &gguf, &t("ssm_dt.bias"))?,
+                                    wg: MatW::load(&file, &gguf, &t("ssm_g.weight"))?,
+                                    ssm_norm: upload(&file, &gguf, &t("ssm_norm.weight"))?,
+                                    out: MatW::load(&file, &gguf, &t("attn_output.weight"))?,
+                                })
+                            } else {
+                                None
+                            },
+                            mla: if is_kda {
+                                None
+                            } else {
+                                Some(K3Mla {
+                                    q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"), &mut *attn_vram_budget)?,
+                                    q_a_norm: upload(&file, &gguf, &t("attn_q_a_norm.weight"))?,
+                                    q_b: upload_attn(&file, &gguf, &t("attn_q_b.weight"), &mut *attn_vram_budget)?,
+                                    kv_a_mqa: upload_attn(&file, &gguf, &t("attn_kv_a_mqa.weight"), &mut *attn_vram_budget)?,
+                                    kv_a_norm: upload(&file, &gguf, &t("attn_kv_a_norm.weight"))?,
+                                    k_b: upload(&file, &gguf, &t("attn_k_b.weight"))?,
+                                    v_b: upload(&file, &gguf, &t("attn_v_b.weight"))?,
+                                    gate: MatW::load(&file, &gguf, &t("attn_gate.weight"))?,
+                                    out: MatW::load(&file, &gguf, &t("attn_output.weight"))?,
+                                })
+                            },
+                            attn_res_score: upload(&file, &gguf, &t("attn_res_score.weight"))?,
+                            ffn_res_score: upload(&file, &gguf, &t("ffn_res_score.weight"))?,
+                            routed: if gguf.tensor(&t("ffn_routed_down.weight")).is_some() {
+                                Some(K3Routed {
+                                    down: MatW::load(&file, &gguf, &t("ffn_routed_down.weight"))?,
+                                    up: MatW::load(&file, &gguf, &t("ffn_routed_up.weight"))?,
+                                    norm: if gguf.tensor(&t("ffn_routed_norm.weight")).is_some() {
+                                        Some(upload(&file, &gguf, &t("ffn_routed_norm.weight"))?)
+                                    } else {
+                                        None
+                                    },
+                                })
+                            } else {
+                                None // leading dense layer
+                            },
+                        }))
                     }
                     Family::Gqa => Attn::Gqa {
                         attn_q: upload_attn(&file, &gguf, &t("attn_q.weight"), &mut *attn_vram_budget)?,
@@ -3413,6 +3519,9 @@ mod real {
                 } else if shape.family == Family::Qwen35 {
                     // GDN layers project through ssm_out; attn layers
                     // through Qwen35Attn.out (MatW)
+                    DeviceBuf::alloc(1)?
+                } else if shape.family == Family::K3 {
+                    // both K3 layer flavours keep their own out (MatW)
                     DeviceBuf::alloc(1)?
                 } else {
                     upload_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?
@@ -5761,8 +5870,8 @@ mod real {
                 // owner device); the common tail below must not re-run it
                 let mut mla_attn_done = false;
                 match &l.attn {
-                    // dsv4/qwen35 have their own graphs
-                    Attn::Dsv4(_) | Attn::Qwen35(_) => {
+                    // dsv4/qwen35/k3 have their own graphs
+                    Attn::Dsv4(_) | Attn::Qwen35(_) | Attn::K3(_) => {
                         return Err("hybrid-family layer in the shared eval path".into())
                     }
                     Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm, sinks } => {
