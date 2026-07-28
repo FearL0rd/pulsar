@@ -140,6 +140,11 @@ extern "C" int pulsar_k3_kda_step(
     return cuda_ok(cudaGetLastError(), "k3 kda step launch");
 }
 
+/* Upper bound on banked checkpoints: ceil(n_layer / attn_res_block) + 1.
+ * K3 is 93 layers with block 12, so 9. The launcher rejects anything
+ * larger rather than silently overrunning the score array. */
+#define K3_ATTN_RES_MAX_CKPT 63
+
 /* Attention Residuals: the layer reads a learned convex mix of the banked
  * block checkpoints and the live residual stream, instead of the stream
  * alone. Attention runs over DEPTH, not sequence - at decode there are at
@@ -163,7 +168,12 @@ __global__ static void k3_attn_res_kernel(
         uint32_t n_tok, uint32_t n_embd, uint32_t n_ckpt, float eps) {
     const uint32_t tok = blockIdx.x;
     if (tok >= n_tok) return;
-    extern __shared__ float sh[];        /* [n_ckpt + 1] scores */
+    /* Static, not `extern __shared__`: the score array is tiny and
+     * bounded (ceil(n_layer/block_size)+1, 9 for K3), and mixing a
+     * dynamic region with a static one here had the compiler reading
+     * past it - a __shared__ OOB the CPU-reference selftest cannot see,
+     * because it only shows up at the real n_embd and checkpoint count. */
+    __shared__ float sh[K3_ATTN_RES_MAX_CKPT + 1];
     __shared__ float red[256];
 
     /* score every source, including the live stream at index n_ckpt */
@@ -227,7 +237,8 @@ extern "C" int pulsar_k3_attn_res(
         uint32_t n_ckpt, float eps) {
     if (!out_dev || !cur_dev || !w_dev || n_tok == 0 || n_embd == 0) return 0;
     if (n_ckpt > 0 && !ckpt_dev) return 0;
-    k3_attn_res_kernel<<<n_tok, 256, (n_ckpt + 1u) * sizeof(float)>>>(
+    if (n_ckpt > K3_ATTN_RES_MAX_CKPT) return 0;
+    k3_attn_res_kernel<<<n_tok, 256>>>(
             (float *)out_dev, (const float *)cur_dev, (const float *)ckpt_dev,
             (const float *)w_dev, n_tok, n_embd, n_ckpt, eps);
     return cuda_ok(cudaGetLastError(), "k3 attn res launch");

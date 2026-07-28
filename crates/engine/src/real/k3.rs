@@ -31,6 +31,11 @@ fn matw(out: &mut DeviceBuf, w: &MatW, x: &DeviceBuf, xq: &DeviceBuf, in_dim: u3
     Ok(())
 }
 
+/// Bytes a q8_K quantization of `n` elements occupies (one row).
+fn q8k_bytes(n: u32) -> usize {
+    (n as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
+}
+
 /// The identity-rotation config described in the module header.
 fn nope_cfg() -> kernels::RopeCfg {
     kernels::RopeCfg {
@@ -115,16 +120,23 @@ impl K3Scratch {
             attn_out_a: f32s(s.n_embd as usize)?,
             ffn_normed_a: f32s(s.n_embd as usize)?,
             shexp_out: f32s(s.n_embd as usize)?,
-            xq_ffn: DeviceBuf::alloc((s.n_embd as usize).div_ceil(256) * 292)?,
-            xq_mid: DeviceBuf::alloc((s.n_ff_shexp.max(1) as usize).div_ceil(256) * 292)?,
+            xq_ffn: DeviceBuf::alloc(q8k_bytes(s.n_embd))?,
+            xq_mid: DeviceBuf::alloc(q8k_bytes(s.n_ff_shexp.max(1)))?,
             gate_sh: f32s(s.n_ff_shexp.max(1) as usize)?,
             up_sh: f32s(s.n_ff_shexp.max(1) as usize)?,
             mid_sh: f32s(s.n_ff_shexp.max(1) as usize)?,
-            // q8_K blocks: 256 values -> 292 bytes, over the widest input
-            // any matw on this card sees (n_embd or the latent width)
-            xq: DeviceBuf::alloc(
-                (s.n_embd.max(s.n_expert_latent).max(s.n_ff_exp) as usize).div_ceil(256) * 292,
-            )?,
+            // Widest vector ever quantized into this buffer. n_embd is
+            // NOT the max: both output projections quantize a d_inner /
+            // n_head*value_mla row (12288 vs 7168), and sizing this from
+            // n_embd wrote ~5.8KB past the end into whatever VRAM sat
+            // behind it - which is what the wandering NaN was.
+            xq: DeviceBuf::alloc(q8k_bytes(
+                s.n_embd
+                    .max(s.n_head * s.kda_head_dim)
+                    .max(s.n_head * s.value_mla)
+                    .max(s.n_expert_latent)
+                    .max(s.n_ff_exp),
+            ))?,
             q: f32s(d_inner)?,
             k: f32s(d_inner)?,
             v: f32s(d_inner)?,
