@@ -23,6 +23,7 @@ mod real {
     const GIB: f64 = (1u64 << 30) as f64;
 
     mod dsv4;
+    mod k3;
     mod qwen35;
     pub use qwen35::{generate_dflash, DraftModel};
 
@@ -148,6 +149,10 @@ mod real {
         /// Layers per AttnRes block; a checkpoint is banked every
         /// `attn_res_block` layers. Zero disables AttnRes.
         pub attn_res_block: u32,
+        /// Shared-expert FFN width. K3 ships this already multiplied by
+        /// the shared-expert count (2 x 3072 = 6144), matching the fused
+        /// ffn_*_shexp tensors; elsewhere it falls back to n_ff_exp.
+        pub n_ff_shexp: u32,
     }
 
     impl Shape {
@@ -404,6 +409,7 @@ mod real {
                 kda_gate_lb: 0.0,
                 n_expert_latent: 0,
                 attn_res_block: 0,
+                n_ff_shexp: 0,
             };
             if g.architecture() == Some("laguna") {
                 // laguna ships real YaRN (factor 32 over an 8192 native
@@ -489,6 +495,8 @@ mod real {
                 s.kda_gate_lb = f("kda.gate_lower_bound").unwrap_or(-5.0);
                 s.n_expert_latent = u("expert_latent_length").unwrap_or(0);
                 s.attn_res_block = u("attn_res.block_size").unwrap_or(0);
+                s.n_ff_shexp = u("expert_shared_feed_forward_length")
+                    .unwrap_or(s.n_ff_exp * u("expert_shared_count").unwrap_or(1));
                 s.rope_orig_ctx = u("rope.scaling.original_context_length")
                     .unwrap_or(1_048_576);
             }
@@ -952,6 +960,8 @@ mod real {
         pub gguf: Gguf,
         token_embd: DeviceBuf,
         output_norm: DeviceBuf,
+        /// K3 AttnRes: the score vector for the final mix before the head
+        output_res_score: Option<DeviceBuf>,
         output: DeviceBuf,
         layers: Vec<LayerW>,
         /// PULSAR_ATTN_GPU: second CUDA device holding ALL attn weights +
@@ -2670,6 +2680,13 @@ mod real {
                 buf
             };
             let output_norm = upload(&file, &gguf, "output_norm.weight")?;
+            // K3 mixes the banked AttnRes checkpoints one last time before
+            // the head; absent on every other family.
+            let output_res_score = if gguf.tensor("output_res_score.weight").is_some() {
+                Some(upload(&file, &gguf, "output_res_score.weight")?)
+            } else {
+                None
+            };
             // tied embeddings (gemma4): no output.weight, the lm head IS
             // the (q8_0) embedding table
             let head_name = if gguf.tensor("output.weight").is_some() {
@@ -2748,20 +2765,43 @@ mod real {
             // =off forces primary.
             let n_attn_slots = shape.n_exec_layer as usize + 1; // + MTP draft slot
             let mut attn_layer_dev: Vec<i32> = vec![attn_dev.unwrap_or(primary); n_attn_slots];
-            if shape.family == Family::Mla
+            if matches!(shape.family, Family::Mla | Family::K3)
                 && attn_dev.is_none()
                 && std::env::var("PULSAR_ATTN_GPU").ok().as_deref().is_none_or(|v| v != "off" && v != "-1")
             {
+                // K3 weighs both layer flavours plus the per-layer pieces
+                // that ride with them (shared experts and the latent
+                // projections are resident too, and dwarf the KDA stack
+                // on MoE layers - leaving them out plans a split that
+                // does not fit).
+                const MLA_SUF: &[&str] = &[
+                    "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
+                    "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
+                    "attn_k_b.weight", "attn_v_b.weight", "attn_output.weight",
+                    "indexer.attn_q_b.weight", "indexer.attn_k.weight",
+                    "indexer.k_norm.weight", "indexer.k_norm.bias",
+                    "indexer.proj.weight",
+                ];
+                const K3_SUF: &[&str] = &[
+                    "attn_q.weight", "attn_k.weight", "attn_v.weight",
+                    "ssm_conv1d_q.weight", "ssm_conv1d_k.weight", "ssm_conv1d_v.weight",
+                    "ssm_f_a.weight", "ssm_f_b.weight", "ssm_beta.weight",
+                    "ssm_a", "ssm_dt.bias", "ssm_g.weight", "ssm_norm.weight",
+                    "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
+                    "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
+                    "attn_k_b.weight", "attn_v_b.weight", "attn_gate.weight",
+                    "attn_output.weight",
+                    "attn_norm.weight", "ffn_norm.weight",
+                    "attn_res_score.weight", "ffn_res_score.weight",
+                    "ffn_routed_down.weight", "ffn_routed_up.weight",
+                    "ffn_routed_norm.weight", "ffn_gate_inp.weight",
+                    "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                    "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+                ];
+                let sufs = if shape.family == Family::K3 { K3_SUF } else { MLA_SUF };
                 let mut lb = vec![0u64; shape.n_exec_layer as usize];
                 for il in 0..shape.n_exec_layer {
-                    for suf in [
-                        "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
-                        "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
-                        "attn_k_b.weight", "attn_v_b.weight", "attn_output.weight",
-                        "indexer.attn_q_b.weight", "indexer.attn_k.weight",
-                        "indexer.k_norm.weight", "indexer.k_norm.bias",
-                        "indexer.proj.weight",
-                    ] {
+                    for suf in sufs.iter().copied() {
                         if let Some(ti) = gguf.tensor(&format!("blk.{il}.{suf}")) {
                             lb[il as usize] += ti.byte_size().unwrap_or(0);
                         }
@@ -3813,6 +3853,7 @@ mod real {
                 gguf,
                 token_embd,
                 output_norm,
+                output_res_score,
                 output,
                 layers,
                 attn_dev,
@@ -4196,6 +4237,8 @@ mod real {
         dsv4: Option<dsv4::Dsv4Rt>,
         /// qwen35 runtime (GDN conv+delta states); None elsewhere
         qwen35: Option<qwen35::Qwen35Rt>,
+        /// k3 runtime (KDA conv+delta states, AttnRes bank); None elsewhere
+        k3: Option<k3::K3Rt>,
         /// recurrent prefix checkpoints (pos ascending): a divergent
         /// request resumes from the nearest one instead of position 0
         ckpts: Vec<(u32, RecurrentCkpt)>,
@@ -5512,6 +5555,11 @@ mod real {
                 } else {
                     None
                 },
+                k3: if s.family == Family::K3 {
+                    Some(k3::K3Rt::new(m)?)
+                } else {
+                    None
+                },
                 ckpts: Vec::new(),
             };
 
@@ -5688,9 +5736,7 @@ mod real {
                 // batching rows is safe
                 // K3's KDA conv window and delta state advance per token,
                 // exactly like qwen35's GDN
-                Family::K3 => {
-                    return Err("kimi-k3: forward_k3 not implemented".into())
-                }
+                Family::K3 => return self.forward_k3(st, tokens, pos0, rows),
                 Family::Gqa | Family::Mla => {}
             }
             // a batch must not straddle the indexer top_k boundary: rows
