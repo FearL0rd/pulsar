@@ -108,6 +108,12 @@ enum ChatStyle {
     /// reasoning and <|channel|>final for the reply, and stops on
     /// <|return|>. History keeps only the final channel.
     Harmony,
+    /// Kimi K3 XTML: <|open|>message role="user"<|sep|> text
+    /// <|close|>message<|sep|><|end_of_msg|>. The assistant turn nests a
+    /// think or response tag inside the message tag, so the generation
+    /// prompt opens TWO tags. Roles and tag names are plain text between
+    /// the markers, not tokens of their own.
+    KimiK3,
 }
 
 #[derive(Clone)]
@@ -136,6 +142,42 @@ pub struct ChatMarkers {
 impl ChatMarkers {
     pub fn resolve(t: &Tokenizer) -> Result<ChatMarkers, Error> {
         let find = |s: &'static str| t.find_token(s).ok_or(Error::MissingKey(s));
+        // K3 before K2: K3 has no <|im_middle|>, but keep the order
+        // explicit so a future K-series file cannot fall into the wrong
+        // renderer by accident.
+        if t.find_token("<|end_of_msg|>").is_some() && t.find_token("<|open|>").is_some() {
+            return Ok(ChatMarkers {
+                style: ChatStyle::KimiK3,
+                bos: t.bos_id,
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: t.find_token("<|end_of_msg|>"),
+                user: find("<|open|>")?,
+                assistant: find("<|close|>")?,
+                aux0: find("<|sep|>")?,
+                aux1: find("<|end_of_msg|>")?,
+                stops: {
+                    // With thinking off the turn opens directly in the
+                    // response channel, so the first <|close|> ends the
+                    // answer; without it generation runs on and prints
+                    // its own closing tags before <|end_of_msg|>.
+                    // Revisit when thinking is enabled: there the model
+                    // closes `think` first and the answer follows.
+                    let mut s = t.stop_ids.clone();
+                    if let Some(c) = t.find_token("<|close|>") {
+                        s.push(c);
+                    }
+                    // is_stop binary-searches this, so it must stay sorted
+                    s.sort_unstable();
+                    s.dedup();
+                    s
+                },
+                // K3 is a reasoning model; its template defaults thinking
+                // on, but a chat UI showing raw think tags looks broken,
+                // so default OFF like GLM and let the caller opt in.
+                think: false,
+                reasoning: "max",
+            });
+        }
         if t.find_token("<|im_middle|>").is_some() {
             return Ok(ChatMarkers {
                 style: ChatStyle::Kimi,
@@ -407,6 +449,7 @@ impl ChatMarkers {
         match self.style {
             ChatStyle::Glm => &["high", "max"],
             ChatStyle::Harmony => &["low", "medium", "high"],
+            ChatStyle::KimiK3 => &["low", "high", "max"],
             _ => &[],
         }
     }
@@ -414,7 +457,7 @@ impl ChatMarkers {
     /// The level this style falls back to when none was requested.
     pub fn reasoning_default(&self) -> &'static str {
         match self.style {
-            ChatStyle::Glm => "max",
+            ChatStyle::Glm | ChatStyle::KimiK3 => "max",
             _ => "medium",
         }
     }
@@ -439,6 +482,32 @@ impl ChatMarkers {
         let mut v = vec![self.aux0];
         let label = if self.reasoning == "high" { "High" } else { "Max" };
         v.extend(t.encode(&format!("Reasoning Effort: {label}")));
+        v
+    }
+
+    /// K3 XTML: <|open|>TAG ATTRS<|sep|>. Roles and tag names are plain
+    /// text between the markers, so they tokenize normally.
+    fn k3_open(&self, t: &Tokenizer, tag_and_attrs: &str) -> Vec<u32> {
+        let mut v = vec![self.user]; // <|open|>
+        v.extend(t.encode(tag_and_attrs));
+        v.push(self.aux0); // <|sep|>
+        v
+    }
+
+    /// K3 XTML: <|close|>TAG<|sep|>.
+    fn k3_close(&self, t: &Tokenizer, tag: &str) -> Vec<u32> {
+        let mut v = vec![self.assistant]; // <|close|>
+        v.extend(t.encode(tag));
+        v.push(self.aux0);
+        v
+    }
+
+    /// A whole K3 message element, ending with <|end_of_msg|>.
+    fn k3_message(&self, t: &Tokenizer, role: &str, text: &str) -> Vec<u32> {
+        let mut v = self.k3_open(t, &format!("message role=\"{role}\""));
+        v.extend(t.encode(text));
+        v.extend(self.k3_close(t, "message"));
+        v.push(self.aux1); // <|end_of_msg|>
         v
     }
 
@@ -500,6 +569,7 @@ impl ChatMarkers {
             }
             // <system>/<user> are plain text in Laguna, not vocab tokens
             ChatStyle::Laguna => t.encode(&format!("<system>{text}</system>\n")),
+            ChatStyle::KimiK3 => self.k3_message(t, "system", text),
         }
     }
 
@@ -553,6 +623,7 @@ impl ChatMarkers {
                 v
             }
             ChatStyle::Laguna => t.encode(&format!("<user>{text}</user>\n")),
+            ChatStyle::KimiK3 => self.k3_message(t, "user", text),
         }
     }
 
@@ -597,6 +668,15 @@ impl ChatMarkers {
             ChatStyle::Gemma => {
                 let mut v = vec![self.assistant];
                 v.extend(t.encode("model\n"));
+                v
+            }
+            // The assistant turn nests a channel tag inside the message
+            // tag, so the opener is two tags deep. Which one it opens IS
+            // the thinking switch: `think` gets a think channel the model
+            // closes itself, otherwise it starts straight in `response`.
+            ChatStyle::KimiK3 => {
+                let mut v = self.k3_open(t, "message role=\"assistant\"");
+                v.extend(self.k3_open(t, if self.think { "think" } else { "response" }));
                 v
             }
             ChatStyle::MiniMax => {
