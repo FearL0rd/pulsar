@@ -7,9 +7,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TARGET=/mnt/models/ThinkingCap-Qwen3.6-27B-Q4_K_M.gguf
+TARGET=/mnt/data/models/ThinkingCap-Qwen3.6-27B-Q4_K_M.gguf
 DSPARK_DIR=/mnt/models/dspark-27b-hf
-DSPARK_GGUF=/mnt/models/Qwen3.6-27B-DSpark-draft.gguf
+DSPARK_GGUF=/mnt/data/models/Qwen3.6-27B-DSpark-draft.gguf
 MATH_PROMPT="Compute the sum of all integers n between 1 and 100 such that n^2 + n + 41 is divisible by 3. Show your work."
 PROSE_PROMPT="Write a reflective essay about the experience of walking through a city at night, focusing on sound and memory."
 N=200
