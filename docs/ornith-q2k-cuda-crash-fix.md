@@ -9,7 +9,7 @@ immediately after warm start, during the first prefill chunk. No output.
 
 ## Root cause
 
-Two unrelated load-site bugs, both the same shape: a tensor was uploaded with
+Three load-site bugs, all the same shape: a tensor was uploaded with
 the generic `upload()` and then consumed by a kernel that reads **f32**.
 
 `upload()` → `read_tensor_bytes()` has a branch

@@ -61,7 +61,7 @@ Gen5 NVMe.
 | GLM-5.2 | 744B | 40B | 211GB (ds4 recipe) | **2.7 tok/s** (2.8 w/ CPU lane) | 0.40 |
 | TML Inkling | 975B | 41B (6 + 2 shared) | 296GB (Q2_K_XL) | **1.6 tok/s** (1.75 w/ CPU lane) | – |
 | Kimi K2.7 Code† | ~1T | 32B | 339GB (Q2_K_XL) | **1.3 tok/s** | – |
-| Ornith-397B | 397B | ~38B (top-10 of 512 + shared) | 149GB (Q2_K exp + Q8_0) | **3.73 tok/s** (7.16 w/ CPU lane) | – |
+| Ornith-397B†† | 397B | ~38B (top-10 of 512 + shared) | 149GB (Q2_K exp + Q8_0) | *not benched* | – |
 
 All figures are sustained warm decode at n=64, temp 0, second run onward.
 The resident tier is placed from the popularity census, which builds over
@@ -77,8 +77,11 @@ the same reason Hy3 reads 8.2 at n=32 against 6.0 at n=64.
 
 †† Ornith-397B was brought up on a different box (3090 + V100 32GB GPU, 128Gb),
 not the reference 2×16GB rig, and only a short cold-census 15-token run exists
-(`-p "The capital of France is" -n 15` → "Paris.", correct). A warm n=64
-decode figure is not reported until it is measured honestly. The 149GB gguf
+(`-p "The capital of France is" -n 15` → "Paris.", correct, 0.82 tok/s cold).
+That is a bring-up smoke test, not a benchmark: n=15 off a cold census with the
+disk as the floor. The rate column stays empty until `scripts/bench.sh` has run
+on it, per the rule that every number in this table comes from that script and
+nowhere else. The 149GB gguf
 size is the experts-Q2_K / rest-Q8_0 mix from `pulsar-quant --map "_exps.=q2_k"
 --default q8_0`.
 
