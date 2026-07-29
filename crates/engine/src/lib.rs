@@ -2622,7 +2622,14 @@ mod real {
             // some GDN models. Dequantize rather than refuse the file.
             TensorType::Q8_0 => {
                 let n = t.n_elements() as usize;
-                let mut buf = vec![0u8; n / 32 * 34];
+                // ask the type for its own size rather than hand-rolling
+                // 34-bytes-per-32; a width that is not a multiple of 32
+                // would otherwise short-read
+                let bytes = t.byte_size().ok_or_else(|| meta_err(name))? as usize;
+                if n % 32 != 0 {
+                    return Err(format!("{name}: q8_0 width {n} not a multiple of 32").into());
+                }
+                let mut buf = vec![0u8; bytes];
                 file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
                 Ok(DeviceBuf::from_f32(&quant::cpu_dot::dequant_q8_0(&buf, n))?)
             }
