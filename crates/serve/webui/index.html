@@ -1283,6 +1283,7 @@
     <button class="tab active" id="tabbtn-chat" type="button" data-tab="tab-chat">Chat</button>
     <button class="tab" id="tabbtn-brain" type="button" data-tab="tab-brain">Brain</button>
     <button class="tab" id="tabbtn-atlas" type="button" data-tab="tab-atlas">Atlas</button>
+    <button class="tab" id="tabbtn-mcp" type="button" data-tab="tab-mcp" hidden>MCP</button>
   </nav>
   <div class="chips">
     <span class="chip"><span class="chip-label">tok/s</span><span id="chip-tps">—</span></span>
@@ -1431,6 +1432,62 @@
       <canvas id="atlas-canvas"></canvas>
       <div class="cortex-tip" id="atlas-tip" hidden></div>
     </div>
+  </div>
+</div>
+
+<div class="tab-panel" id="tab-mcp" hidden>
+  <div class="cortex">
+    <div class="cortex-head">
+      <div class="cortex-title">
+        <span class="ph-kicker">MCP Servers</span>
+        <span class="cortex-dims" id="mcp-summary">— servers</span>
+      </div>
+      <div class="cortex-legend">
+        <span class="cortex-legend-note">manage tool servers · <kbd>--webui-mcp-proxy</kbd></span>
+      </div>
+    </div>
+    <div id="mcp-list"></div>
+    <details>
+      <summary>Add / edit server</summary>
+      <div class="panel">
+        <div class="panel-title" id="mcp-form-title">Add server</div>
+        <input type="hidden" id="mcp-edit-name" />
+        <label><span class="field-label">name</span>
+          <input id="mcp-name" placeholder="everything" />
+        </label>
+        <label><span class="field-label">transport</span>
+          <select id="mcp-transport">
+            <option value="http">http (streamable remote)</option>
+            <option value="stdio">stdio (local subprocess)</option>
+          </select>
+        </label>
+        <div id="mcp-http-fields">
+          <label><span class="field-label">url</span>
+            <input id="mcp-url" placeholder="http://127.0.0.1:8765/mcp" />
+          </label>
+          <label><span class="field-label">headers (KEY: VAL per line)</span>
+            <textarea id="mcp-headers" rows="2" placeholder="Authorization: Bearer ..."></textarea>
+          </label>
+        </div>
+        <div id="mcp-stdio-fields" hidden>
+          <label><span class="field-label">command</span>
+            <input id="mcp-command" placeholder="npx" />
+          </label>
+          <label><span class="field-label">args (whitespace-separated)</span>
+            <input id="mcp-args" placeholder="-y @modelcontextprotocol/server-everything" />
+          </label>
+          <label><span class="field-label">env (KEY=VAL per line)</span>
+            <textarea id="mcp-env" rows="2" placeholder="API_KEY=..."></textarea>
+          </label>
+          <div class="hint" style="color:var(--danger)">warning: stdio spawns this process on the serve host. local single-user only.</div>
+        </div>
+        <label class="check-row"><input type="checkbox" id="mcp-disabled" /><span>disabled (configured but not connected)</span></label>
+        <div class="ctx-row">
+          <button id="mcp-save" class="primary" type="button">Save</button>
+          <button id="mcp-cancel" class="cpu-toggle" type="button" hidden>Cancel edit</button>
+        </div>
+      </div>
+    </details>
   </div>
 </div>
 </main>
@@ -2301,7 +2358,8 @@ function getSettings() {
     messages,
     temperature: parseFloat($("temp").value) || 0.8,
     top_p: parseFloat($("top-p").value) || 0.95,
-    stream: true,
+    // MCP agentic loop runs server-side non-stream; SSE only when no tools.
+    stream: !mcpHasEnabledTools(),
   };
   // blank = omit: the server then defaults max_tokens to all remaining
   // context, which beats any number we could guess here
@@ -2400,49 +2458,66 @@ async function streamAssistant() {
 
   try {
     setChips("busy");
+    const settings = getSettings();
     const resp = await fetch("/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(getSettings()),
+      body: JSON.stringify(settings),
       signal: controller.signal,
     });
-    if (!resp.ok || !resp.body) {
+    if (!resp.ok) {
       const txt = await resp.text().catch(() => "");
       throw new Error("HTTP " + resp.status + " " + txt);
     }
-
-    const reader = resp.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let sep;
-      while ((sep = buf.indexOf("\n\n")) !== -1) {
-        const chunk = buf.slice(0, sep);
-        buf = buf.slice(sep + 2);
-        const line = chunk.trim();
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
-        if (payload === "[DONE]") { buf = ""; break; }
-        let ev;
-        try { ev = JSON.parse(payload); } catch { continue; }
-        const pt = ev?.usage?.prompt_tokens;
-        if (Number.isFinite(pt)) promptToks = pt;
-        const delta = ev?.choices?.[0]?.delta;
-        if (delta?.content || delta?.reasoning_content) {
-          if (ntok === 0) {
-            const prefillS = (performance.now() - tSend) / 1000;
-            if (promptToks > 0 && prefillS > 0) prefillTps = promptToks / prefillS;
-            t0 = performance.now();
+    if (settings.stream) {
+      if (!resp.body) throw new Error("no response body");
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let sep;
+        while ((sep = buf.indexOf("\n\n")) !== -1) {
+          const chunk = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          const line = chunk.trim();
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "[DONE]") { buf = ""; break; }
+          let ev;
+          try { ev = JSON.parse(payload); } catch { continue; }
+          const pt = ev?.usage?.prompt_tokens;
+          if (Number.isFinite(pt)) promptToks = pt;
+          const delta = ev?.choices?.[0]?.delta;
+          if (delta?.content || delta?.reasoning_content) {
+            if (ntok === 0) {
+              const prefillS = (performance.now() - tSend) / 1000;
+              if (promptToks > 0 && prefillS > 0) prefillTps = promptToks / prefillS;
+              t0 = performance.now();
+            }
+            if (delta.content) acc += delta.content;
+            if (delta.reasoning_content) racc += delta.reasoning_content;
+            ntok += 1;
+            scheduleRender();
           }
-          if (delta.content) acc += delta.content;
-          if (delta.reasoning_content) racc += delta.reasoning_content;
-          ntok += 1;
-          scheduleRender();
         }
       }
+    } else {
+      // MCP tools active: the server ran the full agentic loop
+      // (generate → dispatch → regenerate) non-stream and returns one
+      // chat.completion JSON. Render the final message in one shot.
+      const data = await resp.json();
+      const msg = data?.choices?.[0]?.message || {};
+      if (msg.content) acc = msg.content;
+      if (msg.reasoning_content) racc = msg.reasoning_content;
+      ntok = data?.usage?.completion_tokens || 0;
+      const pt = data?.usage?.prompt_tokens;
+      if (Number.isFinite(pt)) promptToks = pt;
+      const prefillS = (performance.now() - tSend) / 1000;
+      if (promptToks > 0 && prefillS > 0) prefillTps = promptToks / prefillS;
+      t0 = tSend; // decode timer spans the whole multi-turn call
     }
     cancelRender();
     body.innerHTML = renderTurn() || "<p><i>(empty)</i></p>";
@@ -2557,12 +2632,188 @@ for (const btn of document.querySelectorAll(".tabs .tab")) {
 $("probe").addEventListener("click", probe);
 $("endpoint").textContent = location.origin + "/v1";
 
+// ---- MCP servers (--webui-mcp-proxy). The tab button is hidden by default;
+// a 200 from GET /mcp/status on load means the flag is on and the tab un-hides.
+let mcpEnabled = false;   // flag on + status reachable
+let mcpHasTools = false;  // ≥1 enabled tool => force non-stream agentic loop
+function mcpHasEnabledTools() { return mcpEnabled && mcpHasTools; }
+
+function mcpSetTransport(kind) {
+  $("mcp-stdio-fields").hidden = kind !== "stdio";
+  $("mcp-http-fields").hidden = kind !== "http";
+}
+
+function mcpFillForm(cfg) {
+  if (cfg && cfg.command !== undefined) {
+    $("mcp-transport").value = "stdio";
+    mcpSetTransport("stdio");
+    $("mcp-command").value = cfg.command || "";
+    $("mcp-args").value = (cfg.args || []).join(" ");
+    $("mcp-env").value = Object.entries(cfg.env || {}).map(([k, v]) => k + "=" + v).join("\n");
+    $("mcp-disabled").checked = !!cfg.disabled;
+  } else {
+    $("mcp-transport").value = "http";
+    mcpSetTransport("http");
+    $("mcp-url").value = (cfg && cfg.url) || "";
+    $("mcp-headers").value = Object.entries((cfg && cfg.headers) || {}).map(([k, v]) => k + ": " + v).join("\n");
+    $("mcp-disabled").checked = !!(cfg && cfg.disabled);
+  }
+}
+
+function mcpResetForm() {
+  $("mcp-edit-name").value = "";
+  $("mcp-name").value = "";
+  $("mcp-transport").value = "http";
+  mcpSetTransport("http");
+  $("mcp-command").value = "";
+  $("mcp-args").value = "";
+  $("mcp-env").value = "";
+  $("mcp-url").value = "";
+  $("mcp-headers").value = "";
+  $("mcp-disabled").checked = false;
+  $("mcp-form-title").textContent = "Add server";
+  $("mcp-cancel").hidden = true;
+}
+
+async function mcpRefresh() {
+  if (!mcpEnabled) return;
+  let data;
+  try {
+    const r = await fetch("/mcp/status");
+    if (!r.ok) return;
+    data = await r.json();
+  } catch { return; }
+  mcpHasTools = false;
+  const list = $("mcp-list");
+  list.innerHTML = "";
+  const servers = data.servers || [];
+  $("mcp-summary").textContent = servers.length + " server" + (servers.length === 1 ? "" : "s");
+  for (const s of servers) {
+    const enabledCount = (s.tools || []).filter((t) => t.enabled).length;
+    if (enabledCount > 0) mcpHasTools = true;
+    const card = document.createElement("div");
+    card.className = "panel";
+    const toolsHtml = (s.tools || []).map((t) =>
+      `<label class="check-row"><input type="checkbox" data-tool="${escapeHtml(t.namespaced)}" ${t.enabled ? "checked" : ""}/><span>${escapeHtml(t.name)} <span class="hint">${escapeHtml((t.description || "").slice(0, 80))}</span></span></label>`
+    ).join("");
+    card.innerHTML =
+      `<div class="panel-title">${escapeHtml(s.name)} <span class="hint">${escapeHtml(s.transport)} · ${s.connected ? "connected" : "offline"}${s.disabled ? " · disabled" : ""} · ${enabledCount}/${(s.tools || []).length} tools</span></div>` +
+      (s.error ? `<div class="hint" style="color:var(--danger)">${escapeHtml(s.error)}</div>` : "") +
+      `<div class="mcp-tools">${toolsHtml}</div>` +
+      `<div class="ctx-row"><button class="cpu-toggle" data-edit="${escapeHtml(s.name)}">Edit</button><button class="danger" data-del="${escapeHtml(s.name)}">Remove</button></div>`;
+    list.appendChild(card);
+  }
+  for (const cb of list.querySelectorAll("input[data-tool]")) {
+    cb.addEventListener("change", async () => {
+      await fetch("/mcp/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tool: cb.dataset.tool, disabled: !cb.checked }),
+      });
+      mcpRefresh();
+    });
+  }
+  for (const b of list.querySelectorAll("button[data-edit]")) {
+    b.addEventListener("click", () => mcpBeginEdit(b.dataset.edit));
+  }
+  for (const b of list.querySelectorAll("button[data-del]")) {
+    b.addEventListener("click", async () => {
+      if (!confirm("Remove server " + b.dataset.del + "?")) return;
+      await fetch("/mcp/server/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: b.dataset.del }),
+      });
+      mcpRefresh();
+    });
+  }
+}
+
+async function mcpBeginEdit(name) {
+  try {
+    const r = await fetch("/mcp/status");
+    const data = await r.json();
+    const s = (data.servers || []).find((x) => x.name === name);
+    if (s) mcpFillForm(s.config);
+  } catch {}
+  $("mcp-edit-name").value = name;
+  $("mcp-name").value = name;
+  $("mcp-form-title").textContent = "Edit " + name;
+  $("mcp-cancel").hidden = false;
+  document.querySelector("#tab-mcp details").open = true;
+}
+
+function mcpKvLines(text, sep) {
+  return Object.fromEntries(
+    text.split("\n")
+      .map((l) => { const i = l.indexOf(sep); return i > 0 ? [l.slice(0, i).trim(), l.slice(i + 1).trim()] : null; })
+      .filter(Boolean)
+  );
+}
+
+async function mcpSave() {
+  const name = $("mcp-name").value.trim();
+  if (!name) { alert("name required"); return; }
+  const kind = $("mcp-transport").value;
+  let cfg;
+  if (kind === "stdio") {
+    const command = $("mcp-command").value.trim();
+    if (!command) { alert("command required"); return; }
+    cfg = {
+      command,
+      args: $("mcp-args").value.trim().split(/\s+/).filter(Boolean),
+      env: mcpKvLines($("mcp-env").value, "="),
+      disabled: $("mcp-disabled").checked,
+    };
+  } else {
+    const url = $("mcp-url").value.trim();
+    if (!url) { alert("url required"); return; }
+    cfg = {
+      url,
+      headers: mcpKvLines($("mcp-headers").value, ":"),
+      disabled: $("mcp-disabled").checked,
+    };
+  }
+  // rename = delete old name then add the new one
+  const editName = $("mcp-edit-name").value;
+  if (editName && editName !== name) {
+    await fetch("/mcp/server/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: editName }),
+    });
+  }
+  const r = await fetch("/mcp/server", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, config: cfg }),
+  });
+  if (!r.ok) { const t = await r.text().catch(() => ""); alert("save failed: " + t); return; }
+  mcpResetForm();
+  mcpRefresh();
+}
+
+async function mcpInit() {
+  try {
+    const r = await fetch("/mcp/status");
+    if (r.ok) {
+      mcpEnabled = true;
+      $("tabbtn-mcp").hidden = false;
+      mcpRefresh();
+    }
+  } catch {}
+}
+$("mcp-transport").addEventListener("change", (e) => mcpSetTransport(e.target.value));
+$("mcp-save").addEventListener("click", mcpSave);
+$("mcp-cancel").addEventListener("click", mcpResetForm);
+
 applyTheme(document.documentElement.dataset.theme || "light", false);
 let savedSidebar = "expanded";
 try { savedSidebar = localStorage.getItem("pulsar-sidebar") || "expanded"; } catch {}
 applySidebarCollapsed(savedSidebar === "collapsed", false);
 loadModel();
 probe(); // initial /stats: reachability + runtime + tiers
+mcpInit(); // un-hides the MCP tab only when --webui-mcp-proxy is on
 setChips("idle");
 autoGrow();
 
