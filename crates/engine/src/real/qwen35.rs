@@ -1126,12 +1126,32 @@ impl Model {
             kernels::gqa_head_rms_norm(&mut st.k, Some(&attn.k_norm), t * s.n_head_kv, hd, eps)?;
             kernels::gqa_rope(&mut st.q, t, s.n_head, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
             kernels::gqa_rope(&mut st.k, t, s.n_head_kv, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
-            kernels::gqa_kv_append(&mut st.kcache[il], &st.k, t, s.n_head_kv, hd, st.ctx, pos, 0)?;
-            kernels::gqa_kv_append(&mut st.vcache[il], &st.v, t, s.n_head_kv, hd, st.ctx, pos, 0)?;
+            // turbo rotation + block-KV: mirror the Gqa arm (engine/src/lib.rs).
+            // st.kvq selects the row stride the cache was sized with in lib.rs;
+            // hardcoding f32 here while the cache is q8_0/q4_0-sized made the
+            // append write hd*4 bytes into a (hd/32)*34-byte row — a ~3.8x OOB
+            // write that surfaced as `pulsar-cli: cuda kernel op failed` or
+            // garbage tokens. Rotating K and Q by the same orthogonal Π before
+            // block-quant spreads outliers across the 32-wide block; V is left
+            // unrotated, and (QΠᵀ)·(KΠᵀ)ᵀ = QKᵀ preserves the attention scores.
+            let ksrc: &DeviceBuf = if st.kvq_rot {
+                kernels::matmul_f32(&mut st.krot, &st.pi, &st.k, hd, hd, t * s.n_head_kv)?;
+                &st.krot
+            } else {
+                &st.k
+            };
+            let qsrc: &DeviceBuf = if st.kvq_rot {
+                kernels::matmul_f32(&mut st.qrot, &st.pi, &st.q, hd, hd, t * s.n_head)?;
+                &st.qrot
+            } else {
+                &st.q
+            };
+            kernels::gqa_kv_append(&mut st.kcache[il], ksrc, t, s.n_head_kv, hd, st.ctx, pos, st.kvq)?;
+            kernels::gqa_kv_append(&mut st.vcache[il], &st.v, t, s.n_head_kv, hd, st.ctx, pos, st.kvq)?;
             kernels::gqa_attention_rel(
-                &mut st.heads, &st.q, &st.kcache[il], &st.vcache[il],
+                &mut st.heads, qsrc, &st.kcache[il], &st.vcache[il],
                 t, s.n_head, s.n_head_kv, hd, st.ctx, pos,
-                1.0 / (hd as f32).sqrt(), 0, None, 0, 0,
+                1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
                 None, // qwen35 has no attention sinks
             )?;
             kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.gate, t * s.n_head * hd)?;

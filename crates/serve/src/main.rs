@@ -526,8 +526,8 @@ fn run() -> engine::Result {
                 ("POST", "/kv") => {
                     let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                     let want = req["format"].as_str().unwrap_or("auto").to_string();
-                    const KV_FORMATS: [&str; 8] =
-                        ["auto", "f32", "fp8", "fp16", "int8", "q8_0", "q4_0", "turbo4"];
+                    const KV_FORMATS: [&str; 9] =
+                        ["auto", "f32", "fp8", "fp16", "int8", "q8_0", "q4_0", "turbo4", "turbo8"];
                     if !KV_FORMATS.contains(&want.as_str()) {
                         respond_json(&mut stream, 400, &serde_json::json!({"error": {"message":
                             format!("unknown KV format {want} (one of {KV_FORMATS:?})")}}))
