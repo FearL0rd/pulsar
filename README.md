@@ -450,7 +450,10 @@ MCP (Model Context Protocol) tool-use in pulsar-serve, opt-in via
 (rmcp 3.0.1; stdio + streamable-http), exposes their tools to the model
 as namespaced `server__tool` specs, and runs a non-stream agentic loop
 (MAX_TURNS=8) that executes the model's `<tool_call>` blocks and feeds
-results back. Full CRUD lives in the web UI sidebar (add/edit/remove
+results back. Each server card's title auto-detects the advertised name
+from the MCP `initialize` handshake and shows a rolling connection log
+with the last handshake latency; the on/off pill matches the CPU Lane /
+MTP toggles. Full CRUD lives in the web UI sidebar (add/edit/remove
 servers, enable/disable per tool), persisted to `mcp.json`. Without the
 flag: zero behavioral change — every `/mcp/*` route 404s and the sidebar
 group stays hidden. End-to-end verified on Qwen3.6-35B against a remote

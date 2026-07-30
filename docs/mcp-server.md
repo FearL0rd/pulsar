@@ -72,16 +72,25 @@ All five return a JSON error body `{"error":{"message":"--webui-mcp-proxy not en
 
 ```jsonc
 {
-  "name": "SearchTool",
-  "transport": "http",            // "http" | "stdio"
-  "connected": true,              // client handshake succeeded
-  "disabled": false,              // cfg.disabled flag
-  "error": null,                  // last connect error, if any
+  "name": "SearchTool",             // config key
+  "transport": "http",             // "http" | "stdio"
+  "connected": true,               // client handshake succeeded
+  "disabled": false,               // cfg.disabled flag
+  "error": null,                   // last connect error, if any
+  "server_name": "SearXNG MCP",    // handshake-advertised name (null until init ok)
+  "server_version": "1.4.0",       // handshake-advertised version
+  "protocol_version": "2025-11-25",// negotiated MCP protocol version
+  "connect_ms": 312,               // wall-clock ms of the last successful handshake
   "tools": [
     { "name": "search_searxng",
       "namespaced": "SearchTool__search_searxng",   // what the model sees
       "description": "…",
       "enabled": true }                            // false if toggled off or blocked by allow/deny
+  ],
+  "logs": [                        // rolling per-server connection log (newest last, capped 64)
+    { "t": "14:08:21", "ok": true,  "msg": "connecting via http" },
+    { "t": "14:08:21", "ok": true,  "msg": "handshake ok in 312ms — SearXNG MCP 1.4.0" },
+    { "t": "14:08:21", "ok": true,  "msg": "listed 3 tools" }
   ],
   "config": { /* the raw McpServerCfg, so the edit form can repopulate every field */ }
 }
@@ -91,7 +100,8 @@ All five return a JSON error body `{"error":{"message":"--webui-mcp-proxy not en
 
 The management surface lives in the left sidebar as its own group, between **Connection** and **Runtime**. On load, `index.html` does `fetch('/mcp/status')`; HTTP 200 un-hides the group, 404 (flag off) leaves it hidden — no HTML swapping, just a probe-to-show.
 
-- **Server list**: one inline card per configured server (name, transport, connected/error, tool count). Each card has **Edit** and **Remove**. Cards render in normal flow (no popup).
+- **Server list**: one collapsible card per configured server, rendered inline (no popup). The card title shows the **handshake-advertised server name** (read from the MCP `initialize` result and falling back to the config key if the server advertises none), with transport, version, and protocol-version badges. Each card has an **on/off pill** toggle (same `.cpu-toggle` style as the CPU Lane / MTP toggles, re-upserts with the `disabled` flag flipped), plus **Edit** and **Remove**.
+- **Connection log**: a collapsible `Connection log (N)` detail per card shows the per-server log (`logs` in `/mcp/status`), newest last, capped at 64 lines, with the last handshake latency (`connect_ms`) next to the header. Each connect cycle appends a `connecting` → `handshake ok in Nms — {name} {ver}` → `listed N tools` trace, or a `handshake failed in Nms: …` line on error.
 - **Add / edit** (`<details>` form, expands inline): name, transport selector (`http` / `stdio`), and conditional fields — url + headers for http, command + args + env for stdio. Save → `POST /mcp/server`, which reconnects and re-renders status.
 - **Per-tool toggle**: each server's tool list has enable/disable checkboxes → `POST /mcp/toggle`.
 - When any tool is enabled, chat requests are forced to `stream:false` so the server runs the full non-stream agentic loop and returns one final `chat.completion`.
@@ -152,7 +162,7 @@ Server log shows `mcp dispatch SearchTool__search_searxng` on the turn that trig
 
 ## Status
 
-Done: feature gate (`--webui-mcp-proxy` / `--mcp-config`) · sync rmcp bridge (`McpHub`, private tokio runtime, `block_on`) · stdio + streamable-http transports · `connect_all` / `connect_one` / `dispatch_sync` / `status_json` / `toggle` / `upsert_server` / `remove_server` / atomic `save_config` · `/mcp/status`, `/v1/tools`, `/mcp/server`, `/mcp/server/delete`, `/mcp/toggle` routes · non-stream agentic loop (MAX_TURNS=8, prefix-cache reuse, allow/deny, per-call timeout) · web UI sidebar CRUD (probe-to-show, add/edit/remove, per-tool toggle) · end-to-end verification on a remote SearXNG MCP.
+Done: feature gate (`--webui-mcp-proxy` / `--mcp-config`) · sync rmcp bridge (`McpHub`, private tokio runtime, `block_on`) · stdio + streamable-http transports · `connect_all` / `connect_one` / `dispatch_sync` / `status_json` / `toggle` / `upsert_server` / `remove_server` / atomic `save_config` · handshake identity auto-detect (server name/version + negotiated protocol version via `peer_info`, with `connect_ms`) · per-server rolling connection log (capped 64) surfaced as a `logs` array · `/mcp/status`, `/v1/tools`, `/mcp/server`, `/mcp/server/delete`, `/mcp/toggle` routes · non-stream agentic loop (MAX_TURNS=8, prefix-cache reuse, allow/deny, per-call timeout) · web UI sidebar (probe-to-show, collapsible cards with handshake-identified titles + connection log, on/off pill toggle matching CPU Lane / MTP, add/edit/remove, per-tool toggle) · end-to-end verification on a remote SearXNG MCP.
 
 Not yet:
 

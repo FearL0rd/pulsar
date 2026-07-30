@@ -1085,25 +1085,51 @@
   .panel textarea { min-height: 72px; resize: vertical; }
   .panel input:focus, .panel textarea:focus { border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
   .hint { color: var(--text-tertiary); font-size: 11px; }
-  /* MCP server cards live inline in the sidebar (narrow, normal flow) */
+  /* MCP server cards — llama-ui style. Header (name + version + on/off
+     switch), badge row (transport · tools), two collapsible <details>
+     (tools list, connection log), footer (protocol version + actions). */
   .mcp-card {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 8px 9px;
-    margin-bottom: 7px;
-    border-radius: 7px;
+    padding: 10px 11px;
+    margin-bottom: 8px;
+    border-radius: 8px;
     background: var(--glass-input);
     border: 1px solid var(--glass-border);
+    font-size: 12px;
   }
-  .mcp-card .panel-title { font-size: 12px; font-weight: 600; }
-  .mcp-tools { display: flex; flex-direction: column; gap: 3px; }
+  .mcp-card .mc-head { display: flex; align-items: center; gap: 7px; }
+  .mcp-card .mc-name { font-weight: 600; color: var(--text); font-size: 13px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mcp-card .mc-ver { color: var(--text-tertiary); font-size: 11px; flex-shrink: 0; }
+  .mcp-card .mc-spacer { flex: 1; }
+  /* on/off pill reuses the global .cpu-toggle style (same as CPU Lane / MTP),
+     driven by the server's `disabled` flag via re-upsert. */
+  .mcp-card .mc-badges { display: flex; align-items: center; gap: 6px; margin: 7px 0 2px; flex-wrap: wrap; }
+  .mcp-card .mc-badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 4px; background: var(--glass-code); color: var(--text-secondary); font-size: 10.5px; }
+  .mcp-card .mc-badge.tools { background: #4fae6e; color: #fff; }
+  /* collapsible rows (native <details> — no JS needed to toggle) */
+  .mcp-card .mc-fold { margin-top: 4px; }
+  .mcp-card .mc-fold > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 6px; padding: 4px 0; color: var(--text-secondary); font-size: 11.5px; }
+  .mcp-card .mc-fold > summary::-webkit-details-marker { display: none; }
+  .mcp-card .mc-fold > summary::before { content: "▸"; color: var(--text-tertiary); transition: transform .15s ease; font-size: 10px; }
+  .mcp-card .mc-fold[open] > summary::before { transform: rotate(90deg); }
+  .mcp-card .mc-fold[open] > summary { padding-bottom: 6px; }
+  .mcp-tools { display: flex; flex-direction: column; gap: 3px; padding-bottom: 2px; }
+  .mcp-card .mc-log { font-family: var(--mono); font-size: 10.5px; line-height: 1.55; color: var(--text-secondary); max-height: 170px; overflow: auto; padding-right: 4px; }
+  .mcp-card .mc-log .row { display: flex; gap: 7px; white-space: pre-wrap; word-break: break-word; }
+  .mcp-card .mc-log .row .t { color: var(--text-tertiary); flex-shrink: 0; }
+  .mcp-card .mc-log .row.bad .m { color: var(--danger); }
+  .mcp-card .mc-foot { display: flex; align-items: center; gap: 2px; margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--glass-border); }
+  .mcp-card .mc-proto { color: var(--text-tertiary); font-size: 10.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mcp-card .mc-act { background: none; border: none; cursor: pointer; color: var(--text-tertiary); padding: 4px 6px; font-size: 14px; line-height: 1; border-radius: 4px; }
+  .mcp-card .mc-act:hover { color: var(--text); background: var(--glass-code); }
+  .mcp-card .mc-act.danger:hover { color: var(--danger); }
   #mcp-side-section label > .field-label,
   #mcp-side-section label { display: block; }
   #mcp-side-section input, #mcp-side-section select, #mcp-side-section textarea {
     width: 100%;
     box-sizing: border-box;
   }
+  /* form title inside the MCP add/edit details (card titles override below) */
+  .mcp-form .panel-title { font-size: 12px; font-weight: 600; }
 
   .panel input[type=range] { width: 100%; accent-color: var(--text-warm); margin: 2px 0 0; }
   .effort-ticks { display: flex; justify-content: space-between; color: var(--text-tertiary); font-size: 10px; }
@@ -2642,9 +2668,10 @@ for (const btn of document.querySelectorAll(".tabs .tab")) {
 $("probe").addEventListener("click", probe);
 $("endpoint").textContent = location.origin + "/v1";
 
-// ---- MCP servers (--webui-mcp-proxy). The tab button is hidden by default;
-// a 200 from GET /mcp/status on load means the flag is on and the tab un-hides.
-let mcpEnabled = false;   // flag on + status reachable
+// ---- MCP servers. The hub is always on; the tab un-hides once GET
+// /mcp/status responds 200 on load. --webui-mcp-proxy gates only the
+// /cors-proxy passthrough route (llama.cpp server-cors-proxy parity).
+let mcpEnabled = false;   // /mcp/status reachable
 let mcpHasTools = false;  // ≥1 enabled tool => force non-stream agentic loop
 function mcpHasEnabledTools() { return mcpEnabled && mcpHasTools; }
 
@@ -2699,18 +2726,48 @@ async function mcpRefresh() {
   const servers = data.servers || [];
   $("mcp-summary").textContent = servers.length + " server" + (servers.length === 1 ? "" : "s");
   for (const s of servers) {
+    const total = (s.tools || []).length;
     const enabledCount = (s.tools || []).filter((t) => t.enabled).length;
     if (enabledCount > 0) mcpHasTools = true;
+    // display name comes from the server's initialize handshake when reported
+    const display = s.server_name || s.name;
+    const disabled = !!s.disabled;
+    // if the handshake name differs from the config key, show the key as a quiet alias,
+    // otherwise show the server-reported version (e.g. "v0.1.0")
+    const aliasOrVer = (s.server_name && s.server_name !== s.name)
+      ? `<span class="mc-ver">${escapeHtml(s.name)}</span>`
+      : (s.server_version ? `<span class="mc-ver">v${escapeHtml(s.server_version)}</span>` : "");
+    const logs = s.logs || [];
     const card = document.createElement("div");
     card.className = "mcp-card";
-    const toolsHtml = (s.tools || []).map((t) =>
-      `<label class="check-row"><input type="checkbox" data-tool="${escapeHtml(t.namespaced)}" ${t.enabled ? "checked" : ""}/><span>${escapeHtml(t.name)} <span class="hint">${escapeHtml((t.description || "").slice(0, 80))}</span></span></label>`
+    const toolsHtml = total
+      ? (s.tools).map((t) =>
+          `<label class="check-row"><input type="checkbox" data-tool="${escapeHtml(t.namespaced)}" ${t.enabled ? "checked" : ""}/><span>${escapeHtml(t.name)}<span class="hint"> — ${escapeHtml((t.description || "").slice(0, 90))}</span></span></label>`
+        ).join("")
+      : `<div class="hint">no tools advertised</div>`;
+    const logRows = logs.map((l) =>
+      `<div class="row ${l.ok ? "" : "bad"}"><span class="t">${escapeHtml(l.t)}</span><span class="m">${escapeHtml(l.msg)}</span></div>`
     ).join("");
     card.innerHTML =
-      `<div class="panel-title">${escapeHtml(s.name)} <span class="reach ${s.connected ? "ok" : "bad"}">${s.connected ? "reachable" : "offline"}</span><span class="hint"> ${escapeHtml(s.transport)}${s.disabled ? " · disabled" : ""} · ${enabledCount}/${(s.tools || []).length} tools</span></div>` +
+      `<div class="mc-head">` +
+        `<span class="mc-name" title="${escapeHtml(s.name)}">${escapeHtml(display)}</span>${aliasOrVer}` +
+        `<span class="mc-spacer"></span>` +
+        `<span class="reach ${s.connected ? "ok" : "bad"}" title="${s.connected ? "engine reachable" : "offline"}">${s.connected ? "reachable" : "offline"}</span>` +
+        `<button type="button" class="cpu-toggle ${disabled ? "" : "on"}" data-toggle="${escapeHtml(s.name)}" title="${disabled ? "Enable server" : "Disable server"}" aria-label="${disabled ? "Enable" : "Disable"} server">${disabled ? "off" : "on"}</button>` +
+      `</div>` +
+      `<div class="mc-badges">` +
+        `<span class="mc-badge">${escapeHtml(s.transport)}${disabled ? " · off" : ""}</span>` +
+        (total ? `<span class="mc-badge tools">${enabledCount}/${total} tool${total === 1 ? "" : "s"}</span>` : `<span class="mc-badge">no tools</span>`) +
+      `</div>` +
       (s.error ? `<div class="hint" style="color:var(--danger)">${escapeHtml(s.error)}</div>` : "") +
-      `<div class="mcp-tools">${toolsHtml}</div>` +
-      `<div class="ctx-row"><button class="cpu-toggle" data-edit="${escapeHtml(s.name)}">Edit</button><button class="danger" data-del="${escapeHtml(s.name)}">Remove</button></div>`;
+      `<details class="mc-fold"><summary>${total} tool${total === 1 ? "" : "s"} available <span class="hint">· show details</span></summary><div class="mcp-tools">${toolsHtml}</div></details>` +
+      `<details class="mc-fold"><summary>Connection log (${logs.length})${s.connect_ms != null ? ` <span class="hint">· connected in ${s.connect_ms}ms</span>` : ""}</summary><div class="mc-log">${logRows || `<div class="hint">no log entries</div>`}</div></details>` +
+      `<div class="mc-foot">` +
+        `<span class="mc-proto">${s.protocol_version ? "protocol " + escapeHtml(s.protocol_version) : ""}</span>` +
+        `<button type="button" class="mc-act" data-rec="${escapeHtml(s.name)}" title="Reconnect">↻</button>` +
+        `<button type="button" class="mc-act" data-edit="${escapeHtml(s.name)}" title="Edit">✎</button>` +
+        `<button type="button" class="mc-act danger" data-del="${escapeHtml(s.name)}" title="Remove">🗑</button>` +
+      `</div>`;
     list.appendChild(card);
   }
   for (const cb of list.querySelectorAll("input[data-tool]")) {
@@ -2720,6 +2777,25 @@ async function mcpRefresh() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tool: cb.dataset.tool, disabled: !cb.checked }),
       });
+      mcpRefresh();
+    });
+  }
+  // server on/off switch — re-upsert the cfg with `disabled` flipped
+  for (const sw of list.querySelectorAll("button[data-toggle]")) {
+    sw.addEventListener("click", async () => {
+      const s = await mcpGetServer(sw.dataset.toggle);
+      if (!s || !s.config) return;
+      const cfg = Object.assign({}, s.config, { disabled: !s.disabled });
+      await fetch("/mcp/server", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: s.name, config: cfg }) });
+      mcpRefresh();
+    });
+  }
+  // reconnect — re-upsert the unchanged cfg (upsert_server reconnects)
+  for (const b of list.querySelectorAll("button[data-rec]")) {
+    b.addEventListener("click", async () => {
+      const s = await mcpGetServer(b.dataset.rec);
+      if (!s || !s.config) return;
+      await fetch("/mcp/server", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: s.name, config: s.config }) });
       mcpRefresh();
     });
   }
@@ -2739,13 +2815,18 @@ async function mcpRefresh() {
   }
 }
 
-async function mcpBeginEdit(name) {
+async function mcpGetServer(name) {
   try {
     const r = await fetch("/mcp/status");
+    if (!r.ok) return null;
     const data = await r.json();
-    const s = (data.servers || []).find((x) => x.name === name);
-    if (s) mcpFillForm(s.config);
-  } catch {}
+    return (data.servers || []).find((x) => x.name === name) || null;
+  } catch { return null; }
+}
+
+async function mcpBeginEdit(name) {
+  const s = await mcpGetServer(name);
+  if (s) mcpFillForm(s.config);
   $("mcp-edit-name").value = name;
   $("mcp-name").value = name;
   $("mcp-form-title").textContent = "Edit " + name;
@@ -2823,7 +2904,7 @@ try { savedSidebar = localStorage.getItem("pulsar-sidebar") || "expanded"; } cat
 applySidebarCollapsed(savedSidebar === "collapsed", false);
 loadModel();
 probe(); // initial /stats: reachability + runtime + tiers
-mcpInit(); // un-hides the MCP tab only when --webui-mcp-proxy is on
+mcpInit(); // un-hides the MCP tab once /mcp/status responds (hub always on)
 setChips("idle");
 autoGrow();
 

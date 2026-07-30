@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use rmcp::model::{CallToolRequestParams, ClientInfo, InitializeRequestParams, Tool};
 use rmcp::service::{RunningService, ServiceExt};
@@ -108,6 +108,37 @@ struct Conn {
     client: Option<Arc<ClientService>>,
     tools: Vec<Tool>,
     error: Option<String>,
+    /// Identity advertised by the server in its initialize handshake.
+    server_name: Option<String>,
+    server_version: Option<String>,
+    protocol_version: Option<String>,
+    /// Wall-clock ms spent in the last connect (handshake only, excl. list_tools).
+    connect_ms: Option<u64>,
+    /// Rolling per-server connection log (newest last, capped at LOG_CAP).
+    logs: Vec<LogEntry>,
+}
+
+/// One line in a server's connection log. `t` is UTC HH:MM:SS.
+#[derive(Clone, Serialize)]
+struct LogEntry {
+    t: String,
+    ok: bool,
+    msg: String,
+}
+
+/// Max lines retained per server in Conn::logs.
+const LOG_CAP: usize = 64;
+
+/// UTC HH:MM:SS stamp for log lines.
+// ponytail: hand-rolled to avoid pulling chrono/time for one timestamp. Add
+// chrono if real date math shows up elsewhere.
+fn now_hms_utc() -> String {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let d = secs % 86_400;
+    format!("{:02}:{:02}:{:02}", (d / 3600) % 24, (d % 3600) / 60, d % 60)
 }
 
 /// Synchronous facade over the async rmcp clients. Every public method is
@@ -140,6 +171,11 @@ impl McpHub {
                             client: None,
                             tools: Vec::new(),
                             error: None,
+                            server_name: None,
+                            server_version: None,
+                            protocol_version: None,
+                            connect_ms: None,
+                            logs: Vec::new(),
                         });
                     }
                 }
@@ -171,15 +207,24 @@ impl McpHub {
             c.client = None;
             c.tools.clear();
             c.error = None;
+            c.server_name = None;
+            c.server_version = None;
+            c.protocol_version = None;
+            c.connect_ms = None;
             c.cfg.clone()
         };
+        self.push_log(name, true, &format!("connecting via {}", cfg.transport_kind()));
         if cfg.disabled() {
-            let mut conns = self.conns.lock().unwrap();
-            if let Some(c) = conns.iter_mut().find(|c| c.name == name) {
-                c.error = Some("disabled".into());
+            {
+                let mut conns = self.conns.lock().unwrap();
+                if let Some(c) = conns.iter_mut().find(|c| c.name == name) {
+                    c.error = Some("disabled".into());
+                }
             }
+            self.push_log(name, false, "disabled in config");
             return;
         }
+        let started = Instant::now();
         let res = self.rt.block_on(async {
             match &cfg {
                 McpServerCfg::Stdio { command, args, env, .. } => {
@@ -210,22 +255,79 @@ impl McpHub {
                 }
             }
         });
+        let connect_ms = started.elapsed().as_millis() as u64;
         match res {
             Ok(client) => {
                 let client = Arc::new(client);
+                // peer_info is a sync read off the peer (no await needed); it
+                // holds the initialize handshake result: server name/version
+                // and the negotiated protocol version.
+                let (server_name, server_version, protocol_version) = match client.peer_info() {
+                    Some(pi) => (
+                        pi.server_info.as_ref().map(|i| i.name.clone()),
+                        pi.server_info.as_ref().map(|i| i.version.clone()),
+                        Some(pi.protocol_version.as_str().to_string()),
+                    ),
+                    None => (None, None, None),
+                };
+                {
+                    let mut conns = self.conns.lock().unwrap();
+                    if let Some(c) = conns.iter_mut().find(|c| c.name == name) {
+                        c.server_name = server_name.clone();
+                        c.server_version = server_version.clone();
+                        c.protocol_version = protocol_version.clone();
+                        c.connect_ms = Some(connect_ms);
+                    }
+                }
+                let ident = match (&server_name, &server_version) {
+                    (Some(n), Some(v)) => format!("{n} {v}"),
+                    (Some(n), None) => n.clone(),
+                    _ => name.into(),
+                };
+                self.push_log(
+                    name,
+                    true,
+                    &format!("handshake ok in {connect_ms}ms — {ident}"),
+                );
                 let tools = self.rt.block_on(async { client.list_all_tools().await });
                 match tools {
                     Ok(t) => {
-                        let mut conns = self.conns.lock().unwrap();
-                        if let Some(c) = conns.iter_mut().find(|c| c.name == name) {
-                            c.client = Some(client);
-                            c.tools = t;
+                        let cnt = t.len();
+                        {
+                            let mut conns = self.conns.lock().unwrap();
+                            if let Some(c) = conns.iter_mut().find(|c| c.name == name) {
+                                c.client = Some(client);
+                                c.tools = t;
+                            }
                         }
+                        self.push_log(name, true, &format!("listed {cnt} tools"));
                     }
-                    Err(e) => self.set_err(name, format!("list_tools: {e}")),
+                    Err(e) => {
+                        let msg = format!("list_tools: {e}");
+                        self.set_err(name, msg.clone());
+                        self.push_log(name, false, &msg);
+                    }
                 }
             }
-            Err(e) => self.set_err(name, e),
+            Err(e) => {
+                let msg = e;
+                self.set_err(name, msg.clone());
+                self.push_log(name, false, &format!("handshake failed in {connect_ms}ms: {msg}"));
+            }
+        }
+    }
+
+    /// Append a log line to the named server (newest last, capped at LOG_CAP).
+    /// Re-locks `conns`; callers MUST drop their lock guard before calling.
+    fn push_log(&self, name: &str, ok: bool, msg: &str) {
+        let entry = LogEntry { t: now_hms_utc(), ok, msg: msg.into() };
+        let mut conns = self.conns.lock().unwrap();
+        if let Some(c) = conns.iter_mut().find(|c| c.name == name) {
+            c.logs.push(entry);
+            if c.logs.len() > LOG_CAP {
+                let drop_n = c.logs.len() - LOG_CAP;
+                c.logs.drain(0..drop_n);
+            }
         }
     }
 
@@ -333,6 +435,13 @@ impl McpHub {
                     "disabled": c.cfg.disabled(),
                     "error": c.error.clone(),
                     "tools": tools,
+                    // handshake identity + timing (None until first successful init)
+                    "server_name": c.server_name.clone(),
+                    "server_version": c.server_version.clone(),
+                    "protocol_version": c.protocol_version.clone(),
+                    "connect_ms": c.connect_ms,
+                    // rolling connection log, newest last
+                    "logs": c.logs,
                     // raw cfg so the webui edit form can repopulate every field
                     "config": serde_json::to_value(&c.cfg).unwrap_or(Value::Null),
                 })
@@ -360,6 +469,12 @@ impl McpHub {
                 c.client = None;
                 c.tools.clear();
                 c.error = None;
+                // Stale identity from the previous transport — clear so the
+                // next handshake repopulates. Keep c.logs as history.
+                c.server_name = None;
+                c.server_version = None;
+                c.protocol_version = None;
+                c.connect_ms = None;
             } else {
                 conns.push(Conn {
                     name: name.into(),
@@ -367,6 +482,11 @@ impl McpHub {
                     client: None,
                     tools: Vec::new(),
                     error: None,
+                    server_name: None,
+                    server_version: None,
+                    protocol_version: None,
+                    connect_ms: None,
+                    logs: Vec::new(),
                 });
             }
         }
