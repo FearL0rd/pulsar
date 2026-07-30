@@ -1085,6 +1085,26 @@
   .panel textarea { min-height: 72px; resize: vertical; }
   .panel input:focus, .panel textarea:focus { border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
   .hint { color: var(--text-tertiary); font-size: 11px; }
+  /* MCP server cards live inline in the sidebar (narrow, normal flow) */
+  .mcp-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 9px;
+    margin-bottom: 7px;
+    border-radius: 7px;
+    background: var(--glass-input);
+    border: 1px solid var(--glass-border);
+  }
+  .mcp-card .panel-title { font-size: 12px; font-weight: 600; }
+  .mcp-tools { display: flex; flex-direction: column; gap: 3px; }
+  #mcp-side-section label > .field-label,
+  #mcp-side-section label { display: block; }
+  #mcp-side-section input, #mcp-side-section select, #mcp-side-section textarea {
+    width: 100%;
+    box-sizing: border-box;
+  }
+
   .panel input[type=range] { width: 100%; accent-color: var(--text-warm); margin: 2px 0 0; }
   .effort-ticks { display: flex; justify-content: space-between; color: var(--text-tertiary); font-size: 10px; }
   .effort-ticks span { flex: 1; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1213,6 +1233,52 @@
     </div>
   </div>
 
+  <div class="side-section" id="mcp-side-section" hidden>
+    <div class="side-title">MCP Servers<span class="side-title-note" id="mcp-summary">— servers</span></div>
+    <div id="mcp-list"></div>
+    <details>
+      <summary>Add / edit server</summary>
+      <div class="mcp-form">
+        <div class="panel-title" id="mcp-form-title">Add server</div>
+        <input type="hidden" id="mcp-edit-name" />
+        <label><span class="field-label">name</span>
+          <input id="mcp-name" placeholder="everything" />
+        </label>
+        <label><span class="field-label">transport</span>
+          <select id="mcp-transport">
+            <option value="http">http (streamable remote)</option>
+            <option value="stdio">stdio (local subprocess)</option>
+          </select>
+        </label>
+        <div id="mcp-http-fields">
+          <label><span class="field-label">url</span>
+            <input id="mcp-url" placeholder="http://127.0.0.1:8765/mcp" />
+          </label>
+          <label><span class="field-label">headers (KEY: VAL per line)</span>
+            <textarea id="mcp-headers" rows="2" placeholder="Authorization: Bearer ..."></textarea>
+          </label>
+        </div>
+        <div id="mcp-stdio-fields" hidden>
+          <label><span class="field-label">command</span>
+            <input id="mcp-command" placeholder="npx" />
+          </label>
+          <label><span class="field-label">args (whitespace-separated)</span>
+            <input id="mcp-args" placeholder="-y @modelcontextprotocol/server-everything" />
+          </label>
+          <label><span class="field-label">env (KEY=VAL per line)</span>
+            <textarea id="mcp-env" rows="2" placeholder="API_KEY=..."></textarea>
+          </label>
+          <div class="hint" style="color:var(--danger)">warning: stdio spawns this process on the serve host. local single-user only.</div>
+        </div>
+        <label class="check-row"><input type="checkbox" id="mcp-disabled" /><span>disabled (configured but not connected)</span></label>
+        <div class="ctx-row">
+          <button id="mcp-save" class="primary" type="button">Save</button>
+          <button id="mcp-cancel" class="cpu-toggle" type="button" hidden>Cancel edit</button>
+        </div>
+      </div>
+    </details>
+  </div>
+
   <div class="side-section">
     <div class="side-title">Runtime</div>
     <div class="kv"><span class="k">CPU</span><span class="v v-name" id="hw-cpu">—</span></div>
@@ -1283,7 +1349,6 @@
     <button class="tab active" id="tabbtn-chat" type="button" data-tab="tab-chat">Chat</button>
     <button class="tab" id="tabbtn-brain" type="button" data-tab="tab-brain">Brain</button>
     <button class="tab" id="tabbtn-atlas" type="button" data-tab="tab-atlas">Atlas</button>
-    <button class="tab" id="tabbtn-mcp" type="button" data-tab="tab-mcp" hidden>MCP</button>
   </nav>
   <div class="chips">
     <span class="chip"><span class="chip-label">tok/s</span><span id="chip-tps">—</span></span>
@@ -1435,61 +1500,6 @@
   </div>
 </div>
 
-<div class="tab-panel" id="tab-mcp" hidden>
-  <div class="cortex">
-    <div class="cortex-head">
-      <div class="cortex-title">
-        <span class="ph-kicker">MCP Servers</span>
-        <span class="cortex-dims" id="mcp-summary">— servers</span>
-      </div>
-      <div class="cortex-legend">
-        <span class="cortex-legend-note">manage tool servers · <kbd>--webui-mcp-proxy</kbd></span>
-      </div>
-    </div>
-    <div id="mcp-list"></div>
-    <details>
-      <summary>Add / edit server</summary>
-      <div class="panel">
-        <div class="panel-title" id="mcp-form-title">Add server</div>
-        <input type="hidden" id="mcp-edit-name" />
-        <label><span class="field-label">name</span>
-          <input id="mcp-name" placeholder="everything" />
-        </label>
-        <label><span class="field-label">transport</span>
-          <select id="mcp-transport">
-            <option value="http">http (streamable remote)</option>
-            <option value="stdio">stdio (local subprocess)</option>
-          </select>
-        </label>
-        <div id="mcp-http-fields">
-          <label><span class="field-label">url</span>
-            <input id="mcp-url" placeholder="http://127.0.0.1:8765/mcp" />
-          </label>
-          <label><span class="field-label">headers (KEY: VAL per line)</span>
-            <textarea id="mcp-headers" rows="2" placeholder="Authorization: Bearer ..."></textarea>
-          </label>
-        </div>
-        <div id="mcp-stdio-fields" hidden>
-          <label><span class="field-label">command</span>
-            <input id="mcp-command" placeholder="npx" />
-          </label>
-          <label><span class="field-label">args (whitespace-separated)</span>
-            <input id="mcp-args" placeholder="-y @modelcontextprotocol/server-everything" />
-          </label>
-          <label><span class="field-label">env (KEY=VAL per line)</span>
-            <textarea id="mcp-env" rows="2" placeholder="API_KEY=..."></textarea>
-          </label>
-          <div class="hint" style="color:var(--danger)">warning: stdio spawns this process on the serve host. local single-user only.</div>
-        </div>
-        <label class="check-row"><input type="checkbox" id="mcp-disabled" /><span>disabled (configured but not connected)</span></label>
-        <div class="ctx-row">
-          <button id="mcp-save" class="primary" type="button">Save</button>
-          <button id="mcp-cancel" class="cpu-toggle" type="button" hidden>Cancel edit</button>
-        </div>
-      </div>
-    </details>
-  </div>
-</div>
 </main>
 </div>
 
@@ -2692,12 +2702,12 @@ async function mcpRefresh() {
     const enabledCount = (s.tools || []).filter((t) => t.enabled).length;
     if (enabledCount > 0) mcpHasTools = true;
     const card = document.createElement("div");
-    card.className = "panel";
+    card.className = "mcp-card";
     const toolsHtml = (s.tools || []).map((t) =>
       `<label class="check-row"><input type="checkbox" data-tool="${escapeHtml(t.namespaced)}" ${t.enabled ? "checked" : ""}/><span>${escapeHtml(t.name)} <span class="hint">${escapeHtml((t.description || "").slice(0, 80))}</span></span></label>`
     ).join("");
     card.innerHTML =
-      `<div class="panel-title">${escapeHtml(s.name)} <span class="hint">${escapeHtml(s.transport)} · ${s.connected ? "connected" : "offline"}${s.disabled ? " · disabled" : ""} · ${enabledCount}/${(s.tools || []).length} tools</span></div>` +
+      `<div class="panel-title">${escapeHtml(s.name)} <span class="reach ${s.connected ? "ok" : "bad"}">${s.connected ? "reachable" : "offline"}</span><span class="hint"> ${escapeHtml(s.transport)}${s.disabled ? " · disabled" : ""} · ${enabledCount}/${(s.tools || []).length} tools</span></div>` +
       (s.error ? `<div class="hint" style="color:var(--danger)">${escapeHtml(s.error)}</div>` : "") +
       `<div class="mcp-tools">${toolsHtml}</div>` +
       `<div class="ctx-row"><button class="cpu-toggle" data-edit="${escapeHtml(s.name)}">Edit</button><button class="danger" data-del="${escapeHtml(s.name)}">Remove</button></div>`;
@@ -2740,7 +2750,7 @@ async function mcpBeginEdit(name) {
   $("mcp-name").value = name;
   $("mcp-form-title").textContent = "Edit " + name;
   $("mcp-cancel").hidden = false;
-  document.querySelector("#tab-mcp details").open = true;
+  document.querySelector("#mcp-side-section details").open = true;
 }
 
 function mcpKvLines(text, sep) {
@@ -2798,7 +2808,7 @@ async function mcpInit() {
     const r = await fetch("/mcp/status");
     if (r.ok) {
       mcpEnabled = true;
-      $("tabbtn-mcp").hidden = false;
+      $("mcp-side-section").hidden = false;
       mcpRefresh();
     }
   } catch {}

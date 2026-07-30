@@ -277,6 +277,10 @@ CXX=g++-12 cargo build --release -p engine
 cargo build --release -p serve
 ./target/release/pulsar-serve -m /path/to/model.gguf --port 11435
 # open http://127.0.0.1:11435/  in a browser for the chat UI
+# MCP tool-use (opt-in): connect the model to MCP servers (stdio + http),
+# managed from the web UI sidebar, persisted to ./mcp.json:
+#   pulsar-serve -m model.gguf --port 11435 --webui-mcp-proxy [--mcp-config FILE]
+# see docs/mcp-server.md for the config format, routes, and the agentic loop
 # or hit the API directly:
 curl http://127.0.0.1:11435/v1/chat/completions -d '{
   "messages": [{"role": "user", "content": "Hello!"}],
@@ -441,6 +445,17 @@ falls behind again: the round's remaining fixed costs (a ~95ms verify
 floor of per-layer launches and router readbacks, a draft whose cost
 grows with the feature window) need acceptance ~7+ to amortize, and
 measured acceptance is 4.3 on math, less on prose.
+MCP (Model Context Protocol) tool-use in pulsar-serve, opt-in via
+`--webui-mcp-proxy`: the server connects to configured MCP servers
+(rmcp 3.0.1; stdio + streamable-http), exposes their tools to the model
+as namespaced `server__tool` specs, and runs a non-stream agentic loop
+(MAX_TURNS=8) that executes the model's `<tool_call>` blocks and feeds
+results back. Full CRUD lives in the web UI sidebar (add/edit/remove
+servers, enable/disable per tool), persisted to `mcp.json`. Without the
+flag: zero behavioral change — every `/mcp/*` route 404s and the sidebar
+group stays hidden. End-to-end verified on Qwen3.6-35B against a remote
+SearXNG MCP (tool_call → dispatch → grounded answer in ~22s). See
+`docs/mcp-server.md`.
 
 Not yet:
 
