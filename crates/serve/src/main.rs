@@ -34,6 +34,13 @@ const WEBUI_HTML: &str = include_str!("../webui/index.html");
 #[cfg(target_os = "linux")]
 const FAVICON_SVG: &str = include_str!("../webui/favicon.svg");
 
+/// MCP client hub (rmcp). Gated to linux like the rest of the server; the
+/// feature is opt-in via --webui-mcp-proxy, which enables the /mcp/* routes,
+/// tool injection, and the webui MCP tab. Without the flag this module is
+/// unused and behavior is unchanged.
+#[cfg(target_os = "linux")]
+mod mcp;
+
 /// Sanity bound only - NOT a capability limit. The reachable ceiling is
 /// the checkpoint's own context_length (what the model was trained for)
 /// narrowed by ctx_fit (what this machine's VRAM holds). A fixed number
@@ -89,6 +96,8 @@ fn run() -> engine::Result {
     let mut host = String::from("127.0.0.1");
     let mut ctx = 8192u32;
     let mut prefix_file: Option<String> = None;
+    let mut webui_mcp_proxy = false;
+    let mut mcp_config: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut need = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -98,6 +107,10 @@ fn run() -> engine::Result {
             "--host" => host = need("--host")?.to_string(),
             "--ctx" => ctx = need("--ctx")?.parse()?,
             "--prefix-file" => prefix_file = Some(need("--prefix-file")?),
+            // MCP on/off switch (the whole feature). Optional path defaults to
+            // ./mcp.json next to the server cwd.
+            "--webui-mcp-proxy" => webui_mcp_proxy = true,
+            "--mcp-config" => mcp_config = Some(need("--mcp-config")?),
             other => return Err(format!("unknown arg {other}").into()),
         }
     }
@@ -132,6 +145,23 @@ fn run() -> engine::Result {
         .get("general.sampling.temp")
         .and_then(gguf::Value::as_f32)
         .unwrap_or(0.9);
+
+    // MCP hub: only built when --webui-mcp-proxy is passed (the feature gate).
+    // Without the flag this stays None, no /mcp/* routes match, no tools are
+    // injected, the webui tab stays hidden — zero behavioral change.
+    let mcp = if webui_mcp_proxy {
+        let cfg_path =
+            std::path::PathBuf::from(mcp_config.as_deref().unwrap_or("mcp.json"));
+        let m = mcp::McpHub::new(Some(&cfg_path));
+        m.connect_all();
+        eprintln!(
+            "pulsar-serve: --webui-mcp-proxy enabled ({} server(s) configured)",
+            m.status_json()["servers"].as_array().map(|a| a.len()).unwrap_or(0)
+        );
+        Some(m)
+    } else {
+        None
+    };
 
     let listener = std::net::TcpListener::bind((host.as_str(), port))?;
     eprintln!("pulsar-serve: listening on http://{host}:{port}  (web UI at /, API at /v1)");
@@ -576,7 +606,83 @@ fn run() -> engine::Result {
                     default_temp,
                     request_id,
                     &mut hist,
+                    mcp.as_ref(),
                 ),
+                // --- MCP management + tool surface (only meaningful with
+                // --webui-mcp-proxy; 404 otherwise so the webui probe hides
+                // the tab). ---
+                ("GET", "/mcp/status") => match &mcp {
+                    Some(m) => respond_json(&mut stream, 200, &m.status_json()),
+                    None => respond_json(
+                        &mut stream,
+                        404,
+                        &serde_json::json!({"error": {"message": "--webui-mcp-proxy not enabled"}}),
+                    ),
+                },
+                ("GET", "/v1/tools") => match &mcp {
+                    Some(m) => respond_json(
+                        &mut stream,
+                        200,
+                        &serde_json::json!({"object": "list", "data": m.enabled_tools_as_openai()}),
+                    ),
+                    None => respond_json(
+                        &mut stream,
+                        404,
+                        &serde_json::json!({"error": {"message": "--webui-mcp-proxy not enabled"}}),
+                    ),
+                },
+                ("POST", "/mcp/server") => match &mcp {
+                    Some(m) => {
+                        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                        let name = v["name"].as_str().unwrap_or("").to_string();
+                        let cfg = v
+                            .get("config")
+                            .and_then(|c| serde_json::from_value::<mcp::McpServerCfg>(c.clone()).ok());
+                        if name.is_empty() || cfg.is_none() {
+                            respond_json(
+                                &mut stream,
+                                400,
+                                &serde_json::json!({"error": {"message": "invalid server config"}}),
+                            )
+                        } else {
+                            m.upsert_server(&name, cfg.unwrap());
+                            respond_json(&mut stream, 200, &m.status_json())
+                        }
+                    }
+                    None => respond_json(
+                        &mut stream,
+                        404,
+                        &serde_json::json!({"error": {"message": "--webui-mcp-proxy not enabled"}}),
+                    ),
+                },
+                ("POST", "/mcp/server/delete") => match &mcp {
+                    Some(m) => {
+                        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                        if let Some(name) = v["name"].as_str() {
+                            m.remove_server(name);
+                        }
+                        respond_json(&mut stream, 200, &m.status_json())
+                    }
+                    None => respond_json(
+                        &mut stream,
+                        404,
+                        &serde_json::json!({"error": {"message": "--webui-mcp-proxy not enabled"}}),
+                    ),
+                },
+                ("POST", "/mcp/toggle") => match &mcp {
+                    Some(m) => {
+                        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                        if let (Some(tool), Some(disabled)) = (v["tool"].as_str(), v["disabled"].as_bool()) {
+                            m.toggle(tool, disabled);
+                        }
+                        respond_json(&mut stream, 200, &serde_json::json!({"ok": true}))
+                    }
+                    None => respond_json(
+                        &mut stream,
+                        404,
+                        &serde_json::json!({"error": {"message": "--webui-mcp-proxy not enabled"}}),
+                    ),
+                },
                 _ => respond_json(
                     &mut stream,
                     404,
@@ -858,7 +964,7 @@ fn encode_messages(
     let tool_text = tools.filter(|t| !t.is_empty()).map(|t| {
         let schemas: Vec<&serde_json::Value> = t.iter().map(|f| &f["function"]).collect();
         format!(
-            "\n\n# Tools\n\nYou may call tools. To call one, output exactly:\n<tool_call>\n{{\"name\": \"<tool name>\", \"arguments\": <json arguments>}}\n</tool_call>\nYou may make multiple calls in one reply. After tool results arrive, continue the task.\nAvailable tools (JSON Schema):\n{}",
+            "\n\n# Tools\n\nYou are a tool-using assistant. You MUST call a tool before answering whenever the question is about anything that can change over time (standings, rankings, news, weather, prices, current events, recent releases, live status) OR any specific external fact you are not 100% certain of from the conversation — even if you believe you already know it, because your training data may be stale. Do not ask for permission and do not mention that tools are available. Only answer directly with no tool call when the question is pure reasoning, math, or about something already settled in the conversation. To call one, output exactly:\n<tool_call>\n{{\"name\": \"<tool name>\", \"arguments\": <json arguments>}}\n</tool_call>\nYou may make multiple distinct calls in one reply, but do NOT repeat a call whose result is already in a <tool_result> block above — read that block and use it. When tool results arrive, you MUST base your answer entirely on their content — do not answer from your own knowledge for anything the tools surfaced. After all needed results arrive, stop calling tools and give the final answer immediately.\nAvailable tools (JSON Schema):\n{}",
             serde_json::to_string(&schemas).unwrap_or_default()
         )
     });
@@ -1023,6 +1129,41 @@ fn extract_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
+/// Recompute the prefix-cache common-prefix length for a turn's prompt and, on
+/// divergence, rewind the recurrent state to the nearest checkpoint. Same
+/// logic as the initial prefix block in handle_chat, factored out so the
+/// non-stream agentic loop can call it once per turn.
+#[cfg(target_os = "linux")]
+fn prefix_common(
+    model: &engine::Model,
+    st: &mut engine::State,
+    hist: &mut Vec<u32>,
+    cache_ok: bool,
+    prompt: &[u32],
+) -> engine::Result<usize> {
+    if !cache_ok {
+        return Ok(0);
+    }
+    let mut common = hist.iter().zip(prompt.iter()).take_while(|(a, b)| a == b).count();
+    let recurrent = model.recurrent_state();
+    if recurrent && (common < hist.len() || common == prompt.len()) {
+        let target = common.min(prompt.len() - 1) as u32;
+        match st.restore_nearest_ckpt(model, target)? {
+            Some(c) => {
+                hist.truncate(c as usize);
+                common = c as usize;
+            }
+            None => common = 0,
+        }
+    } else if common == prompt.len() {
+        common -= 1;
+    }
+    if common == 0 {
+        hist.clear();
+    }
+    Ok(common)
+}
+
 fn handle_chat(
     stream: &mut std::net::TcpStream,
     body: &[u8],
@@ -1034,6 +1175,7 @@ fn handle_chat(
     default_temp: f32,
     request_id: u64,
     hist: &mut Vec<u32>,
+    mcp: Option<&mcp::McpHub>,
 ) -> engine::Result {
     use std::io::Write;
 
@@ -1069,7 +1211,17 @@ fn handle_chat(
     }
     let markers = &req_markers;
 
-    let tools = req["tools"].as_array().cloned();
+    // Merge client-supplied tools with any enabled MCP tools (namespaced
+    // `server__tool`). When MCP is off or has no enabled tools this is exactly
+    // the client list (or None), so non-MCP requests are byte-identical to today.
+    let mut tools_vec: Vec<serde_json::Value> =
+        req["tools"].as_array().cloned().unwrap_or_default();
+    if let Some(m) = mcp {
+        if m.has_enabled_tools() {
+            tools_vec.extend(m.enabled_tools_as_openai());
+        }
+    }
+    let tools = if tools_vec.is_empty() { None } else { Some(tools_vec) };
     let prompt = encode_messages(tok, markers, messages, tools.as_ref());
     if std::env::var_os("PULSAR_DEBUG_IDS").is_some() {
         eprintln!("pulsar-serve: prompt ids {prompt:?}");
@@ -1352,40 +1504,131 @@ fn handle_chat(
             hist.extend(stop_seen.get());
         }
     } else {
-        let mut out: Vec<u8> = Vec::new();
-        let mut n_out = 0usize;
-        engine::generate(
-            model,
-            st,
-            &prompt[common..],
-            common as u32,
-            &mut sampler,
-            max_tokens,
-            |t| {
-                let s = markers.is_stop(t);
-                if s {
-                    stop_seen.set(Some(t));
-                }
-                s
-            },
-            |t| {
-                n_out += 1;
-                emitted.push(t);
-                out.extend_from_slice(&tok.decode(&[t]));
-            },
-        )?;
-        let full = String::from_utf8_lossy(&out).into_owned();
-        let (clean, calls) = extract_tool_calls(&full);
-        let (reasoning, clean) = if markers.opens_thinking() {
-            split_open_think(&clean)
-        } else {
-            split_harmony(&clean)
-        };
+        // ponytail: agentic loop is non-stream only. Each turn re-encodes the
+        // full conversation — the prefix cache makes turn N+1 cheap because
+        // hist already holds turn N's prompt+emitted, so only the suffix
+        // re-prefills. When the model emits tool calls AND an MCP hub is
+        // attached, the calls are dispatched, their results appended as
+        // `tool` messages, and the loop regenerates. Without MCP (or once the
+        // model stops calling tools) the loop degenerates to one turn and the
+        // response is byte-identical to the pre-MCP server.
+        const MAX_TURNS: usize = 8;
+        let mut msgs: Vec<serde_json::Value> = messages.to_vec();
+        let mut clean = String::new();
+        let mut reasoning = String::new();
+        let mut calls: Vec<(String, String)> = Vec::new();
+        let mut n_out_total = 0usize;
+        let mut prompt_len = prompt.len();
+        let mut last_finish = "stop";
+        let mut prev_calls: Vec<(String, String)> = Vec::new();
+        for turn in 0..MAX_TURNS {
+            let tp = encode_messages(tok, markers, &msgs, tools.as_ref());
+            if tp.len() as u32 + 2 >= st.ctx() {
+                eprintln!(
+                    "pulsar-serve: {id}: context exceeded after tool turn {turn} ({} tokens)",
+                    tp.len()
+                );
+                break;
+            }
+            let common = prefix_common(model, st, hist, cache_ok, &tp)?;
+            let room = (st.ctx() as usize).saturating_sub(tp.len() + 2);
+            let max_t = max_tokens.min(room);
+            let mut out: Vec<u8> = Vec::new();
+            let mut emitted_t: Vec<u32> = Vec::new();
+            engine::generate(
+                model,
+                st,
+                &tp[common..],
+                common as u32,
+                &mut sampler,
+                max_t,
+                |t| {
+                    let s = markers.is_stop(t);
+                    if s {
+                        stop_seen.set(Some(t));
+                    }
+                    s
+                },
+                |t| {
+                    n_out_total += 1;
+                    emitted_t.push(t);
+                    out.extend_from_slice(&tok.decode(&[t]));
+                },
+            )?;
+            prompt_len = tp.len();
+            if cache_ok {
+                *hist = tp;
+                hist.extend(&emitted_t);
+                hist.extend(stop_seen.get());
+                stop_seen.set(None);
+            }
+            let full = String::from_utf8_lossy(&out).into_owned();
+            let (c, this_calls) = extract_tool_calls(&full);
+            let (r, c2) = if markers.opens_thinking() {
+                split_open_think(&c)
+            } else {
+                split_harmony(&c)
+            };
+            clean = c2;
+            reasoning = r;
+            calls = this_calls;
+            if calls.is_empty() {
+                last_finish = "stop";
+                break;
+            }
+            // ponytail: collapse infinite-loop where the model repeats an
+            // already-dispatched call verbatim instead of reading the
+            // <tool_result> above. Break with the last text as the answer;
+            // upgrade path: a tool-result-aware duplicate check (same name
+            // + args, ignoring prior failed results) instead of exact match.
+            if turn > 0 && calls.len() == prev_calls.len()
+                && calls.iter().zip(prev_calls.iter()).all(|(a, b)| a == b)
+            {
+                eprintln!(
+                    "pulsar-serve: {id}: tool loop stalled at turn {turn} (repeated call), forcing final answer");
+                last_finish = "stop";
+                break;
+            }
+            let Some(m) = mcp else {
+                // calls but no hub: hand them to the client unchanged
+                last_finish = "tool_calls";
+                break;
+            };
+            let tool_calls_json: Vec<serde_json::Value> = calls
+                .iter()
+                .enumerate()
+                .map(|(ci, (name, args))| serde_json::json!({
+                    "id": format!("call_{request_id}_{turn}_{ci}"),
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                }))
+                .collect();
+            msgs.push(serde_json::json!({
+                "role": "assistant",
+                "content": clean.clone(),
+                "tool_calls": tool_calls_json,
+            }));
+            for (ci, (name, args)) in calls.iter().enumerate() {
+                let call_id = format!("call_{request_id}_{turn}_{ci}");
+                let result = m.dispatch_sync(name, args);
+                eprintln!("pulsar-serve: {id}: mcp dispatch {name}");
+                msgs.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result,
+                }));
+            }
+            last_finish = "tool_calls";
+            prev_calls = calls.iter().cloned().collect();
+        }
         let mut message = serde_json::json!({"role": "assistant", "content": clean});
         if !reasoning.is_empty() {
             message["reasoning_content"] = serde_json::json!(reasoning);
         }
-        if !calls.is_empty() {
+        // Final reply carries tool_calls only when the loop ended with
+        // un-dispatched calls (no MCP hub). When the hub ran them, the
+        // model's final turn is a plain answer.
+        if last_finish == "tool_calls" && !calls.is_empty() {
             message["tool_calls"] = serde_json::json!(calls
                 .iter()
                 .enumerate()
@@ -1401,21 +1644,18 @@ fn handle_chat(
             "choices": [{
                 "index": 0,
                 "message": message,
-                "finish_reason": if calls.is_empty() { "stop" } else { "tool_calls" },
+                "finish_reason": last_finish,
             }],
             "usage": {
-                "prompt_tokens": prompt.len(),
-                "completion_tokens": n_out,
-                "total_tokens": prompt.len() + n_out,
+                "prompt_tokens": prompt_len,
+                "completion_tokens": n_out_total,
+                "total_tokens": prompt_len + n_out_total,
             },
         });
-        eprintln!("pulsar-serve: {id}: {} prompt + {n_out} completion tokens", prompt.len());
+        eprintln!(
+            "pulsar-serve: {id}: {prompt_len} prompt + {n_out_total} completion tokens (non-stream)"
+        );
         respond_json(stream, 200, &json)?;
-        if cache_ok {
-            *hist = prompt;
-            hist.extend(&emitted);
-            hist.extend(stop_seen.get());
-        }
     }
     Ok(())
 }

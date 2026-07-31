@@ -1085,6 +1085,52 @@
   .panel textarea { min-height: 72px; resize: vertical; }
   .panel input:focus, .panel textarea:focus { border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
   .hint { color: var(--text-tertiary); font-size: 11px; }
+  /* MCP server cards — llama-ui style. Header (name + version + on/off
+     switch), badge row (transport · tools), two collapsible <details>
+     (tools list, connection log), footer (protocol version + actions). */
+  .mcp-card {
+    padding: 10px 11px;
+    margin-bottom: 8px;
+    border-radius: 8px;
+    background: var(--glass-input);
+    border: 1px solid var(--glass-border);
+    font-size: 12px;
+  }
+  .mcp-card .mc-head { display: flex; align-items: center; gap: 7px; }
+  .mcp-card .mc-name { font-weight: 600; color: var(--text); font-size: 13px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mcp-card .mc-ver { color: var(--text-tertiary); font-size: 11px; flex-shrink: 0; }
+  .mcp-card .mc-spacer { flex: 1; }
+  /* on/off pill reuses the global .cpu-toggle style (same as CPU Lane / MTP),
+     driven by the server's `disabled` flag via re-upsert. */
+  .mcp-card .mc-badges { display: flex; align-items: center; gap: 6px; margin: 7px 0 2px; flex-wrap: wrap; }
+  .mcp-card .mc-badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 4px; background: var(--glass-code); color: var(--text-secondary); font-size: 10.5px; }
+  .mcp-card .mc-badge.tools { background: #4fae6e; color: #fff; }
+  /* collapsible rows (native <details> — no JS needed to toggle) */
+  .mcp-card .mc-fold { margin-top: 4px; }
+  .mcp-card .mc-fold > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 6px; padding: 4px 0; color: var(--text-secondary); font-size: 11.5px; }
+  .mcp-card .mc-fold > summary::-webkit-details-marker { display: none; }
+  .mcp-card .mc-fold > summary::before { content: "▸"; color: var(--text-tertiary); transition: transform .15s ease; font-size: 10px; }
+  .mcp-card .mc-fold[open] > summary::before { transform: rotate(90deg); }
+  .mcp-card .mc-fold[open] > summary { padding-bottom: 6px; }
+  .mcp-tools { display: flex; flex-direction: column; gap: 3px; padding-bottom: 2px; }
+  .mcp-card .mc-log { font-family: var(--mono); font-size: 10.5px; line-height: 1.55; color: var(--text-secondary); max-height: 170px; overflow: auto; padding-right: 4px; }
+  .mcp-card .mc-log .row { display: flex; gap: 7px; white-space: pre-wrap; word-break: break-word; }
+  .mcp-card .mc-log .row .t { color: var(--text-tertiary); flex-shrink: 0; }
+  .mcp-card .mc-log .row.bad .m { color: var(--danger); }
+  .mcp-card .mc-foot { display: flex; align-items: center; gap: 2px; margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--glass-border); }
+  .mcp-card .mc-proto { color: var(--text-tertiary); font-size: 10.5px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mcp-card .mc-act { background: none; border: none; cursor: pointer; color: var(--text-tertiary); padding: 4px 6px; font-size: 14px; line-height: 1; border-radius: 4px; }
+  .mcp-card .mc-act:hover { color: var(--text); background: var(--glass-code); }
+  .mcp-card .mc-act.danger:hover { color: var(--danger); }
+  #mcp-side-section label > .field-label,
+  #mcp-side-section label { display: block; }
+  #mcp-side-section input, #mcp-side-section select, #mcp-side-section textarea {
+    width: 100%;
+    box-sizing: border-box;
+  }
+  /* form title inside the MCP add/edit details (card titles override below) */
+  .mcp-form .panel-title { font-size: 12px; font-weight: 600; }
+
   .panel input[type=range] { width: 100%; accent-color: var(--text-warm); margin: 2px 0 0; }
   .effort-ticks { display: flex; justify-content: space-between; color: var(--text-tertiary); font-size: 10px; }
   .effort-ticks span { flex: 1; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1211,6 +1257,52 @@
       <button id="probe" type="button">Probe server</button>
       <span class="reach" id="reach">not probed</span>
     </div>
+  </div>
+
+  <div class="side-section" id="mcp-side-section" hidden>
+    <div class="side-title">MCP Servers<span class="side-title-note" id="mcp-summary">— servers</span></div>
+    <div id="mcp-list"></div>
+    <details>
+      <summary>Add / edit server</summary>
+      <div class="mcp-form">
+        <div class="panel-title" id="mcp-form-title">Add server</div>
+        <input type="hidden" id="mcp-edit-name" />
+        <label><span class="field-label">name</span>
+          <input id="mcp-name" placeholder="everything" />
+        </label>
+        <label><span class="field-label">transport</span>
+          <select id="mcp-transport">
+            <option value="http">http (streamable remote)</option>
+            <option value="stdio">stdio (local subprocess)</option>
+          </select>
+        </label>
+        <div id="mcp-http-fields">
+          <label><span class="field-label">url</span>
+            <input id="mcp-url" placeholder="http://127.0.0.1:8765/mcp" />
+          </label>
+          <label><span class="field-label">headers (KEY: VAL per line)</span>
+            <textarea id="mcp-headers" rows="2" placeholder="Authorization: Bearer ..."></textarea>
+          </label>
+        </div>
+        <div id="mcp-stdio-fields" hidden>
+          <label><span class="field-label">command</span>
+            <input id="mcp-command" placeholder="npx" />
+          </label>
+          <label><span class="field-label">args (whitespace-separated)</span>
+            <input id="mcp-args" placeholder="-y @modelcontextprotocol/server-everything" />
+          </label>
+          <label><span class="field-label">env (KEY=VAL per line)</span>
+            <textarea id="mcp-env" rows="2" placeholder="API_KEY=..."></textarea>
+          </label>
+          <div class="hint" style="color:var(--danger)">warning: stdio spawns this process on the serve host. local single-user only.</div>
+        </div>
+        <label class="check-row"><input type="checkbox" id="mcp-disabled" /><span>disabled (configured but not connected)</span></label>
+        <div class="ctx-row">
+          <button id="mcp-save" class="primary" type="button">Save</button>
+          <button id="mcp-cancel" class="cpu-toggle" type="button" hidden>Cancel edit</button>
+        </div>
+      </div>
+    </details>
   </div>
 
   <div class="side-section">
@@ -1433,6 +1525,7 @@
     </div>
   </div>
 </div>
+
 </main>
 </div>
 
@@ -2301,7 +2394,8 @@ function getSettings() {
     messages,
     temperature: parseFloat($("temp").value) || 0.8,
     top_p: parseFloat($("top-p").value) || 0.95,
-    stream: true,
+    // MCP agentic loop runs server-side non-stream; SSE only when no tools.
+    stream: !mcpHasEnabledTools(),
   };
   // blank = omit: the server then defaults max_tokens to all remaining
   // context, which beats any number we could guess here
@@ -2400,49 +2494,66 @@ async function streamAssistant() {
 
   try {
     setChips("busy");
+    const settings = getSettings();
     const resp = await fetch("/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(getSettings()),
+      body: JSON.stringify(settings),
       signal: controller.signal,
     });
-    if (!resp.ok || !resp.body) {
+    if (!resp.ok) {
       const txt = await resp.text().catch(() => "");
       throw new Error("HTTP " + resp.status + " " + txt);
     }
-
-    const reader = resp.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let sep;
-      while ((sep = buf.indexOf("\n\n")) !== -1) {
-        const chunk = buf.slice(0, sep);
-        buf = buf.slice(sep + 2);
-        const line = chunk.trim();
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
-        if (payload === "[DONE]") { buf = ""; break; }
-        let ev;
-        try { ev = JSON.parse(payload); } catch { continue; }
-        const pt = ev?.usage?.prompt_tokens;
-        if (Number.isFinite(pt)) promptToks = pt;
-        const delta = ev?.choices?.[0]?.delta;
-        if (delta?.content || delta?.reasoning_content) {
-          if (ntok === 0) {
-            const prefillS = (performance.now() - tSend) / 1000;
-            if (promptToks > 0 && prefillS > 0) prefillTps = promptToks / prefillS;
-            t0 = performance.now();
+    if (settings.stream) {
+      if (!resp.body) throw new Error("no response body");
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let sep;
+        while ((sep = buf.indexOf("\n\n")) !== -1) {
+          const chunk = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          const line = chunk.trim();
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "[DONE]") { buf = ""; break; }
+          let ev;
+          try { ev = JSON.parse(payload); } catch { continue; }
+          const pt = ev?.usage?.prompt_tokens;
+          if (Number.isFinite(pt)) promptToks = pt;
+          const delta = ev?.choices?.[0]?.delta;
+          if (delta?.content || delta?.reasoning_content) {
+            if (ntok === 0) {
+              const prefillS = (performance.now() - tSend) / 1000;
+              if (promptToks > 0 && prefillS > 0) prefillTps = promptToks / prefillS;
+              t0 = performance.now();
+            }
+            if (delta.content) acc += delta.content;
+            if (delta.reasoning_content) racc += delta.reasoning_content;
+            ntok += 1;
+            scheduleRender();
           }
-          if (delta.content) acc += delta.content;
-          if (delta.reasoning_content) racc += delta.reasoning_content;
-          ntok += 1;
-          scheduleRender();
         }
       }
+    } else {
+      // MCP tools active: the server ran the full agentic loop
+      // (generate → dispatch → regenerate) non-stream and returns one
+      // chat.completion JSON. Render the final message in one shot.
+      const data = await resp.json();
+      const msg = data?.choices?.[0]?.message || {};
+      if (msg.content) acc = msg.content;
+      if (msg.reasoning_content) racc = msg.reasoning_content;
+      ntok = data?.usage?.completion_tokens || 0;
+      const pt = data?.usage?.prompt_tokens;
+      if (Number.isFinite(pt)) promptToks = pt;
+      const prefillS = (performance.now() - tSend) / 1000;
+      if (promptToks > 0 && prefillS > 0) prefillTps = promptToks / prefillS;
+      t0 = tSend; // decode timer spans the whole multi-turn call
     }
     cancelRender();
     body.innerHTML = renderTurn() || "<p><i>(empty)</i></p>";
@@ -2557,12 +2668,243 @@ for (const btn of document.querySelectorAll(".tabs .tab")) {
 $("probe").addEventListener("click", probe);
 $("endpoint").textContent = location.origin + "/v1";
 
+// ---- MCP servers. The hub is always on; the tab un-hides once GET
+// /mcp/status responds 200 on load. --webui-mcp-proxy gates only the
+// /cors-proxy passthrough route (llama.cpp server-cors-proxy parity).
+let mcpEnabled = false;   // /mcp/status reachable
+let mcpHasTools = false;  // ≥1 enabled tool => force non-stream agentic loop
+function mcpHasEnabledTools() { return mcpEnabled && mcpHasTools; }
+
+function mcpSetTransport(kind) {
+  $("mcp-stdio-fields").hidden = kind !== "stdio";
+  $("mcp-http-fields").hidden = kind !== "http";
+}
+
+function mcpFillForm(cfg) {
+  if (cfg && cfg.command !== undefined) {
+    $("mcp-transport").value = "stdio";
+    mcpSetTransport("stdio");
+    $("mcp-command").value = cfg.command || "";
+    $("mcp-args").value = (cfg.args || []).join(" ");
+    $("mcp-env").value = Object.entries(cfg.env || {}).map(([k, v]) => k + "=" + v).join("\n");
+    $("mcp-disabled").checked = !!cfg.disabled;
+  } else {
+    $("mcp-transport").value = "http";
+    mcpSetTransport("http");
+    $("mcp-url").value = (cfg && cfg.url) || "";
+    $("mcp-headers").value = Object.entries((cfg && cfg.headers) || {}).map(([k, v]) => k + ": " + v).join("\n");
+    $("mcp-disabled").checked = !!(cfg && cfg.disabled);
+  }
+}
+
+function mcpResetForm() {
+  $("mcp-edit-name").value = "";
+  $("mcp-name").value = "";
+  $("mcp-transport").value = "http";
+  mcpSetTransport("http");
+  $("mcp-command").value = "";
+  $("mcp-args").value = "";
+  $("mcp-env").value = "";
+  $("mcp-url").value = "";
+  $("mcp-headers").value = "";
+  $("mcp-disabled").checked = false;
+  $("mcp-form-title").textContent = "Add server";
+  $("mcp-cancel").hidden = true;
+}
+
+async function mcpRefresh() {
+  if (!mcpEnabled) return;
+  let data;
+  try {
+    const r = await fetch("/mcp/status");
+    if (!r.ok) return;
+    data = await r.json();
+  } catch { return; }
+  mcpHasTools = false;
+  const list = $("mcp-list");
+  list.innerHTML = "";
+  const servers = data.servers || [];
+  $("mcp-summary").textContent = servers.length + " server" + (servers.length === 1 ? "" : "s");
+  for (const s of servers) {
+    const total = (s.tools || []).length;
+    const enabledCount = (s.tools || []).filter((t) => t.enabled).length;
+    if (enabledCount > 0) mcpHasTools = true;
+    // display name comes from the server's initialize handshake when reported
+    const display = s.server_name || s.name;
+    const disabled = !!s.disabled;
+    // if the handshake name differs from the config key, show the key as a quiet alias,
+    // otherwise show the server-reported version (e.g. "v0.1.0")
+    const aliasOrVer = (s.server_name && s.server_name !== s.name)
+      ? `<span class="mc-ver">${escapeHtml(s.name)}</span>`
+      : (s.server_version ? `<span class="mc-ver">v${escapeHtml(s.server_version)}</span>` : "");
+    const logs = s.logs || [];
+    const card = document.createElement("div");
+    card.className = "mcp-card";
+    const toolsHtml = total
+      ? (s.tools).map((t) =>
+          `<label class="check-row"><input type="checkbox" data-tool="${escapeHtml(t.namespaced)}" ${t.enabled ? "checked" : ""}/><span>${escapeHtml(t.name)}<span class="hint"> — ${escapeHtml((t.description || "").slice(0, 90))}</span></span></label>`
+        ).join("")
+      : `<div class="hint">no tools advertised</div>`;
+    const logRows = logs.map((l) =>
+      `<div class="row ${l.ok ? "" : "bad"}"><span class="t">${escapeHtml(l.t)}</span><span class="m">${escapeHtml(l.msg)}</span></div>`
+    ).join("");
+    card.innerHTML =
+      `<div class="mc-head">` +
+        `<span class="mc-name" title="${escapeHtml(s.name)}">${escapeHtml(display)}</span>${aliasOrVer}` +
+        `<span class="mc-spacer"></span>` +
+        `<span class="reach ${s.connected ? "ok" : "bad"}" title="${s.connected ? "engine reachable" : "offline"}">${s.connected ? "reachable" : "offline"}</span>` +
+        `<button type="button" class="cpu-toggle ${disabled ? "" : "on"}" data-toggle="${escapeHtml(s.name)}" title="${disabled ? "Enable server" : "Disable server"}" aria-label="${disabled ? "Enable" : "Disable"} server">${disabled ? "off" : "on"}</button>` +
+      `</div>` +
+      `<div class="mc-badges">` +
+        `<span class="mc-badge">${escapeHtml(s.transport)}${disabled ? " · off" : ""}</span>` +
+        (total ? `<span class="mc-badge tools">${enabledCount}/${total} tool${total === 1 ? "" : "s"}</span>` : `<span class="mc-badge">no tools</span>`) +
+      `</div>` +
+      (s.error ? `<div class="hint" style="color:var(--danger)">${escapeHtml(s.error)}</div>` : "") +
+      `<details class="mc-fold"><summary>${total} tool${total === 1 ? "" : "s"} available <span class="hint">· show details</span></summary><div class="mcp-tools">${toolsHtml}</div></details>` +
+      `<details class="mc-fold"><summary>Connection log (${logs.length})${s.connect_ms != null ? ` <span class="hint">· connected in ${s.connect_ms}ms</span>` : ""}</summary><div class="mc-log">${logRows || `<div class="hint">no log entries</div>`}</div></details>` +
+      `<div class="mc-foot">` +
+        `<span class="mc-proto">${s.protocol_version ? "protocol " + escapeHtml(s.protocol_version) : ""}</span>` +
+        `<button type="button" class="mc-act" data-rec="${escapeHtml(s.name)}" title="Reconnect">↻</button>` +
+        `<button type="button" class="mc-act" data-edit="${escapeHtml(s.name)}" title="Edit">✎</button>` +
+        `<button type="button" class="mc-act danger" data-del="${escapeHtml(s.name)}" title="Remove">🗑</button>` +
+      `</div>`;
+    list.appendChild(card);
+  }
+  for (const cb of list.querySelectorAll("input[data-tool]")) {
+    cb.addEventListener("change", async () => {
+      await fetch("/mcp/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tool: cb.dataset.tool, disabled: !cb.checked }),
+      });
+      mcpRefresh();
+    });
+  }
+  // server on/off switch — re-upsert the cfg with `disabled` flipped
+  for (const sw of list.querySelectorAll("button[data-toggle]")) {
+    sw.addEventListener("click", async () => {
+      const s = await mcpGetServer(sw.dataset.toggle);
+      if (!s || !s.config) return;
+      const cfg = Object.assign({}, s.config, { disabled: !s.disabled });
+      await fetch("/mcp/server", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: s.name, config: cfg }) });
+      mcpRefresh();
+    });
+  }
+  // reconnect — re-upsert the unchanged cfg (upsert_server reconnects)
+  for (const b of list.querySelectorAll("button[data-rec]")) {
+    b.addEventListener("click", async () => {
+      const s = await mcpGetServer(b.dataset.rec);
+      if (!s || !s.config) return;
+      await fetch("/mcp/server", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: s.name, config: s.config }) });
+      mcpRefresh();
+    });
+  }
+  for (const b of list.querySelectorAll("button[data-edit]")) {
+    b.addEventListener("click", () => mcpBeginEdit(b.dataset.edit));
+  }
+  for (const b of list.querySelectorAll("button[data-del]")) {
+    b.addEventListener("click", async () => {
+      if (!confirm("Remove server " + b.dataset.del + "?")) return;
+      await fetch("/mcp/server/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: b.dataset.del }),
+      });
+      mcpRefresh();
+    });
+  }
+}
+
+async function mcpGetServer(name) {
+  try {
+    const r = await fetch("/mcp/status");
+    if (!r.ok) return null;
+    const data = await r.json();
+    return (data.servers || []).find((x) => x.name === name) || null;
+  } catch { return null; }
+}
+
+async function mcpBeginEdit(name) {
+  const s = await mcpGetServer(name);
+  if (s) mcpFillForm(s.config);
+  $("mcp-edit-name").value = name;
+  $("mcp-name").value = name;
+  $("mcp-form-title").textContent = "Edit " + name;
+  $("mcp-cancel").hidden = false;
+  document.querySelector("#mcp-side-section details").open = true;
+}
+
+function mcpKvLines(text, sep) {
+  return Object.fromEntries(
+    text.split("\n")
+      .map((l) => { const i = l.indexOf(sep); return i > 0 ? [l.slice(0, i).trim(), l.slice(i + 1).trim()] : null; })
+      .filter(Boolean)
+  );
+}
+
+async function mcpSave() {
+  const name = $("mcp-name").value.trim();
+  if (!name) { alert("name required"); return; }
+  const kind = $("mcp-transport").value;
+  let cfg;
+  if (kind === "stdio") {
+    const command = $("mcp-command").value.trim();
+    if (!command) { alert("command required"); return; }
+    cfg = {
+      command,
+      args: $("mcp-args").value.trim().split(/\s+/).filter(Boolean),
+      env: mcpKvLines($("mcp-env").value, "="),
+      disabled: $("mcp-disabled").checked,
+    };
+  } else {
+    const url = $("mcp-url").value.trim();
+    if (!url) { alert("url required"); return; }
+    cfg = {
+      url,
+      headers: mcpKvLines($("mcp-headers").value, ":"),
+      disabled: $("mcp-disabled").checked,
+    };
+  }
+  // rename = delete old name then add the new one
+  const editName = $("mcp-edit-name").value;
+  if (editName && editName !== name) {
+    await fetch("/mcp/server/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: editName }),
+    });
+  }
+  const r = await fetch("/mcp/server", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, config: cfg }),
+  });
+  if (!r.ok) { const t = await r.text().catch(() => ""); alert("save failed: " + t); return; }
+  mcpResetForm();
+  mcpRefresh();
+}
+
+async function mcpInit() {
+  try {
+    const r = await fetch("/mcp/status");
+    if (r.ok) {
+      mcpEnabled = true;
+      $("mcp-side-section").hidden = false;
+      mcpRefresh();
+    }
+  } catch {}
+}
+$("mcp-transport").addEventListener("change", (e) => mcpSetTransport(e.target.value));
+$("mcp-save").addEventListener("click", mcpSave);
+$("mcp-cancel").addEventListener("click", mcpResetForm);
+
 applyTheme(document.documentElement.dataset.theme || "light", false);
 let savedSidebar = "expanded";
 try { savedSidebar = localStorage.getItem("pulsar-sidebar") || "expanded"; } catch {}
 applySidebarCollapsed(savedSidebar === "collapsed", false);
 loadModel();
 probe(); // initial /stats: reachability + runtime + tiers
+mcpInit(); // un-hides the MCP tab once /mcp/status responds (hub always on)
 setChips("idle");
 autoGrow();
 
