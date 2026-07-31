@@ -163,6 +163,10 @@ fn run() -> engine::Result {
         None
     };
 
+    // Host values a browser may legitimately reach us on. Anything else is a
+    // DNS-rebinding attempt (see host_allowed).
+    let allowed_hosts = allowed_hosts(&host, port);
+
     let listener = std::net::TcpListener::bind((host.as_str(), port))?;
     eprintln!("pulsar-serve: listening on http://{host}:{port}  (web UI at /, API at /v1)");
     // Record this ctx as last-known-good: KV allocated and we are serving. A
@@ -236,6 +240,25 @@ fn run() -> engine::Result {
             let mut body = vec![0u8; content_length];
             reader.read_exact(&mut body)?;
 
+            // DNS-rebinding guard, checked on EVERY method. An attacker who
+            // points evil.example at 127.0.0.1 makes the browser treat us as
+            // same-origin: it sends Origin AND Host both reading
+            // "evil.example", so an Origin==Host test passes and the page can
+            // read our replies (/mcp/status returns server configs, /models/
+            // list returns paths). Only the Host allowlist catches this.
+            if !host_allowed(host_hdr.as_deref(), &allowed_hosts) {
+                eprintln!(
+                    "pulsar-serve: rejected unrecognized Host {} on {path} (allowed: {}) - \
+                     set PULSAR_ALLOWED_HOSTS to add it",
+                    host_hdr.as_deref().unwrap_or("-"),
+                    allowed_hosts.join(", ")
+                );
+                return respond_json(
+                    &mut stream,
+                    403,
+                    &serde_json::json!({"error": {"message": "unrecognized Host header"}}),
+                );
+            }
             // CSRF guard. Every POST here mutates server state, and
             // /mcp/server spawns an arbitrary process (stdio transport) -
             // so a drive-by page was one `fetch` away from code execution:
@@ -747,15 +770,67 @@ fn run() -> engine::Result {
     Ok(())
 }
 
+/// Host authorities a browser may legitimately reach this server on: the
+/// loopback names, plus the bind address when it is not a wildcard, plus
+/// anything in PULSAR_ALLOWED_HOSTS (comma-separated). The env var is the
+/// escape hatch for a reverse proxy or a `--host 0.0.0.0` bind reached by a
+/// name we cannot infer (a Tailscale hostname, say).
+#[cfg(target_os = "linux")]
+fn allowed_hosts(bind_host: &str, port: u16) -> Vec<String> {
+    let mut v = vec![
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ];
+    // A wildcard bind says nothing about the name the browser will use.
+    if !matches!(bind_host, "0.0.0.0" | "::" | "[::]" | "*") {
+        v.push(format!("{bind_host}:{port}"));
+    }
+    // Browsers omit the port from Host when it is the scheme default.
+    if port == 80 {
+        v.extend(["127.0.0.1".into(), "localhost".into(), "[::1]".into()]);
+        if !matches!(bind_host, "0.0.0.0" | "::" | "[::]" | "*") {
+            v.push(bind_host.to_string());
+        }
+    }
+    if let Ok(extra) = std::env::var("PULSAR_ALLOWED_HOSTS") {
+        v.extend(
+            extra
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty()),
+        );
+    }
+    // --host 127.0.0.1 (the default) repeats a loopback entry; keep the log
+    // line readable.
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// True when the request's `Host` is one we answer to. A missing Host is
+/// allowed (HTTP/1.0 clients omit it); browsers always send one, so a
+/// rebinding attack can never present as absent.
+#[cfg(target_os = "linux")]
+fn host_allowed(host: Option<&str>, allowed: &[String]) -> bool {
+    let Some(h) = host else { return true };
+    let h = h.to_ascii_lowercase();
+    allowed.iter().any(|a| *a == h)
+}
+
 /// True when a POST may proceed: either it carries no `Origin` (every
 /// non-browser client) or its Origin authority equals the `Host` we were
 /// reached on (our own web UI). `Origin: null` - sandboxed iframe, file://
 /// page - is never same-origin, so it falls through to false.
 ///
+/// This runs only after host_allowed has confirmed the Host is one of ours,
+/// which is what makes the equality test meaningful: without that, DNS
+/// rebinding satisfies Origin==Host with the attacker's own domain on both
+/// sides.
+///
 /// ponytail: authority string compare, no URL parser. A reverse proxy that
-/// rewrites Host without rewriting Origin would 403 the web UI; the rejection
-/// is logged with both values, and the fix is an allowed-origin env var if
-/// anyone actually fronts pulsar-serve that way.
+/// rewrites Host without rewriting Origin still 403s here; PULSAR_ALLOWED_HOSTS
+/// does not cover that case, and the fix would be a matching origin allowlist.
 #[cfg(target_os = "linux")]
 fn origin_ok(origin: Option<&str>, host: Option<&str>) -> bool {
     let Some(origin) = origin else { return true };
@@ -771,7 +846,31 @@ fn origin_ok(origin: Option<&str>, host: Option<&str>) -> bool {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::origin_ok;
+    use super::{allowed_hosts, host_allowed, origin_ok};
+
+    #[test]
+    fn rebinding_guard() {
+        let allowed = allowed_hosts("127.0.0.1", 11435);
+        // the ways we are actually reached
+        assert!(host_allowed(Some("127.0.0.1:11435"), &allowed));
+        assert!(host_allowed(Some("localhost:11435"), &allowed));
+        assert!(host_allowed(Some("LocalHost:11435"), &allowed)); // Host is case-insensitive
+        assert!(host_allowed(None, &allowed)); // HTTP/1.0 client
+        // DNS rebinding: attacker's domain resolved to 127.0.0.1. Origin and
+        // Host agree, so origin_ok alone would have let this through.
+        assert!(origin_ok(Some("http://evil.example:11435"), Some("evil.example:11435")));
+        assert!(!host_allowed(Some("evil.example:11435"), &allowed));
+        // right name, wrong port is a different origin
+        assert!(!host_allowed(Some("127.0.0.1:9999"), &allowed));
+        // a wildcard bind must not silently allowlist the wildcard itself
+        let wild = allowed_hosts("0.0.0.0", 11435);
+        assert!(!host_allowed(Some("0.0.0.0:11435"), &wild));
+        assert!(host_allowed(Some("127.0.0.1:11435"), &wild));
+        // an explicit non-loopback bind is reachable under its own name
+        let lan = allowed_hosts("192.168.1.50", 11435);
+        assert!(host_allowed(Some("192.168.1.50:11435"), &lan));
+        assert!(!host_allowed(Some("evil.example:11435"), &lan));
+    }
 
     #[test]
     fn csrf_guard() {
