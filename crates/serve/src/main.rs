@@ -215,6 +215,8 @@ fn run() -> engine::Result {
             let path = parts.next().unwrap_or("").to_owned();
 
             let mut content_length = 0usize;
+            let mut origin: Option<String> = None;
+            let mut host_hdr: Option<String> = None;
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line)?;
@@ -222,12 +224,40 @@ fn run() -> engine::Result {
                 if line.is_empty() {
                     break;
                 }
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                let lower = line.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
                     content_length = v.trim().parse().unwrap_or(0);
+                } else if let Some(v) = lower.strip_prefix("origin:") {
+                    origin = Some(v.trim().to_string());
+                } else if let Some(v) = lower.strip_prefix("host:") {
+                    host_hdr = Some(v.trim().to_string());
                 }
             }
             let mut body = vec![0u8; content_length];
             reader.read_exact(&mut body)?;
+
+            // CSRF guard. Every POST here mutates server state, and
+            // /mcp/server spawns an arbitrary process (stdio transport) -
+            // so a drive-by page was one `fetch` away from code execution:
+            // a text/plain POST is a CORS "simple request" (no preflight),
+            // so the browser sends it to 127.0.0.1 and the side effect
+            // lands even though the attacker never reads the response.
+            // Browsers always attach Origin to cross-site POSTs; non-browser
+            // clients (curl, the OpenAI SDKs, Claude Code) send none. So:
+            // no Origin -> allow, Origin matching Host -> allow (our own
+            // web UI), anything else -> 403.
+            if method == "POST" && !origin_ok(origin.as_deref(), host_hdr.as_deref()) {
+                eprintln!(
+                    "pulsar-serve: rejected cross-origin POST {path} (origin {}, host {})",
+                    origin.as_deref().unwrap_or("-"),
+                    host_hdr.as_deref().unwrap_or("-")
+                );
+                return respond_json(
+                    &mut stream,
+                    403,
+                    &serde_json::json!({"error": {"message": "cross-origin request rejected"}}),
+                );
+            }
 
             match (method.as_str(), path.as_str()) {
                 ("GET", "/") | ("GET", "/index.html") => {
@@ -715,6 +745,51 @@ fn run() -> engine::Result {
         }
     }
     Ok(())
+}
+
+/// True when a POST may proceed: either it carries no `Origin` (every
+/// non-browser client) or its Origin authority equals the `Host` we were
+/// reached on (our own web UI). `Origin: null` - sandboxed iframe, file://
+/// page - is never same-origin, so it falls through to false.
+///
+/// ponytail: authority string compare, no URL parser. A reverse proxy that
+/// rewrites Host without rewriting Origin would 403 the web UI; the rejection
+/// is logged with both values, and the fix is an allowed-origin env var if
+/// anyone actually fronts pulsar-serve that way.
+#[cfg(target_os = "linux")]
+fn origin_ok(origin: Option<&str>, host: Option<&str>) -> bool {
+    let Some(origin) = origin else { return true };
+    let authority = origin
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(origin);
+    match host {
+        Some(h) => !authority.is_empty() && authority == h,
+        None => false,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::origin_ok;
+
+    #[test]
+    fn csrf_guard() {
+        // non-browser clients send no Origin at all
+        assert!(origin_ok(None, Some("127.0.0.1:8080")));
+        // our own web UI, served from the same host:port
+        assert!(origin_ok(Some("http://127.0.0.1:8080"), Some("127.0.0.1:8080")));
+        assert!(origin_ok(Some("https://box.tail1234.ts.net"), Some("box.tail1234.ts.net")));
+        // a drive-by page: this is the one that used to reach /mcp/server
+        assert!(!origin_ok(Some("https://evil.example"), Some("127.0.0.1:8080")));
+        // same host, different port is still a different origin
+        assert!(!origin_ok(Some("http://127.0.0.1:9999"), Some("127.0.0.1:8080")));
+        // sandboxed iframe / file:// page
+        assert!(!origin_ok(Some("null"), Some("127.0.0.1:8080")));
+        // malformed / absent Host cannot be matched against
+        assert!(!origin_ok(Some("http://127.0.0.1:8080"), None));
+        assert!(!origin_ok(Some("http://"), Some("127.0.0.1:8080")));
+    }
 }
 
 #[cfg(target_os = "linux")]

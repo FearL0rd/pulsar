@@ -131,6 +131,7 @@ Non-stream branch of `handle_chat` only (`main.rs`, `MAX_TURNS = 8`). The stream
 ## Security / trust boundary
 
 - **stdio spawns arbitrary processes on the serve host.** The web UI's add-server form can enter any `command`/`args`. This is acceptable for a local single-user server behind an opt-in flag, and is the intended UX (you are configuring your own tools). Do **not** expose `pulsar-serve --webui-mcp-proxy` to untrusted networks without your own authz in front — the `/mcp/*` routes are unauthenticated localhost-only like the rest of the server.
+- **Cross-origin POSTs are rejected** (403) for every route, `/mcp/*` included. Because `/mcp/server` spawns a process, a page you merely *visit* would otherwise have been one `fetch` away from running code on this host: a `text/plain` POST is a CORS "simple request", so the browser sends it to `127.0.0.1` without a preflight and the side effect lands even though the attacker never reads the response. The guard allows requests with no `Origin` header (curl, the OpenAI SDKs, Claude Code) and requests whose `Origin` matches the `Host` they arrived on (the web UI itself). It is not a substitute for authz on an untrusted network.
 - **Per-call timeout** (default 30s) bounds a hung tool call; `allow`/`deny` per server bounds which tools the model may invoke.
 - `McpHub` is a single process-global hub. pulsar-serve is sequential single-user localhost (one request at a time), so there is no per-request isolation; the ceiling is per-session hubs if multi-tenant ever matters (marked `ponytail:` in `mcp.rs`).
 
