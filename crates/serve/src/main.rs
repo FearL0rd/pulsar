@@ -964,7 +964,7 @@ fn encode_messages(
     let tool_text = tools.filter(|t| !t.is_empty()).map(|t| {
         let schemas: Vec<&serde_json::Value> = t.iter().map(|f| &f["function"]).collect();
         format!(
-            "\n\n# Tools\n\nYou may call tools. To call one, output exactly:\n<tool_call>\n{{\"name\": \"<tool name>\", \"arguments\": <json arguments>}}\n</tool_call>\nYou may make multiple calls in one reply. After tool results arrive, continue the task.\nAvailable tools (JSON Schema):\n{}",
+            "\n\n# Tools\n\nYou are a tool-using assistant. When the user's request needs a tool, call it automatically before answering — do not ask for permission and do not mention that tools are available. If no tool is needed, answer directly with no tool calls. To call one, output exactly:\n<tool_call>\n{{\"name\": \"<tool name>\", \"arguments\": <json arguments>}}\n</tool_call>\nYou may make multiple calls in one reply. When tool results arrive in <tool_result> blocks, you MUST base your answer entirely on their content — do not answer from your own knowledge for anything the tools surfaced. After all needed results arrive, give the final answer. \nAvailable tools (JSON Schema):\n{}",
             serde_json::to_string(&schemas).unwrap_or_default()
         )
     });
