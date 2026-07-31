@@ -964,7 +964,7 @@ fn encode_messages(
     let tool_text = tools.filter(|t| !t.is_empty()).map(|t| {
         let schemas: Vec<&serde_json::Value> = t.iter().map(|f| &f["function"]).collect();
         format!(
-            "\n\n# Tools\n\nYou are a tool-using assistant. When the user's request needs a tool, call it automatically before answering — do not ask for permission and do not mention that tools are available. If no tool is needed, answer directly with no tool calls. To call one, output exactly:\n<tool_call>\n{{\"name\": \"<tool name>\", \"arguments\": <json arguments>}}\n</tool_call>\nYou may make multiple calls in one reply. When tool results arrive in <tool_result> blocks, you MUST base your answer entirely on their content — do not answer from your own knowledge for anything the tools surfaced. After all needed results arrive, give the final answer. \nAvailable tools (JSON Schema):\n{}",
+            "\n\n# Tools\n\nYou are a tool-using assistant. When the user's request needs a tool, call it automatically before answering — do not ask for permission and do not mention that tools are available. If no tool is needed, answer directly with no tool calls. To call one, output exactly:\n<tool_call>\n{{\"name\": \"<tool name>\", \"arguments\": <json arguments>}}\n</tool_call>\nYou may make multiple distinct calls in one reply, but do NOT repeat a call whose result is already in a <tool_result> block above — read that block and use it. When tool results arrive, you MUST base your answer entirely on their content — do not answer from your own knowledge for anything the tools surfaced. After all needed results arrive, stop calling tools and give the final answer immediately.\nAvailable tools (JSON Schema):\n{}",
             serde_json::to_string(&schemas).unwrap_or_default()
         )
     });
@@ -1520,6 +1520,7 @@ fn handle_chat(
         let mut n_out_total = 0usize;
         let mut prompt_len = prompt.len();
         let mut last_finish = "stop";
+        let mut prev_calls: Vec<(String, String)> = Vec::new();
         for turn in 0..MAX_TURNS {
             let tp = encode_messages(tok, markers, &msgs, tools.as_ref());
             if tp.len() as u32 + 2 >= st.ctx() {
@@ -1575,6 +1576,19 @@ fn handle_chat(
                 last_finish = "stop";
                 break;
             }
+            // ponytail: collapse infinite-loop where the model repeats an
+            // already-dispatched call verbatim instead of reading the
+            // <tool_result> above. Break with the last text as the answer;
+            // upgrade path: a tool-result-aware duplicate check (same name
+            // + args, ignoring prior failed results) instead of exact match.
+            if turn > 0 && calls.len() == prev_calls.len()
+                && calls.iter().zip(prev_calls.iter()).all(|(a, b)| a == b)
+            {
+                eprintln!(
+                    "pulsar-serve: {id}: tool loop stalled at turn {turn} (repeated call), forcing final answer");
+                last_finish = "stop";
+                break;
+            }
             let Some(m) = mcp else {
                 // calls but no hub: hand them to the client unchanged
                 last_finish = "tool_calls";
@@ -1605,6 +1619,7 @@ fn handle_chat(
                 }));
             }
             last_finish = "tool_calls";
+            prev_calls = calls.iter().cloned().collect();
         }
         let mut message = serde_json::json!({"role": "assistant", "content": clean});
         if !reasoning.is_empty() {
