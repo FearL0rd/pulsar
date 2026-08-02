@@ -163,12 +163,19 @@ fn run() -> engine::Result {
         None
     };
 
-    // Host values a browser may legitimately reach us on. Anything else is a
-    // DNS-rebinding attempt (see host_allowed).
+    // Host values a browser may legitimately reach us on, or None on a
+    // network bind where any name is fair game (see allowed_hosts).
     let allowed_hosts = allowed_hosts(&host, port);
 
     let listener = std::net::TcpListener::bind((host.as_str(), port))?;
     eprintln!("pulsar-serve: listening on http://{host}:{port}  (web UI at /, API at /v1)");
+    if allowed_hosts.is_none() {
+        eprintln!(
+            "pulsar-serve: reachable from other machines - Host allowlist off, and there is no \
+             auth here. Keep it to a trusted network, or set PULSAR_ALLOWED_HOSTS=name:{port} to \
+             pin the names it answers to."
+        );
+    }
     // Record this ctx as last-known-good: KV allocated and we are serving. A
     // resize that OOMs dies before reaching here, so PULSAR_CTX_STATE keeps the
     // previous value and the supervisor restarts at it (see launch script).
@@ -246,12 +253,13 @@ fn run() -> engine::Result {
             // "evil.example", so an Origin==Host test passes and the page can
             // read our replies (/mcp/status returns server configs, /models/
             // list returns paths). Only the Host allowlist catches this.
-            if !host_allowed(host_hdr.as_deref(), &allowed_hosts) {
+            if !host_allowed(host_hdr.as_deref(), allowed_hosts.as_ref()) {
                 eprintln!(
                     "pulsar-serve: rejected unrecognized Host {} on {path} (allowed: {}) - \
-                     set PULSAR_ALLOWED_HOSTS to add it",
+                     to reach this server from another machine start it with --host 0.0.0.0, \
+                     or add the name via PULSAR_ALLOWED_HOSTS",
                     host_hdr.as_deref().unwrap_or("-"),
-                    allowed_hosts.join(", ")
+                    allowed_hosts.as_ref().map(|v| v.join(", ")).unwrap_or_default()
                 );
                 return respond_json(
                     &mut stream,
@@ -770,30 +778,48 @@ fn run() -> engine::Result {
     Ok(())
 }
 
-/// Host authorities a browser may legitimately reach this server on: the
-/// loopback names, plus the bind address when it is not a wildcard, plus
-/// anything in PULSAR_ALLOWED_HOSTS (comma-separated). The env var is the
-/// escape hatch for a reverse proxy or a `--host 0.0.0.0` bind reached by a
-/// name we cannot infer (a Tailscale hostname, say).
+/// True when the bind address keeps the server off the network entirely.
+/// Only then is a Host allowlist both safe to impose and worth imposing.
 #[cfg(target_os = "linux")]
-fn allowed_hosts(bind_host: &str, port: u16) -> Vec<String> {
+fn is_loopback_bind(bind_host: &str) -> bool {
+    matches!(bind_host, "localhost" | "::1" | "[::1]") || bind_host.starts_with("127.")
+}
+
+/// Host authorities a browser may legitimately reach this server on, or
+/// `None` for "accept any".
+///
+/// The allowlist exists to stop DNS rebinding, and rebinding only buys an
+/// attacker something when the service is otherwise unreachable - i.e. bound
+/// to loopback. A `--host 0.0.0.0` (or LAN IP) bind is an explicit request to
+/// be reachable from other machines under names we cannot enumerate, and
+/// anyone who can rebind can already connect directly, so the list would cost
+/// real usability and buy nothing. Setting PULSAR_ALLOWED_HOSTS forces the
+/// strict path back on regardless of bind, for a public bind that still wants
+/// a fixed set of names.
+#[cfg(target_os = "linux")]
+fn allowed_hosts(bind_host: &str, port: u16) -> Option<Vec<String>> {
+    let explicit = std::env::var("PULSAR_ALLOWED_HOSTS")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    if explicit.is_none() && !is_loopback_bind(bind_host) {
+        return None;
+    }
     let mut v = vec![
         format!("127.0.0.1:{port}"),
         format!("localhost:{port}"),
         format!("[::1]:{port}"),
+        format!("{bind_host}:{port}"),
     ];
-    // A wildcard bind says nothing about the name the browser will use.
-    if !matches!(bind_host, "0.0.0.0" | "::" | "[::]" | "*") {
-        v.push(format!("{bind_host}:{port}"));
-    }
     // Browsers omit the port from Host when it is the scheme default.
     if port == 80 {
-        v.extend(["127.0.0.1".into(), "localhost".into(), "[::1]".into()]);
-        if !matches!(bind_host, "0.0.0.0" | "::" | "[::]" | "*") {
-            v.push(bind_host.to_string());
-        }
+        v.extend([
+            "127.0.0.1".into(),
+            "localhost".into(),
+            "[::1]".into(),
+            bind_host.to_string(),
+        ]);
     }
-    if let Ok(extra) = std::env::var("PULSAR_ALLOWED_HOSTS") {
+    if let Some(extra) = explicit {
         v.extend(
             extra
                 .split(',')
@@ -805,14 +831,15 @@ fn allowed_hosts(bind_host: &str, port: u16) -> Vec<String> {
     // line readable.
     v.sort();
     v.dedup();
-    v
+    Some(v)
 }
 
 /// True when the request's `Host` is one we answer to. A missing Host is
 /// allowed (HTTP/1.0 clients omit it); browsers always send one, so a
 /// rebinding attack can never present as absent.
 #[cfg(target_os = "linux")]
-fn host_allowed(host: Option<&str>, allowed: &[String]) -> bool {
+fn host_allowed(host: Option<&str>, allowed: Option<&Vec<String>>) -> bool {
+    let Some(allowed) = allowed else { return true };
     let Some(h) = host else { return true };
     let h = h.to_ascii_lowercase();
     allowed.iter().any(|a| *a == h)
@@ -850,26 +877,40 @@ mod tests {
 
     #[test]
     fn rebinding_guard() {
+        // Default loopback bind: the allowlist is on, because that is the
+        // case where rebinding reaches something the attacker otherwise
+        // could not.
         let allowed = allowed_hosts("127.0.0.1", 11435);
+        assert!(allowed.is_some());
+        let a = allowed.as_ref();
         // the ways we are actually reached
-        assert!(host_allowed(Some("127.0.0.1:11435"), &allowed));
-        assert!(host_allowed(Some("localhost:11435"), &allowed));
-        assert!(host_allowed(Some("LocalHost:11435"), &allowed)); // Host is case-insensitive
-        assert!(host_allowed(None, &allowed)); // HTTP/1.0 client
+        assert!(host_allowed(Some("127.0.0.1:11435"), a));
+        assert!(host_allowed(Some("localhost:11435"), a));
+        assert!(host_allowed(Some("LocalHost:11435"), a)); // Host is case-insensitive
+        assert!(host_allowed(None, a)); // HTTP/1.0 client
         // DNS rebinding: attacker's domain resolved to 127.0.0.1. Origin and
         // Host agree, so origin_ok alone would have let this through.
         assert!(origin_ok(Some("http://evil.example:11435"), Some("evil.example:11435")));
-        assert!(!host_allowed(Some("evil.example:11435"), &allowed));
+        assert!(!host_allowed(Some("evil.example:11435"), a));
         // right name, wrong port is a different origin
-        assert!(!host_allowed(Some("127.0.0.1:9999"), &allowed));
-        // a wildcard bind must not silently allowlist the wildcard itself
+        assert!(!host_allowed(Some("127.0.0.1:9999"), a));
+    }
+
+    #[test]
+    fn network_bind_accepts_any_host() {
+        // --host 0.0.0.0 is an explicit request to be reachable under names
+        // we cannot enumerate (LAN IP, mDNS name, Tailscale name). Rebinding
+        // buys an attacker nothing there - they can already connect - so the
+        // allowlist would only break the feature. See issue #20.
         let wild = allowed_hosts("0.0.0.0", 11435);
-        assert!(!host_allowed(Some("0.0.0.0:11435"), &wild));
-        assert!(host_allowed(Some("127.0.0.1:11435"), &wild));
-        // an explicit non-loopback bind is reachable under its own name
-        let lan = allowed_hosts("192.168.1.50", 11435);
-        assert!(host_allowed(Some("192.168.1.50:11435"), &lan));
-        assert!(!host_allowed(Some("evil.example:11435"), &lan));
+        assert!(wild.is_none());
+        assert!(host_allowed(Some("192.168.1.50:11435"), wild.as_ref()));
+        assert!(host_allowed(Some("desktop.local:11435"), wild.as_ref()));
+        // A specific LAN bind is equally a network bind.
+        assert!(allowed_hosts("192.168.1.50", 11435).is_none());
+        // ...but loopback in any spelling stays strict.
+        assert!(allowed_hosts("localhost", 11435).is_some());
+        assert!(allowed_hosts("127.0.0.53", 11435).is_some());
     }
 
     #[test]
