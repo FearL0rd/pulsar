@@ -1521,8 +1521,17 @@ fn handle_chat(
             "id": id, "object": "chat.completion.chunk", "model": model_name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
             // prompt token count up front so the UI can show live context use
-            // and prefill tok/s the moment the first decoded token lands
-            "usage": {"prompt_tokens": prompt.len()},
+            // and prefill tok/s the moment the first decoded token lands.
+            // completion/total are required members of the usage object -
+            // clients that deserialize into a struct with non-optional fields
+            // (grok-cli, the strict Go/Rust SDKs) hard-error on a partial one
+            // rather than ignoring it, so send all three and let the zeros
+            // stand for "nothing generated yet".
+            "usage": {
+                "prompt_tokens": prompt.len(),
+                "completion_tokens": 0,
+                "total_tokens": prompt.len(),
+            },
         });
         write!(stream, "data: {first}\n\n")?;
         stream.flush()?;
