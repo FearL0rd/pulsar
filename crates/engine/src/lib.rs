@@ -4217,8 +4217,9 @@ mod real {
         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
         /// 5=q4_0. All lossy formats opt-in via PULSAR_KV=<fmt>; the
-        /// default f32 path keeps bit-exact guarantees. Dsv4 keeps its
-        /// own cache as-is.
+        /// default f32 path keeps bit-exact guarantees. Dsv4's fused
+        /// latent rows (raw ring + compressed) ride the same kvq field as
+        /// a single flat head.
         kvq: u32,
         /// MLA latent KV storage format. 0=f32, 1=fp8 e4m3 + per-row
         /// scale, 2=fp16. Applies to both the latent rows and the rope
@@ -4924,21 +4925,22 @@ mod real {
             let kv_ok = match s.family {
                 // GQA keeps a plain [layer][kv_head][pos] cache the quant
                 // kernels understand; qwen35's full-attention layers use the
-                // same one, minus the dense split path
-                Family::Gqa | Family::Qwen35 => !kv_dense,
-                // MLA/Dsv4 carry their own compact latent caches; K3's
-                // MLA quarter does too, and its KDA layers keep no KV at
-                // all
-                Family::Mla | Family::Dsv4 | Family::K3 => false,
+                // same one, minus the dense split path. Dsv4's fused latent
+                // row is a flat 512-wide vector divisible by 32, so every
+                // codec (fp8/fp16/int8/q8_0/q4_0/turbo) applies to it as one
+                // "head"; it rides the same kvq field as GQA.
+                Family::Gqa | Family::Qwen35 | Family::Dsv4 => !kv_dense,
+                // MLA carries its own compact latent cache (kvq_lat below);
+                // K3's MLA quarter does too, and its KDA layers keep no KV
+                // at all
+                Family::Mla | Family::K3 => false,
             };
             // The MLA latent cache has its own quantized formats (fp8/fp16,
-            // kvq_lat below) through mla_store_compact_kv/mla_attention;
-            // Dsv4 keeps its reference fp8-sim path and stays f32 here.
+            // kvq_lat below) through mla_store_compact_kv/mla_attention.
             let kv_lat_ok = s.family == Family::Mla;
             // f32 KV projection across exec layers (+ MTP slot), mirroring
             // the per-layer sizing loop below. Only consulted for kv_ok /
-            // kv_lat_ok families, so the qwen35-dense and Dsv4 shapes never
-            // reach it.
+            // kv_lat_ok families, so the qwen35-dense shape never reaches it.
             let kv_f32_total = || -> usize {
                 let slots = s.n_exec_layer as usize + usize::from(m.mtp.is_some());
                 (0..slots)
@@ -4953,6 +4955,12 @@ mod real {
                             } else {
                                 8
                             }
+                        } else if s.family == Family::Dsv4 {
+                            // raw SWA ring + compressed rows (vcache) are
+                            // both flat head_dim-wide latent rows in f32
+                            let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
+                            let comp = if ratio > 0 { ctx as usize / ratio + 2 } else { 0 };
+                            (s.n_swa as usize + comp) * s.head_dim as usize * 4
                         } else {
                             let (hkv, hd) = match m.geom.get(i) {
                                 Some(g) => (g.n_head_kv as usize, g.head_dim as usize),
@@ -5013,7 +5021,9 @@ mod real {
                 // rotation would read across head boundaries. qk_nope/qk_rope
                 // are MLA-only and stay 0 for Gqa/Qwen35, so this holds today;
                 // the guard keeps it from breaking silently if that changes.
-                if rot && s.qk_dim() > s.head_dim {
+                // Dsv4's q reads as [n_head][head_dim] (no qrot/qk_low split),
+                // so it deliberately skips this guard and keeps rotation.
+                if rot && s.qk_dim() > s.head_dim && matches!(s.family, Family::Gqa | Family::Qwen35) {
                     eprintln!(
                         "pulsar: PULSAR_KV={} rotation disabled - qk_dim {} exceeds head_dim {} (split-rope q stride); falling back to plain block-KV",
                         kv_req.as_deref().unwrap_or(""),
@@ -5079,8 +5089,12 @@ mod real {
                     ctx as usize * lat_row(s.qk_rope as usize),
                 ),
                 // raw SWA ring in kcache; the compressed-row cache rides
-                // vcache, sized per layer in the loop below
-                Family::Dsv4 => (s.n_swa as usize * s.head_dim as usize * 4, 4),
+                // vcache, sized per layer in the loop below. Both are flat
+                // latent rows, quantized per kvq like a single GQA head.
+                Family::Dsv4 => (
+                    s.n_swa as usize * kv_row(s.head_dim as usize),
+                    4,
+                ),
                 Family::Qwen35 => {
                     let b = s.n_head_kv as usize * ctx as usize * kv_row(s.head_dim as usize);
                     (b, b)
@@ -5095,7 +5109,32 @@ mod real {
                 ),
             };
             if kvq != 0 {
-                let full = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
+                // f32 baseline footprint: GQA/Qwen35 keep one row per head
+                // per position; Dsv4 keeps one flat latent row per position
+                // (n_swa raw ring + ctx/ratio compressed rows, per layer)
+                let (full, packed) = if s.family == Family::Dsv4 {
+                    (
+                        (0..s.n_exec_layer as usize + usize::from(m.mtp.is_some()))
+                            .map(|i| {
+                                let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
+                                let comp = if ratio > 0 { ctx as usize / ratio + 2 } else { 0 };
+                                (s.n_swa as usize + comp) * s.head_dim as usize * 4
+                            })
+                            .sum(),
+                        (0..s.n_exec_layer as usize + usize::from(m.mtp.is_some()))
+                            .map(|i| {
+                                let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
+                                let comp = if ratio > 0 { ctx as usize / ratio + 2 } else { 0 };
+                                (s.n_swa as usize + comp) * kv_row(s.head_dim as usize)
+                            })
+                            .sum(),
+                    )
+                } else {
+                    (
+                        s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4,
+                        (k_bytes + v_bytes) * s.n_exec_layer as usize,
+                    )
+                };
                 let name = match kvq {
                     1 => "fp8",
                     2 => "fp16",
@@ -5103,10 +5142,18 @@ mod real {
                     4 => if kvq_rot { "turbo8" } else { "q8_0" },
                     _ => if kvq_rot { "turbo4" } else { "q4_0" },
                 };
+                // Dsv4's full is already ring+comp across all layers (its
+                // kcache=raw ring, vcache=compressed rows are distinct data,
+                // not K/V copies); GQA/Qwen35 double for the K and V copies.
+                let full_gib = if s.family == Family::Dsv4 {
+                    full as f64 / GIB
+                } else {
+                    (full * 2 * s.n_exec_layer as usize) as f64 / GIB
+                };
                 eprintln!(
                     "pulsar: {name} KV cache on ({:.2} GiB -> {:.2} GiB over {} layers)",
-                    (full * 2 * s.n_exec_layer as usize) as f64 / GIB,
-                    ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / GIB,
+                    full_gib,
+                    packed as f64 / GIB,
                     s.n_exec_layer,
                 );
                 // q8_0/q4_0 kernels require 32-wide blocks; a non-multiple head_dim
@@ -5221,7 +5268,7 @@ mod real {
                 } else if s.family == Family::Dsv4 {
                     let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
                     let comp = if ratio > 0 {
-                        (ctx as usize / ratio + 2) * s.head_dim as usize * 4
+                        (ctx as usize / ratio + 2) * kv_row(s.head_dim as usize)
                     } else {
                         4
                     };

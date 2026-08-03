@@ -79,8 +79,11 @@ already (gqa fp8 KV); hadamard128 + e2m1 are new small device fns.
    init; hc_mix kernel (gates + sinkhorn + mix, one small kernel);
    output_hc merge
 3. V4 attention path (read reference first): MLA-descendant + sinks +
-   compressor branch; fp8 KV cache REQUIRED (not optional) for parity? -
-   check whether reference always quantizes (looks like yes)
+   compressor branch; reference ALWAYS fp8-quantizes the KV cache
+   (dsv4_fp8_kv_quantize_row_inplace_cpu); pulsar sims that numerically
+   via dsv4_fp8_sim and now OPTIONALLY stores real fp8/fp16/int8/
+   q8_0/q4_0/turbo8/turbo4 rows via PULSAR_KV (kvq field, see
+   docs/ for the 7-format table)
 4. Router: hash layers (token-id plumb) + gating_func 4 topk
 5. Indexer: reuse tensor-core scorer + add hadamard128/e2m1 QAT pre-pass
 6. act_op 3 clamped-silu in pulsar_glu

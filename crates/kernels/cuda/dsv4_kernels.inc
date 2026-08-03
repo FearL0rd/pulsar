@@ -71,17 +71,21 @@ extern "C" int pulsar_dsv4_hc_mix(
  * max and denominator with no value contribution. Raw rows live in a
  * ring (any order - softmax is permutation-invariant); comp rows are
  * append-ordered with an optional visibility mask. */
+template <uint32_t KVQ, uint32_t TURBO>
 __global__ static void dsv4_attention_kernel(
         float *out,          /* [n_head][head_dim] */
-        const float *q,      /* [n_head][head_dim] */
-        const float *raw,    /* [raw_cap][head_dim] ring */
+        const float *q,      /* [n_head][head_dim] (Pi*Q when TURBO) */
+        const void *raw,     /* [raw_cap][kv_row_stride(KVQ)] ring */
         uint32_t n_raw,
-        const float *comp,   /* [>= n_comp][head_dim]; NULL if n_comp 0 */
+        const void *comp,    /* [>= n_comp][kv_row_stride(KVQ)]; NULL if 0 */
         uint32_t n_comp,
         const uint8_t *allowed, /* [n_comp] 1 = visible; NULL = all */
         const float *sinks,  /* [n_head] */
         uint32_t head_dim,   /* <= 512 */
-        float scale) {
+        float scale,
+        const float *pi) {   /* [head_dim][head_dim]; NULL unless TURBO */
+    const Kvf KVF = (Kvf)KVQ;
+    const uint64_t stride = kv_row_stride(KVF, head_dim);
     uint32_t h = blockIdx.x;
     const float *qh = q + (uint64_t)h * head_dim;
     const uint32_t tid = threadIdx.x;
@@ -99,18 +103,18 @@ __global__ static void dsv4_attention_kernel(
     for (uint32_t base = 0; base < n_total; base += 128u) {
         uint32_t chunk = n_total - base < 128u ? n_total - base : 128u;
         float s = -INFINITY;
-        const float *srow = NULL;
+        const void *srow = NULL;
         if (tid < chunk) {
             uint32_t r = base + tid;
             if (r < n_raw) {
-                srow = raw + (uint64_t)r * head_dim;
+                srow = (const char *)raw + (uint64_t)r * stride;
             } else if (!allowed || allowed[r - n_raw]) {
-                srow = comp + (uint64_t)(r - n_raw) * head_dim;
+                srow = (const char *)comp + (uint64_t)(r - n_raw) * stride;
             }
             if (srow) {
-                float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * srow[d];
-                s = dot * scale;
+                float rs;
+                float dot = gqa_kdot<KVF>(srow, sq, head_dim, &rs);
+                s = dot * rs * scale;
             }
         }
         red[tid] = s;
@@ -130,19 +134,36 @@ __global__ static void dsv4_attention_kernel(
             float w = s_w[r];
             if (w == 0.0f) continue;
             uint32_t row = base + r;
-            const float *vrow = row < n_raw
-                ? raw + (uint64_t)row * head_dim
-                : comp + (uint64_t)(row - n_raw) * head_dim;
+            /* K == V: the same stored row (already Pi*row when TURBO) feeds
+             * the value accumulate. Pi is linear, so acc = Pi*(sum w*row);
+             * the Pi^T restore below undoes it once on the output. */
+            const void *vrow = row < n_raw
+                ? (const char *)raw + (uint64_t)row * stride
+                : (const char *)comp + (uint64_t)(row - n_raw) * stride;
             den += w;
+            float wv = w * gqa_vrow_scale<KVF>(vrow, head_dim);
             for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
-                acc[k] += w * vrow[d];
+                acc[k] += wv * gqa_vacc_lane<KVF>(vrow, d, head_dim);
             }
         }
         m = m_new;
         __syncthreads();
     }
-    for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
-        out[(uint64_t)h * head_dim + d] = acc[k] / den;
+    if (!TURBO) {
+        for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
+            out[(uint64_t)h * head_dim + d] = acc[k] / den;
+        }
+    } else {
+        /* restore V: out = Pi^T . (acc/den). Pi orthonormal, Pi^T = Pi^-1. */
+        __shared__ float s_acc[512];
+        for (uint32_t d = tid; d < head_dim; d += 128u) s_acc[d] = acc[d >> 7] / den;
+        __syncthreads();
+        for (uint32_t d = tid; d < head_dim; d += 128u) {
+            float v = 0.0f;
+            for (uint32_t j = 0; j < head_dim; j++)
+                v += pi[(uint64_t)j * head_dim + d] * s_acc[j];
+            out[(uint64_t)h * head_dim + d] = v;
+        }
     }
 }
 
@@ -157,16 +178,40 @@ extern "C" int pulsar_dsv4_attention(
         const void *sinks_dev,
         uint32_t n_head,
         uint32_t head_dim,
-        float scale) {
+        float scale,
+        uint32_t kvq,
+        uint32_t turbo,
+        const void *pi_dev) {
     if (!out_dev || !q_dev || !raw_dev || !sinks_dev || n_head == 0 ||
-        head_dim == 0 || head_dim > 512u || (n_comp > 0 && !comp_dev)) {
+        head_dim == 0 || head_dim > 512u || (n_comp > 0 && !comp_dev) ||
+        kvq > 5u || turbo > 1u || (turbo && !pi_dev) ||
+        (kvq >= 4u && head_dim % 32u != 0) || (turbo && kvq != 4u && kvq != 5u)) {
         return 0;
     }
-    dsv4_attention_kernel<<<n_head, 128>>>(
-            (float *)out_dev, (const float *)q_dev, (const float *)raw_dev,
-            n_raw, (const float *)comp_dev, n_comp,
-            (const uint8_t *)allowed_dev, (const float *)sinks_dev,
-            head_dim, scale);
+    #define DSV4_ATTN_LAUNCH(K, T)                                            \
+        dsv4_attention_kernel<K, T><<<n_head, 128>>>(                          \
+                (float *)out_dev, (const float *)q_dev, raw_dev, n_raw,        \
+                comp_dev, n_comp, (const uint8_t *)allowed_dev,                \
+                (const float *)sinks_dev, head_dim, scale,                     \
+                (const float *)pi_dev)
+    if (!turbo) {
+        switch (kvq) {
+            case 0u: DSV4_ATTN_LAUNCH(0u, 0u); break;
+            case 1u: DSV4_ATTN_LAUNCH(1u, 0u); break;
+            case 2u: DSV4_ATTN_LAUNCH(2u, 0u); break;
+            case 3u: DSV4_ATTN_LAUNCH(3u, 0u); break;
+            case 4u: DSV4_ATTN_LAUNCH(4u, 0u); break;
+            case 5u: DSV4_ATTN_LAUNCH(5u, 0u); break;
+            default: return 0;
+        }
+    } else {
+        switch (kvq) {
+            case 4u: DSV4_ATTN_LAUNCH(4u, 1u); break;
+            case 5u: DSV4_ATTN_LAUNCH(5u, 1u); break;
+            default: return 0;
+        }
+    }
+    #undef DSV4_ATTN_LAUNCH
     return cuda_ok(cudaGetLastError(), "dsv4 attention launch");
 }
 
@@ -398,14 +443,24 @@ __device__ static void dsv4_qat_row_dev(float *x) {
  * with two device syncs per lane): write the state row (+additive PE),
  * and on a ratio boundary pool -> rms*norm -> rope at the compressed
  * position -> fp8 sim (512-wide attn lane) or hadamard+e2m1 QAT
- * (128-wide indexer lane) -> f16 round -> emit into the cache row,
- * then the ratio-4 double-shift. ONE thread block; the serial tail
- * (rope/QAT) runs on thread 0 - the arrays are <= 1024 wide and this
- * replaces host math plus a sync, not a fast kernel. */
+ * (128-wide indexer lane) -> codec store (quant for kvq != 0) -> emit
+ * into the cache row, then the ratio-4 double-shift. ONE thread block;
+ * the serial tail (rope/QAT/quant) runs on thread 0 - the arrays are
+ * <= 1024 wide and this replaces host math plus a sync, not a fast
+ * kernel. The fp8 sim stays unconditional (reference always quantizes;
+ * it is the numerical baseline), and the indexer lane (is_idx, kvq=0)
+ * keeps its f16-round f32 row. */
+/* forward decl: dsv4_quant_row_serial lives after this kernel (used by the
+ * comp emit tail and the store kernel's lossy arm) */
+template <uint32_t KVQ>
+__device__ static void dsv4_quant_row_serial(
+        void *dst, const float *src, uint32_t head_dim, uint32_t turbo,
+        const float *pi);
+template <uint32_t KVQ, uint32_t TURBO>
 __global__ static void dsv4_comp_step_kernel(
         float *state_kv,     /* [rows][width] */
         float *state_sc,
-        float *cache_row,    /* emit target: one [head_dim] row (or NULL) */
+        void *cache_row,     /* emit target: one [kv_row_stride(KVQ)] row (or NULL) */
         const float *kv_cur, /* [width] */
         const float *sc_cur,
         const float *ape,    /* [ratio-mod slots][width] */
@@ -423,7 +478,8 @@ __global__ static void dsv4_comp_step_kernel(
         float freq_base,
         float freq_scale,
         float ext_factor,
-        float attn_factor) {
+        float attn_factor,
+        const float *pi) {
     const uint32_t tid = threadIdx.x;
     const uint32_t pos_mod = pos % ratio;
     const uint32_t row = ratio == 4u ? ratio + pos_mod : pos_mod;
@@ -512,6 +568,9 @@ __global__ static void dsv4_comp_step_kernel(
         }
         if (is_idx) {
             dsv4_qat_row_dev(pooled);
+            /* indexer QAT cache stays f32 (its own hadamard+e2m1 lane) */
+            for (uint32_t j = 0; j < head_dim; j++)
+                ((float *)cache_row)[j] = __half2float(__float2half(pooled[j]));
         } else {
             for (uint32_t off = 0; off < n_nope; off += 64u) {
                 float amax = 0.0f;
@@ -523,9 +582,13 @@ __global__ static void dsv4_comp_step_kernel(
                     pooled[off + i] = e4m3_dec_common(e4m3_enc(v)) * scale;
                 }
             }
-        }
-        for (uint32_t j = 0; j < head_dim; j++) {
-            cache_row[j] = __half2float(__float2half(pooled[j]));
+            if (KVQ == 0u) {
+                /* parity: comp rows f16-round on push in the reference */
+                for (uint32_t j = 0; j < head_dim; j++)
+                    ((float *)cache_row)[j] = __half2float(__float2half(pooled[j]));
+            } else {
+                dsv4_quant_row_serial<KVQ>(cache_row, pooled, head_dim, TURBO, pi);
+            }
         }
     }
     __syncthreads();
@@ -550,18 +613,41 @@ extern "C" int pulsar_dsv4_comp_step(
         const void *norm_dev, uint32_t width, uint32_t head_dim,
         uint32_t ratio, uint32_t pos, uint32_t emit, uint32_t is_idx,
         float rms_eps, uint32_t n_rot, uint32_t n_ctx_orig, float freq_base,
-        float freq_scale, float ext_factor, float attn_factor) {
+        float freq_scale, float ext_factor, float attn_factor,
+        uint32_t kvq, uint32_t turbo, const void *pi_dev) {
     if (!state_kv_dev || !state_sc_dev || !kv_cur_dev || !sc_cur_dev ||
         !ape_dev || !norm_dev || width == 0 || head_dim == 0 ||
-        head_dim > 512u || ratio == 0 || (emit && !cache_row_dev)) {
+        head_dim > 512u || ratio == 0 || (emit && !cache_row_dev) ||
+        kvq > 5u || turbo > 1u || (turbo && !pi_dev) ||
+        (kvq >= 4u && head_dim % 32u != 0) || (turbo && kvq != 4u && kvq != 5u)) {
         return 0;
     }
-    dsv4_comp_step_kernel<<<1, 256>>>(
-            (float *)state_kv_dev, (float *)state_sc_dev, (float *)cache_row_dev,
-            (const float *)kv_cur_dev, (const float *)sc_cur_dev,
-            (const float *)ape_dev, (const float *)norm_dev,
-            width, head_dim, ratio, pos, emit, is_idx, rms_eps,
-            n_rot, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor);
+    #define DSV4_COMP_LAUNCH(K, T)                                             \
+        dsv4_comp_step_kernel<K, T><<<1, 256>>>(                                \
+                (float *)state_kv_dev, (float *)state_sc_dev,                  \
+                cache_row_dev, (const float *)kv_cur_dev,                       \
+                (const float *)sc_cur_dev, (const float *)ape_dev,              \
+                (const float *)norm_dev, width, head_dim, ratio, pos, emit,     \
+                is_idx, rms_eps, n_rot, n_ctx_orig, freq_base, freq_scale,      \
+                ext_factor, attn_factor, (const float *)pi_dev)
+    if (!turbo) {
+        switch (kvq) {
+            case 0u: DSV4_COMP_LAUNCH(0u, 0u); break;
+            case 1u: DSV4_COMP_LAUNCH(1u, 0u); break;
+            case 2u: DSV4_COMP_LAUNCH(2u, 0u); break;
+            case 3u: DSV4_COMP_LAUNCH(3u, 0u); break;
+            case 4u: DSV4_COMP_LAUNCH(4u, 0u); break;
+            case 5u: DSV4_COMP_LAUNCH(5u, 0u); break;
+            default: return 0;
+        }
+    } else {
+        switch (kvq) {
+            case 4u: DSV4_COMP_LAUNCH(4u, 1u); break;
+            case 5u: DSV4_COMP_LAUNCH(5u, 1u); break;
+            default: return 0;
+        }
+    }
+    #undef DSV4_COMP_LAUNCH
     return cuda_ok(cudaGetLastError(), "dsv4 comp step launch");
 }
 
@@ -576,6 +662,146 @@ extern "C" int pulsar_dsv4_f16_round(void *x_dev, uint32_t n) {
     if (!x_dev || n == 0) return 0;
     dsv4_f16_round_kernel<<<(n + 255u) / 256u, 256>>>((float *)x_dev, n);
     return cuda_ok(cudaGetLastError(), "dsv4 f16 round launch");
+}
+
+/* ---- quantized KV store for the fused latent row (K == V) ---------------
+ * The Dsv4 cache rows are one flat 512-wide latent per position, so every
+ * pulsar codec applies directly (same layouts as gqa_kernels.inc):
+ * KVQ 0=f32, 1=fp8 (e4m3 + f32 tail scale), 2=fp16, 3=int8 (f32 tail
+ * scale), 4=q8_0, 5=q4_0 (per-32-block f16 d, stride via kv_row_stride).
+ * TURBO pre-rotates the row by Pi (row -> Pi*row) before quant so block
+ * quant sees spread-out outliers; the templated attention kernel undoes it
+ * with Pi^T once on the normalized output (Pi orthonormal: Pi^T = Pi^-1). */
+
+/* Serial quantizer for one f32 row -> `dst` byte buffer of at least
+ * kv_row_stride(Kvf,KVQ,head_dim) bytes. One thread only (the comp_step
+ * emit tail and the store kernel's lossy arm). */
+template <uint32_t KVQ>
+__device__ static void dsv4_quant_row_serial(
+        void *dst, const float *src, uint32_t head_dim, uint32_t turbo,
+        const float *pi) {
+    float rot[512];
+    const float *base = src;
+    if (turbo && KVQ != 0u && KVQ != 2u) {
+        for (uint32_t j = 0; j < head_dim; j++) {
+            float acc = 0.0f;
+            for (uint32_t i = 0; i < head_dim; i++)
+                acc += pi[(uint64_t)head_dim * j + i] * src[i];
+            rot[j] = acc;
+        }
+        base = rot;
+    }
+    if (KVQ == 0u) {
+        float *out = (float *)dst;
+        for (uint32_t j = 0; j < head_dim; j++) out[j] = base[j];
+    } else if (KVQ == 2u) {
+        __half *out = (__half *)dst;
+        for (uint32_t j = 0; j < head_dim; j++) out[j] = __float2half(base[j]);
+    } else if (KVQ == 1u || KVQ == 3u) {
+        float amax = 0.0f;
+        for (uint32_t j = 0; j < head_dim; j++) amax = fmaxf(amax, fabsf(base[j]));
+        const float lim = KVQ == 1u ? 448.0f : 127.0f;
+        const float scale = amax / lim;
+        const float inv = amax > 0.0f ? lim / amax : 0.0f;
+        if (KVQ == 1u) {
+            uint8_t *out = (uint8_t *)dst;
+            for (uint32_t j = 0; j < head_dim; j++) out[j] = e4m3_enc(base[j] * inv);
+            memcpy(out + head_dim, &scale, 4);
+        } else {
+            int8_t *out = (int8_t *)dst;
+            for (uint32_t j = 0; j < head_dim; j++) {
+                int qi = __float2int_rn(base[j] * inv);
+                if (qi > 127) qi = 127;
+                if (qi < -128) qi = -128;
+                out[j] = (int8_t)qi;
+            }
+            memcpy(out + head_dim, &scale, 4);
+        }
+    } else { /* q8_0 (4) / q4_0 (5): per-32-wide-block f16 d */
+        const uint32_t n_blocks = head_dim / 32u;
+        char *dstb = (char *)dst;
+        for (uint32_t b = 0; b < n_blocks; b++) {
+            const float *blk = base + b * 32u;
+            char *bb = dstb + (uint64_t)b * (KVQ == 4u ? 34u : 18u);
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < 32u; i++) amax = fmaxf(amax, fabsf(blk[i]));
+            if (KVQ == 4u) {
+                const float d = amax / 127.0f;
+                const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+                *(__half *)bb = __float2half(d);
+                for (uint32_t i = 0; i < 32u; i++) {
+                    int qi = __float2int_rn(blk[i] * inv);
+                    if (qi > 127) qi = 127;
+                    if (qi < -128) qi = -128;
+                    bb[2u + i] = (int8_t)qi;
+                }
+            } else {
+                const float d = amax / 8.5f;
+                const float inv = amax > 0.0f ? 8.5f / amax : 0.0f;
+                *(__half *)bb = __float2half(d);
+                for (uint32_t i = 0; i < 16u; i++) {
+                    int q0 = __float2int_rn(blk[i] * inv) + 8;
+                    int q1 = __float2int_rn(blk[i + 16u] * inv) + 8;
+                    if (q0 > 15) q0 = 15; if (q0 < 0) q0 = 0;
+                    if (q1 > 15) q1 = 15; if (q1 < 0) q1 = 0;
+                    bb[2u + i] = (uint8_t)(q0 | (q1 << 4));
+                }
+            }
+        }
+    }
+}
+
+template <uint32_t KVQ, uint32_t TURBO>
+__global__ static void dsv4_kv_store_kernel(
+        void *dst, const float *src, uint32_t head_dim, const float *pi) {
+    /* fast parallel arms for the scale-free formats (the ring push used to
+     * be a plain D2D copy; keep that cheap). Lossy formats serialize the
+     * quant on thread 0 - one row per token, correctness over elegance. */
+    if (KVQ == 0u) {
+        float *out = (float *)dst;
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
+            out[d] = src[d];
+        return;
+    }
+    if (KVQ == 2u) {
+        __half *out = (__half *)dst;
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x)
+            out[d] = __float2half(src[d]);
+        return;
+    }
+    if (threadIdx.x == 0u) dsv4_quant_row_serial<KVQ>(dst, src, head_dim, TURBO, pi);
+}
+
+extern "C" int pulsar_dsv4_kv_store(
+        void *dst_dev, const void *src_dev, uint32_t head_dim,
+        uint32_t kvq, uint32_t turbo, const void *pi_dev) {
+    if (!dst_dev || !src_dev || head_dim == 0 || head_dim > 512u ||
+        kvq > 5u || turbo > 1u || (turbo && !pi_dev) ||
+        (kvq >= 4u && head_dim % 32u != 0) || (turbo && kvq != 4u && kvq != 5u)) {
+        return 0;
+    }
+    #define DSV4_KV_LAUNCH(K, T)                                                \
+        dsv4_kv_store_kernel<K, T><<<1, 256>>>(                                 \
+                dst_dev, (const float *)src_dev, head_dim, (const float *)pi_dev)
+    if (!turbo) {
+        switch (kvq) {
+            case 0u: DSV4_KV_LAUNCH(0u, 0u); break;
+            case 1u: DSV4_KV_LAUNCH(1u, 0u); break;
+            case 2u: DSV4_KV_LAUNCH(2u, 0u); break;
+            case 3u: DSV4_KV_LAUNCH(3u, 0u); break;
+            case 4u: DSV4_KV_LAUNCH(4u, 0u); break;
+            case 5u: DSV4_KV_LAUNCH(5u, 0u); break;
+            default: return 0;
+        }
+    } else {
+        switch (kvq) {
+            case 4u: DSV4_KV_LAUNCH(4u, 1u); break;
+            case 5u: DSV4_KV_LAUNCH(5u, 1u); break;
+            default: return 0;
+        }
+    }
+    #undef DSV4_KV_LAUNCH
+    return cuda_ok(cudaGetLastError(), "dsv4 kv store launch");
 }
 
 /* ---- selftest: CPU references vs the kernels --------------------------- */
@@ -703,7 +929,8 @@ extern "C" int pulsar_dsv4_selftest(void) {
         cudaMemcpy(dsinks, sinks, n_head * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dallowed, allowed, n_comp, cudaMemcpyHostToDevice);
         ok &= pulsar_dsv4_attention(dout, dq, draw, n_raw, dcomp, n_comp,
-                                    dallowed, dsinks, n_head, head_dim, scale);
+                                    dallowed, dsinks, n_head, head_dim, scale,
+                                    0, 0, NULL);
         float *got = (float *)malloc((size_t)n_head * head_dim * 4);
         cudaMemcpy(got, dout, (size_t)n_head * head_dim * 4, cudaMemcpyDeviceToHost);
         float max_rel = 0.0f;
@@ -718,7 +945,8 @@ extern "C" int pulsar_dsv4_selftest(void) {
         }
         /* no-mask, no-comp path */
         ok &= pulsar_dsv4_attention(dout, dq, draw, n_raw, NULL, 0,
-                                    NULL, dsinks, n_head, head_dim, scale);
+                                    NULL, dsinks, n_head, head_dim, scale,
+                                    0, 0, NULL);
         dsv4_ref_attention(ref, q, raw, n_raw, NULL, 0, NULL, sinks,
                            n_head, head_dim, scale);
         cudaMemcpy(got, dout, (size_t)n_head * head_dim * 4, cudaMemcpyDeviceToHost);
@@ -807,6 +1035,141 @@ extern "C" int pulsar_dsv4_selftest(void) {
         }
         cudaFree(dx);
         free(x); free(ref); free(got);
+    }
+
+    /* kv_store round-trip: store+dequant must reproduce the f32 row within
+     * codec error; turbo additionally checks Pi*Pi^T ~= I and that store(rot)
+     * + Pi^T restore recovers the original. */
+    {
+        const uint32_t hd = 512;
+        float *row = (float *)malloc(hd * 4);
+        for (uint32_t i = 0; i < hd; i++) row[i] = gqa_test_randf() * 4.0f - 2.0f;
+        float *pi = (float *)malloc((size_t)hd * hd * 4);
+        /* deterministic orthogonal Pi: modified Gram-Schmidt on fixed rows */
+        {
+            uint64_t s = 0x9e3779b97f4a7c15ull;
+            float *m = (float *)malloc((size_t)hd * hd * 4);
+            for (uint64_t i = 0; i < (uint64_t)hd * hd; i++) {
+                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                m[i] = ((float)(s >> 11) / 8388608.0f - 0.5f) * 2.0f;
+            }
+            for (uint32_t j = 0; j < hd; j++) {
+                float *col = m + (uint64_t)j * hd;
+                for (uint32_t k = 0; k < j; k++) {
+                    float *prev = m + (uint64_t)k * hd;
+                    float dot = 0.0f;
+                    for (uint32_t i = 0; i < hd; i++) dot += col[i] * prev[i];
+                    for (uint32_t i = 0; i < hd; i++) col[i] -= dot * prev[i];
+                }
+                float n2 = 0.0f;
+                for (uint32_t i = 0; i < hd; i++) n2 += col[i] * col[i];
+                float inv = 1.0f / sqrtf(n2);
+                for (uint32_t i = 0; i < hd; i++) {
+                    col[i] *= inv;
+                    pi[(uint64_t)j * hd + i] = col[i];  /* row-major Pi */
+                }
+            }
+            free(m);
+        }
+        void *dsrc, *ddst, *dpi;
+        cudaMalloc(&dsrc, hd * 4);
+        cudaMalloc(&dpi, (size_t)hd * hd * 4);
+        cudaMemcpy(dsrc, row, hd * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dpi, pi, (size_t)hd * hd * 4, cudaMemcpyHostToDevice);
+        const uint32_t cases_q[7][2] = {
+            {0u, 0u}, {1u, 0u}, {2u, 0u}, {3u, 0u},
+            {4u, 0u}, {4u, 1u}, {5u, 1u},
+        };
+        for (uint32_t c = 0; c < 7 && ok; c++) {
+            const uint32_t kvq = cases_q[c][0], turbo = cases_q[c][1];
+            /* host mirror of kv_row_stride (the device fn is __device__) */
+            const uint64_t stride = kvq == 1u || kvq == 3u ? (uint64_t)hd + 4u
+                : kvq == 2u ? (uint64_t)hd * 2u
+                : kvq == 4u ? ((uint64_t)hd / 32u) * 34u
+                : kvq == 5u ? ((uint64_t)hd / 32u) * 18u
+                : (uint64_t)hd * 4u;
+            cudaMalloc(&ddst, stride);
+            ok &= pulsar_dsv4_kv_store(ddst, dsrc, hd, kvq, turbo, dpi);
+            cudaDeviceSynchronize();
+            if (!ok) break;
+            /* host dequant -> compare */
+            uint8_t *stored = (uint8_t *)malloc(stride);
+            cudaMemcpy(stored, ddst, stride, cudaMemcpyDeviceToHost);
+            float *dec = (float *)malloc(hd * 4);
+            if (kvq == 0u) {
+                memcpy(dec, stored, hd * 4);
+            } else if (kvq == 2u) {
+                for (uint32_t d = 0; d < hd; d++) dec[d] = __half2float(((__half *)stored)[d]);
+            } else if (kvq == 1u) {
+                float scl;
+                memcpy(&scl, stored + hd, 4);
+                for (uint32_t d = 0; d < hd; d++) dec[d] = e4m3_dec_common(stored[d]) * scl;
+            } else if (kvq == 3u) {
+                float scl;
+                memcpy(&scl, stored + hd, 4);
+                for (uint32_t d = 0; d < hd; d++) dec[d] = (float)(int8_t)stored[d] * scl;
+            } else {
+                /* q8_0 / q4_0 blocks */
+                for (uint32_t d = 0; d < hd; d++) {
+                    const uint32_t b = d >> 5, i = d & 31u;
+                    const char *bb = (const char *)stored + (uint64_t)b * (kvq == 4u ? 34u : 18u);
+                    const float dlt = __half2float(*(const __half *)bb);
+                    if (kvq == 4u) dec[d] = dlt * (float)(int8_t)bb[2u + i];
+                    else {
+                        const uint32_t bytei = i & 15u;
+                        const int sh = ((i >> 4) & 1u) << 2;
+                        dec[d] = dlt * (float)(((bb[2u + bytei] >> sh) & 15) - 8);
+                    }
+                }
+            }
+            if (turbo) {
+                /* Pi^T restore: out[j] = sum_i pi[i*hd + j]*dec[i] */
+                float *tmp = (float *)malloc(hd * 4);
+                for (uint32_t j = 0; j < hd; j++) {
+                    float acc = 0.0f;
+                    for (uint32_t i = 0; i < hd; i++) acc += pi[(uint64_t)i * hd + j] * dec[i];
+                    tmp[j] = acc;
+                }
+                memcpy(dec, tmp, hd * 4);
+                free(tmp);
+            }
+            double err = 0.0, nrm = 0.0;
+            for (uint32_t d = 0; d < hd; d++) {
+                double e = fabs(dec[d] - row[d]);
+                if (e > err) err = e;
+                if (fabs(row[d]) > nrm) nrm = fabs(row[d]);
+            }
+            /* q4_0 under turbo has the coarsest honest step (d/8.5), and
+             * rotating concentrates values so the post-rot amax (hence d)
+             * exceeds the pre-rot nrm the tolerance keys on - widen it so
+             * the round-trip gate reflects codec error, not a Pi-scale bug. */
+            if (err > (double)(kvq == 0u ? 1.0e-5 : kvq == 2u ? 2.0e-3
+                        : (kvq == 5u && turbo) ? 3.0 : 0.20) * (nrm + 1.0e-3)) {
+                fprintf(stderr, "dsv4 selftest: kv_store round-trip kvq=%u turbo=%u max abs err %.3e\n",
+                        kvq, turbo, err);
+                ok = 0;
+            }
+            free(stored); free(dec);
+            cudaFree(ddst);
+        }
+        /* verify Pi orthonormal within eps */
+        float max_off = 0.0f;
+        for (uint32_t j = 0; j < hd; j++) {
+            for (uint32_t k = 0; k < hd; k++) {
+                float d = 0.0f;
+                for (uint32_t i = 0; i < hd; i++)
+                    d += pi[(uint64_t)j * hd + i] * pi[(uint64_t)k * hd + i];
+                float want = j == k ? 1.0f : 0.0f;
+                float off = fabsf(d - want);
+                if (off > max_off) max_off = off;
+            }
+        }
+        if (max_off > 1.0e-3f) {
+            fprintf(stderr, "dsv4 selftest: Pi not orthonormal max off %.3e\n", max_off);
+            ok = 0;
+        }
+        cudaFree(dsrc); cudaFree(dpi);
+        free(row); free(pi);
     }
 
     /* sinkhorn kernel vs a serial C reference */
@@ -927,7 +1290,8 @@ extern "C" int pulsar_dsv4_selftest(void) {
                 cudaMemcpy(dcur_sc, cur_sc, width * 4, cudaMemcpyHostToDevice);
                 ok &= pulsar_dsv4_comp_step(dkv, dsc, dcache, dcur_kv, dcur_sc,
                         dape, dnrm, width, hd, ratio, pos, emit, cases[ci].is_idx,
-                        eps, n_rot, 65536u, freq_base, freq_scale, ext_factor, attn_factor);
+                        eps, n_rot, 65536u, freq_base, freq_scale, ext_factor, attn_factor,
+                        0, 0, NULL);
                 /* reference step */
                 const uint32_t pos_mod = pos % ratio;
                 const uint32_t row = ratio == 4u ? ratio + pos_mod : pos_mod;
