@@ -298,9 +298,19 @@ fn run() -> engine::Result {
                     respond_bytes(&mut stream, 200, "image/svg+xml", FAVICON_SVG.as_bytes())
                 }
                 ("GET", "/v1/models") => {
+                    // `created` is required on the model object for the same
+                    // reason it is on completions: strict clients deserialize
+                    // into a struct with non-optional fields. The gguf's mtime
+                    // is the honest answer to "when did this model appear".
+                    let created = std::fs::metadata(&model_path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
                     let json = serde_json::json!({
                         "object": "list",
-                        "data": [{"id": model_name, "object": "model", "owned_by": "pulsar", "max_model_len": ctx}],
+                        "data": [{"id": model_name, "object": "model", "created": created, "owned_by": "pulsar", "max_model_len": ctx}],
                     });
                     respond_json(&mut stream, 200, &json)
                 }
@@ -1466,6 +1476,17 @@ fn handle_chat(
         .min(room);
     let mut sampler = engine::Sampler::new(temp, top_p, min_p, seed);
     let id = format!("chatcmpl-{request_id}");
+    // `created` is a required member of both chat.completion and
+    // chat.completion.chunk. Clients that deserialize into a struct with
+    // non-optional fields reject the whole turn without it (issue #20/#21),
+    // and lenient ones simply ignored that it was missing. Stamped once per
+    // request and reused across every chunk of the stream, which is what
+    // upstream does: the value marks when the completion started, not when
+    // each chunk was flushed.
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // Prefix cache: skip re-prefilling whatever the engine already holds.
     // Chat transcripts APPEND, so the common case reuses everything up to
@@ -1518,7 +1539,7 @@ fn handle_chat(
         // until real SSE data arrives, so a silent prefill looks like a
         // dead upstream. The role chunk is protocol-required anyway.
         let first = serde_json::json!({
-            "id": id, "object": "chat.completion.chunk", "model": model_name,
+            "id": id, "object": "chat.completion.chunk", "model": model_name, "created": created,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
             // prompt token count up front so the UI can show live context use
             // and prefill tok/s the moment the first decoded token lands.
@@ -1641,7 +1662,7 @@ fn handle_chat(
                     let text = String::from_utf8_lossy(&rbytes[..rvalid]).into_owned();
                     rbytes.drain(..rvalid);
                     let chunk = serde_json::json!({
-                        "id": id, "object": "chat.completion.chunk", "model": model_name,
+                        "id": id, "object": "chat.completion.chunk", "model": model_name, "created": created,
                         "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}],
                     });
                     if write!(stream, "data: {chunk}\n\n").and_then(|_| stream.flush()).is_err() {
@@ -1672,7 +1693,7 @@ fn handle_chat(
                     let text = String::from_utf8_lossy(&bytes[..valid]).into_owned();
                     bytes.drain(..valid);
                     let chunk = serde_json::json!({
-                        "id": id, "object": "chat.completion.chunk", "model": model_name,
+                        "id": id, "object": "chat.completion.chunk", "model": model_name, "created": created,
                         "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}],
                     });
                     if write!(stream, "data: {chunk}\n\n").and_then(|_| stream.flush()).is_err() {
@@ -1691,7 +1712,7 @@ fn handle_chat(
         if !tool_phase.get() && !bytes.is_empty() && !send_err.get() {
             let text = String::from_utf8_lossy(&bytes).into_owned();
             let chunk = serde_json::json!({
-                "id": id, "object": "chat.completion.chunk", "model": model_name,
+                "id": id, "object": "chat.completion.chunk", "model": model_name, "created": created,
                 "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}],
             });
             let _ = write!(stream, "data: {chunk}\n\n").and_then(|_| stream.flush());
@@ -1700,7 +1721,7 @@ fn handle_chat(
         let (_, calls) = extract_tool_calls(&full);
         for (ci, (name, args)) in calls.iter().enumerate() {
             let tc = serde_json::json!({
-                "id": id, "object": "chat.completion.chunk", "model": model_name,
+                "id": id, "object": "chat.completion.chunk", "model": model_name, "created": created,
                 "choices": [{"index": 0, "delta": {"tool_calls": [{
                     "index": ci, "id": format!("call_{request_id}_{ci}"),
                     "type": "function",
@@ -1711,7 +1732,7 @@ fn handle_chat(
         }
         let fin_reason = if calls.is_empty() { "stop" } else { "tool_calls" };
         let fin = serde_json::json!({
-            "id": id, "object": "chat.completion.chunk", "model": model_name,
+            "id": id, "object": "chat.completion.chunk", "model": model_name, "created": created,
             "choices": [{"index": 0, "delta": {}, "finish_reason": fin_reason}],
             "usage": {
                 "prompt_tokens": prompt.len(),
@@ -1864,7 +1885,7 @@ fn handle_chat(
                 .collect::<Vec<_>>());
         }
         let json = serde_json::json!({
-            "id": id, "object": "chat.completion", "model": model_name,
+            "id": id, "object": "chat.completion", "model": model_name, "created": created,
             "choices": [{
                 "index": 0,
                 "message": message,
