@@ -13,6 +13,20 @@
 use super::{Attn, Ffn, LayerW, Model, Result, Shape, State, SLAB_SLACK};
 use kernels::DeviceBuf;
 
+/// Packed byte width of one quantized latent row for the given kvq codec.
+/// Mirrors the `kv_row` closure in engine lib.rs (setup) so the per-token
+/// ring/comp writes agree with the cache allocation.
+const fn kv_row(hd: usize, kvq: u32) -> usize {
+    match kvq {
+        0 => hd * 4,
+        1 | 3 => hd + 4,      // fp8/int8: per-row f32 scale
+        2 => hd * 2,          // fp16
+        4 => (hd / 32) * 34,  // q8_0: 34 B / 32 elems
+        5 => (hd / 32) * 18,  // q4_0: 18 B / 32 elems
+        _ => hd * 4,
+    }
+}
+
 const NEG_INF: f32 = -1.0e30; // DS4_NEG_INF (finite on purpose)
 /// Batched prefill chunk width (matches the qwen35 blueprint; the
 /// per-token interleave keeps the SWA ring correct within a chunk).
@@ -963,7 +977,11 @@ impl Model {
         }
         kernels::dsv4_rope_tail(&mut st.v, t, 1, s.head_dim, s.rot_dim, pos0, &rope, false)?;
         kernels::dsv4_fp8_sim(&mut st.v, t, s.head_dim, s.rot_dim)?;
-        kernels::dsv4_f16_round(&mut st.v, t * s.head_dim)?;
+        // f16 round-trip sim is only the numerical baseline when we store
+        // f32; any real kvq codec rounds once at the store point.
+        if st.kvq == 0 {
+            kernels::dsv4_f16_round(&mut st.v, t * s.head_dim)?;
+        }
         // compressor projections batched (per-token rows consumed below)
         if let Some(comp) = &w.comp {
             kernels::matmul_q8_0(&mut rt.comp_kv, &comp.kv_w, &st.normed, s.n_embd, comp.width, t)?;
@@ -991,26 +1009,52 @@ impl Model {
         // clobber earlier tokens' windows (ring cap 128 < chunk span +
         // window), and each token's visibility mask depends on the
         // indexer cache state AT ITS OWN position.
+        // turbo: rotate the whole batch's Q by Π once so (Πq)·(Πk) = qᵀk
+        // while the cache holds Π-rotated rows. st.q is [t][n_head][head_dim];
+        // matmul_f32 treats it as n_tok = t*n_head rows of head_dim.
+        let qsrc: &DeviceBuf = if st.kvq_rot {
+            kernels::matmul_f32(
+                &mut st.qrot,
+                &st.pi,
+                &st.q,
+                s.head_dim,
+                s.head_dim,
+                t * s.n_head,
+            )?;
+            &st.qrot
+        } else {
+            &st.q
+        };
         for i in 0..t as usize {
             let pos = pos0 + i as u32;
             let n_raw = (pos + 1).min(s.n_swa);
             let emit = w.ratio != 0 && (pos + 1) % w.ratio == 0;
-            kernels::copy_d2d(
+            // raw ring push: quantized per kvq (turbo rotates the row by Π
+            // inside the store kernel so ring and comp rows match). The f16
+            // sim was dropped above when kvq != 0, so this store is the
+            // single quantization point for the raw window.
+            kernels::dsv4_kv_store(
                 &mut st.kcache[il],
-                (pos % s.n_swa) as usize * hd4,
+                (pos % s.n_swa) as usize * kv_row(s.head_dim as usize, st.kvq),
                 &st.v,
                 i * hd4,
-                hd4,
+                s.head_dim,
+                st.kvq,
+                u32::from(st.kvq_rot),
+                (st.kvq_rot).then_some(&st.pi),
             )?;
             let lrt = &mut rt.layers[il];
             if let Some(comp) = &w.comp {
                 let lane = lrt.comp.as_mut().ok_or("compressor state missing")?;
                 kernels::dsv4_comp_step(
                     &mut lane.st_kv, &mut lane.st_sc,
-                    &mut st.vcache[il], lrt.n_comp as usize * hd4,
+                    &mut st.vcache[il], lrt.n_comp as usize * kv_row(s.head_dim as usize, st.kvq),
                     &rt.comp_kv, &rt.comp_sc, i * comp.width as usize * 4,
                     &comp.ape, &comp.norm,
                     comp.width, s.head_dim, lane.ratio, pos, emit, false, eps, &rope,
+                    st.kvq,
+                    u32::from(st.kvq_rot),
+                    (st.kvq_rot).then_some(&st.pi),
                 )?;
                 if emit {
                     lrt.n_comp += 1;
@@ -1027,6 +1071,7 @@ impl Model {
                     &rt.idx_kv, &rt.idx_sc, i * idx.comp.width as usize * 4,
                     &idx.comp.ape, &idx.comp.norm,
                     idx.comp.width, s.n_idx_dim, lane.ratio, pos, emit, true, eps, &rope,
+                    0, 0, None,
                 )?;
                 if emit {
                     lrt.n_idx_comp += 1;
@@ -1067,7 +1112,7 @@ impl Model {
                 }
             }
             let n_comp = rt.layers[il].n_comp;
-            if std::env::var_os("PULSAR_L0_LOG").is_some() && il == 0 && i == 0 && (2046..2051).contains(&pos) {
+            if std::env::var_os("PULSAR_L0_LOG").is_some() && st.kvq == 0 && il == 0 && i == 0 && (2046..2051).contains(&pos) {
                 kernels::sync()?;
                 let hd = s.head_dim as usize;
                 let kc = st.kcache[il].read_f32_at((pos % s.n_swa) as usize * hd, hd)?;
@@ -1083,7 +1128,7 @@ impl Model {
             kernels::dsv4_attention_at(
                 &mut st.heads,
                 i * q_dim as usize * 4,
-                &st.q,
+                qsrc,
                 i * q_dim as usize * 4,
                 &st.kcache[il],
                 n_raw,
@@ -1094,6 +1139,9 @@ impl Model {
                 s.n_head,
                 s.head_dim,
                 1.0 / (s.head_dim as f32).sqrt(),
+                st.kvq,
+                u32::from(st.kvq_rot),
+                (st.kvq_rot).then_some(&st.pi),
             )?;
         }
         if std::env::var_os("PULSAR_L0_LOG").is_some() && il <= 2 && (2046..2051).contains(&pos0) {

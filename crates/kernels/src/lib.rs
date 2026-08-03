@@ -130,12 +130,13 @@ mod real {
         fn pulsar_mla_rope_tail(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> i32;
         fn pulsar_dsv4_rope_tail(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, inverse: u32) -> i32;
         fn pulsar_dsv4_hc_mix(out: *mut c_void, streams: *const c_void, block: *const c_void, st_c: *const f32, blk_c: *const f32, n_embd: u32, n_hc: u32, n_out: u32) -> i32;
-        fn pulsar_dsv4_attention(out: *mut c_void, q: *const c_void, raw: *const c_void, n_raw: u32, comp: *const c_void, n_comp: u32, allowed: *const c_void, sinks: *const c_void, n_head: u32, head_dim: u32, scale: f32) -> i32;
+        fn pulsar_dsv4_attention(out: *mut c_void, q: *const c_void, raw: *const c_void, n_raw: u32, comp: *const c_void, n_comp: u32, allowed: *const c_void, sinks: *const c_void, n_head: u32, head_dim: u32, scale: f32, kvq: u32, turbo: u32, pi: *const c_void) -> i32;
         fn pulsar_dsv4_fp8_sim(x: *mut c_void, n_rows: u32, head_dim: u32, n_rot: u32) -> i32;
         fn pulsar_dsv4_f16_round(x: *mut c_void, n: u32) -> i32;
+        fn pulsar_dsv4_kv_store(dst: *mut c_void, src: *const c_void, head_dim: u32, kvq: u32, turbo: u32, pi: *const c_void) -> i32;
         fn pulsar_dsv4_sinkhorn(coef: *mut c_void, mix: *const c_void, scale: *const c_void, base: *const c_void, n_hc: u32, iters: u32, eps: f32, n_tok: u32) -> i32;
         fn pulsar_dsv4_hc_mix_dev(out: *mut c_void, streams: *const c_void, block: *const c_void, coef: *const c_void, st_off: u32, blk_off: i32, n_embd: u32, n_hc: u32, n_out: u32, n_tok: u32) -> i32;
-        fn pulsar_dsv4_comp_step(state_kv: *mut c_void, state_sc: *mut c_void, cache_row: *mut c_void, kv_cur: *const c_void, sc_cur: *const c_void, ape: *const c_void, norm: *const c_void, width: u32, head_dim: u32, ratio: u32, pos: u32, emit: u32, is_idx: u32, rms_eps: f32, n_rot: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32) -> i32;
+        fn pulsar_dsv4_comp_step(state_kv: *mut c_void, state_sc: *mut c_void, cache_row: *mut c_void, kv_cur: *const c_void, sc_cur: *const c_void, ape: *const c_void, norm: *const c_void, width: u32, head_dim: u32, ratio: u32, pos: u32, emit: u32, is_idx: u32, rms_eps: f32, n_rot: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, kvq: u32, turbo: u32, pi: *const c_void) -> i32;
         fn pulsar_dsv4_selftest() -> i32;
         fn pulsar_qwen35_conv_step(out: *mut c_void, x: *const c_void, kern: *const c_void, state: *mut c_void, n_chan: u32, k: u32) -> i32;
         fn pulsar_qwen35_l2_norm(x: *mut c_void, rows: u32, dim: u32, eps: f32) -> i32;
@@ -1137,19 +1138,19 @@ mod real {
     /// deepseek4 decode attention: sinks + raw SWA ring + compressed
     /// rows (K == V), optional per-comp-row visibility mask.
     #[allow(clippy::too_many_arguments)]
-    pub fn dsv4_attention(out: &mut DeviceBuf, q: &DeviceBuf, raw: &DeviceBuf, n_raw: u32, comp: Option<&DeviceBuf>, n_comp: u32, allowed: Option<&DeviceBuf>, sinks: &DeviceBuf, n_head: u32, head_dim: u32, scale: f32) -> Result {
-        dsv4_attention_at(out, 0, q, 0, raw, n_raw, comp, n_comp, allowed, sinks, n_head, head_dim, scale)
+    pub fn dsv4_attention(out: &mut DeviceBuf, q: &DeviceBuf, raw: &DeviceBuf, n_raw: u32, comp: Option<&DeviceBuf>, n_comp: u32, allowed: Option<&DeviceBuf>, sinks: &DeviceBuf, n_head: u32, head_dim: u32, scale: f32, kvq: u32, turbo: u32, pi: Option<&DeviceBuf>) -> Result {
+        dsv4_attention_at(out, 0, q, 0, raw, n_raw, comp, n_comp, allowed, sinks, n_head, head_dim, scale, kvq, turbo, pi)
     }
 
     /// dsv4_attention with byte offsets into out/q (chunked prefill's
     /// per-token interleave).
     #[allow(clippy::too_many_arguments)]
-    pub fn dsv4_attention_at(out: &mut DeviceBuf, out_off: usize, q: &DeviceBuf, q_off: usize, raw: &DeviceBuf, n_raw: u32, comp: Option<&DeviceBuf>, n_comp: u32, allowed: Option<&DeviceBuf>, sinks: &DeviceBuf, n_head: u32, head_dim: u32, scale: f32) -> Result {
+    pub fn dsv4_attention_at(out: &mut DeviceBuf, out_off: usize, q: &DeviceBuf, q_off: usize, raw: &DeviceBuf, n_raw: u32, comp: Option<&DeviceBuf>, n_comp: u32, allowed: Option<&DeviceBuf>, sinks: &DeviceBuf, n_head: u32, head_dim: u32, scale: f32, kvq: u32, turbo: u32, pi: Option<&DeviceBuf>) -> Result {
         let out_ptr = unsafe { (out.ptr_mut() as *mut u8).add(out_off) as *mut c_void };
         let q_ptr = unsafe { (q.ptr() as *const u8).add(q_off) as *const c_void };
         check(
             unsafe {
-                pulsar_dsv4_attention(out_ptr, q_ptr, raw.ptr(), n_raw, comp.map_or(std::ptr::null(), |b| b.ptr()), n_comp, allowed.map_or(std::ptr::null(), |b| b.ptr()), sinks.ptr(), n_head, head_dim, scale)
+                pulsar_dsv4_attention(out_ptr, q_ptr, raw.ptr(), n_raw, comp.map_or(std::ptr::null(), |b| b.ptr()), n_comp, allowed.map_or(std::ptr::null(), |b| b.ptr()), sinks.ptr(), n_head, head_dim, scale, kvq, turbo, pi.map_or(std::ptr::null(), |b| b.ptr()))
             },
             "dsv4_attention",
         )
@@ -1183,15 +1184,27 @@ mod real {
     /// Streaming compressor step fully on-device; cache_row is the
     /// emit target (pass a dummy when emit is false).
     #[allow(clippy::too_many_arguments)]
-    pub fn dsv4_comp_step(state_kv: &mut DeviceBuf, state_sc: &mut DeviceBuf, cache_row: &mut DeviceBuf, cache_off: usize, kv_cur: &DeviceBuf, sc_cur: &DeviceBuf, cur_off: usize, ape: &DeviceBuf, norm: &DeviceBuf, width: u32, head_dim: u32, ratio: u32, pos: u32, emit: bool, is_idx: bool, rms_eps: f32, r: &RopeCfg) -> Result {
+    pub fn dsv4_comp_step(state_kv: &mut DeviceBuf, state_sc: &mut DeviceBuf, cache_row: &mut DeviceBuf, cache_off: usize, kv_cur: &DeviceBuf, sc_cur: &DeviceBuf, cur_off: usize, ape: &DeviceBuf, norm: &DeviceBuf, width: u32, head_dim: u32, ratio: u32, pos: u32, emit: bool, is_idx: bool, rms_eps: f32, r: &RopeCfg, kvq: u32, turbo: u32, pi: Option<&DeviceBuf>) -> Result {
         let row_ptr = unsafe { (cache_row.ptr_mut() as *mut u8).add(cache_off) as *mut c_void };
         let kv_ptr = unsafe { (kv_cur.ptr() as *const u8).add(cur_off) as *const c_void };
         let sc_ptr = unsafe { (sc_cur.ptr() as *const u8).add(cur_off) as *const c_void };
         check(
             unsafe {
-                pulsar_dsv4_comp_step(state_kv.ptr_mut(), state_sc.ptr_mut(), row_ptr, kv_ptr, sc_ptr, ape.ptr(), norm.ptr(), width, head_dim, ratio, pos, emit as u32, is_idx as u32, rms_eps, 64, r.n_ctx_orig, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor)
+                pulsar_dsv4_comp_step(state_kv.ptr_mut(), state_sc.ptr_mut(), row_ptr, kv_ptr, sc_ptr, ape.ptr(), norm.ptr(), width, head_dim, ratio, pos, emit as u32, is_idx as u32, rms_eps, 64, r.n_ctx_orig, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor, kvq, turbo, pi.map_or(std::ptr::null(), |b| b.ptr()))
             },
             "dsv4_comp_step",
+        )
+    }
+
+    /// Store one dsv4 latent row into a ring/comp slot, quantized per kvq
+    /// (0 f32, 1 fp8, 2 fp16, 3 int8, 4 q8_0, 5 q4_0) with optional turbo
+    /// (pi rotation for block formats).
+    pub fn dsv4_kv_store(dst: &mut DeviceBuf, dst_off: usize, src: &DeviceBuf, src_off: usize, head_dim: u32, kvq: u32, turbo: u32, pi: Option<&DeviceBuf>) -> Result {
+        let dst_ptr = unsafe { (dst.ptr_mut() as *mut u8).add(dst_off) as *mut c_void };
+        let src_ptr = unsafe { (src.ptr() as *const u8).add(src_off) as *const c_void };
+        check(
+            unsafe { pulsar_dsv4_kv_store(dst_ptr, src_ptr, head_dim, kvq, turbo, pi.map_or(std::ptr::null(), |b| b.ptr())) },
+            "dsv4_kv_store",
         )
     }
 
