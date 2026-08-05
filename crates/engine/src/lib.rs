@@ -3400,7 +3400,7 @@ mod real {
                                     conv_k: upload(&file, &gguf, &t("ssm_conv1d_k.weight"))?,
                                     conv_v: upload(&file, &gguf, &t("ssm_conv1d_v.weight"))?,
                                     f_a: MatW::load(&file, &gguf, &t("ssm_f_a.weight"))?,
-                                    f_b: upload_f16_as_f32(&file, &gguf, &t("ssm_f_b.weight"))?,
+                                    f_b: upload_as_f32(&file, &gguf, &t("ssm_f_b.weight"))?,
                                     beta_w: MatW::load(&file, &gguf, &t("ssm_beta.weight"))?,
                                     a: upload_as_f32(&file, &gguf, &t("ssm_a"))?,
                                     dt_bias: upload(&file, &gguf, &t("ssm_dt.bias"))?,
