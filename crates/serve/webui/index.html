@@ -815,6 +815,33 @@
   }
   .cortex-tip .tip-k { color: var(--text-tertiary); }
 
+  .cortex-empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 24px;
+    text-align: center;
+    color: var(--text-tertiary);
+    pointer-events: none;
+  }
+  .cortex-empty strong { color: var(--text-warm); font-size: 13px; font-weight: 600; }
+  .cortex-empty span { font-size: 12px; line-height: 1.5; max-width: 440px; }
+  .cortex-empty code {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: var(--glass-panel);
+    box-shadow: 0 0 0 1px var(--glass-border);
+    color: var(--accent);
+    pointer-events: auto;
+    user-select: all;
+  }
+
   #messages {
     flex: 1;
     overflow-y: auto;
@@ -3099,10 +3126,48 @@ function topicColor(i, n, dark) {
   return "hsl(" + hue.toFixed(0) + "," + (dark ? 70 : 62) + "%," + (dark ? 62 : 46) + "%)";
 }
 
+// atlasMode: "topic" (sidecar PCA galaxy) takes priority; otherwise "live" (tier+heat scatter from /experts).
+let atlasMode = "live";
+let liveCells = null; // [{layer,expert,tier,heat}]
+let liveStats = null; // {max,nVram,nRam,nDisk}
+
+function flattenExperts(j) {
+  const cells = [];
+  let max = 0, nVram = 0, nRam = 0, nDisk = 0;
+  for (const L of j.layers || []) {
+    const li = L.layer;
+    for (let i = 0; i < (L.tier || []).length; i++) {
+      const t = L.tier[i] | 0, h = L.heat[i] | 0;
+      cells.push({ layer: li, expert: i, tier: t, heat: h });
+      if (h > max) max = h;
+      if (t === 3) nVram++; else if (t === 2) nRam++; else nDisk++;
+    }
+  }
+  return { cells, max, nVram, nRam, nDisk };
+}
+
+// deterministic jitter so the cloud is stable across redraws, not random flicker
+function hashJitter(n) {
+  const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+  return (s - Math.floor(s)) * 0.08 - 0.04;
+}
+const TIER_BAND = { 3: 0.22, 2: 0.55, 0: 0.85 }; // vram core · ram mid · disk edge
+const TIER_NAME = { 3: "VRAM", 2: "RAM cache", 0: "disk" };
+function tierColor(t, dark) {
+  if (t === 3) return dark ? "hsl(150,62%,60%)" : "hsl(150,55%,40%)"; // green
+  if (t === 2) return dark ? "hsl(208,68%,64%)" : "hsl(208,60%,44%)"; // blue
+  return dark ? "hsl(0,0%,62%)" : "hsl(0,0%,42%)"; // gray
+}
+
 function renderAtlas() {
-  if (!atlasData || !atlasData.experts?.length) { atlasDims.textContent = "— experts · — specialists"; return; }
+  if (atlasMode === "topic" && atlasData?.experts?.length) { renderAtlasTopic(); return; }
+  if (liveCells?.length) { renderAtlasLive(); return; }
+  atlasDims.textContent = "— experts";
+}
+
+function renderAtlasTopic() {
   const { experts, anchors, topics } = atlasData;
-  atlasDims.textContent = (atlasData.n_experts || experts.length) + " experts · " + (atlasData.n_specialists || 0) + " specialists";
+  atlasDims.textContent = (atlasData.n_experts || experts.length) + " experts · " + (atlasData.n_specialists || 0) + " specialists · topic map";
   const stageW = atlasStage.clientWidth, stageH = atlasStage.clientHeight;
   if (!stageW || !stageH) return;
   const dpr = window.devicePixelRatio || 1;
@@ -3114,12 +3179,10 @@ function renderAtlas() {
   const C = cortexColors();
   ctx.fillStyle = "rgb(" + C.bg[0] + "," + C.bg[1] + "," + C.bg[2] + ")";
   ctx.fillRect(0, 0, stageW, stageH);
-
   const R = Math.min(stageW, stageH) / 2 - 44;
   const cx = stageW / 2, cy = stageH / 2;
   const mapX = (x) => cx + x * R, mapY = (y) => cy + y * R;
   const nTop = topics.length;
-
   atlasPts = [];
   const pass = (wantSpec) => {
     for (const e of experts) {
@@ -3134,10 +3197,9 @@ function renderAtlas() {
       if (wantSpec) atlasPts.push({ px, py, e });
     }
   };
-  pass(false); // faint generalist cloud
-  pass(true);  // specialists on top
+  pass(false);
+  pass(true);
   ctx.globalAlpha = 1;
-
   ctx.font = "600 11px -apple-system, BlinkMacSystemFont, sans-serif";
   ctx.textBaseline = "middle";
   for (const a of anchors || []) {
@@ -3150,13 +3212,95 @@ function renderAtlas() {
   }
 }
 
+// Instant live atlas: no probing, no command. Plots every expert by where its
+// weights live (VRAM core / RAM ring / disk rim) and grows dots with routing heat.
+function renderAtlasLive() {
+  atlasDims.textContent =
+    liveCells.length + " experts · " + liveStats.nVram + " VRAM · " +
+    liveStats.nRam + " cached · " + liveStats.nDisk + " disk";
+  const stageW = atlasStage.clientWidth, stageH = atlasStage.clientHeight;
+  if (!stageW || !stageH) return;
+  const dpr = window.devicePixelRatio || 1;
+  atlasCanvas.width = Math.round(stageW * dpr);
+  atlasCanvas.height = Math.round(stageH * dpr);
+  const ctx = atlasCanvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const dark = document.documentElement.dataset.theme === "dark";
+  const C = cortexColors();
+  ctx.fillStyle = "rgb(" + C.bg[0] + "," + C.bg[1] + "," + C.bg[2] + ")";
+  ctx.fillRect(0, 0, stageW, stageH);
+  const R = Math.min(stageW, stageH) / 2 - 44;
+  const cx = stageW / 2, cy = stageH / 2;
+  const max = liveStats.max || 1;
+
+  // tier band rings + labels
+  ctx.font = "10px -apple-system, BlinkMacSystemFont, sans-serif";
+  ctx.textBaseline = "middle"; ctx.textAlign = "center";
+  for (const [t, f] of [[3, 0.22], [2, 0.55], [0, 0.85]]) {
+    ctx.strokeStyle = dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)";
+    ctx.beginPath(); ctx.arc(cx, cy, f * R, 0, 6.2832); ctx.stroke();
+    ctx.fillStyle = dark ? "rgba(255,255,255,0.30)" : "rgba(0,0,0,0.30)";
+    ctx.fillText(TIER_NAME[t], cx, cy - f * R - 8);
+  }
+
+  atlasPts = [];
+  const golden = 2.3999632318;
+  for (let i = 0; i < liveCells.length; i++) {
+    const c = liveCells[i];
+    const band = TIER_BAND[c.tier] ?? 0.85;
+    const ang = i * golden;
+    const r = (band + hashJitter(i)) * R;
+    const px = cx + r * Math.cos(ang), py = cy + r * Math.sin(ang);
+    const hn = c.heat / max; // 0..1
+    ctx.globalAlpha = 0.22 + 0.65 * Math.sqrt(hn);
+    ctx.fillStyle = tierColor(c.tier, dark);
+    ctx.beginPath();
+    ctx.arc(px, py, 1.0 + 2.8 * Math.sqrt(hn), 0, 6.2832);
+    ctx.fill();
+    atlasPts.push({ px, py, c });
+  }
+  ctx.globalAlpha = 1;
+
+  if (liveStats.max === 0) {
+    ctx.fillStyle = dark ? "rgba(255,255,255,0.45)" : "rgba(0,0,0,0.45)";
+    ctx.textAlign = "center";
+    ctx.fillText("routing heat appears here as you chat", cx, cy + R + 26);
+  }
+}
+
+function hideAtlasEmpty() { const el = $("atlas-empty"); if (el) el.hidden = true; }
+
+let atlasPoll = null;
+function stopAtlasPoll() { if (atlasPoll) { clearInterval(atlasPoll); atlasPoll = null; } }
+function startAtlasPoll() {
+  if (atlasPoll) return;
+  atlasPoll = setInterval(() => { if ($("tab-atlas").hidden) return; refreshAtlas(); }, 6000);
+}
+
+// Always fetch /experts (instant live atlas) and /atlas (topic map if a sidecar
+// exists). Live mode renders immediately with no build step; if a topic sidecar
+// is later produced, the poll upgrades the view to the topic galaxy.
 async function refreshAtlas() {
+  hideAtlasEmpty();
   try {
-    const r = await fetch("/atlas");
-    if (!r.ok) return; // 404 = no atlas built for this model
-    atlasData = await r.json();
+    const [er, ar] = await Promise.all([fetch("/experts"), fetch("/atlas")]);
+    if (er.ok) {
+      const f = flattenExperts(await er.json());
+      liveCells = f.cells; liveStats = f;
+    }
+    if (ar.ok) {
+      atlasData = await ar.json();
+      atlasMode = "topic";
+      stopAtlasPoll();
+    } else {
+      atlasMode = "live";
+      startAtlasPoll();
+    }
     renderAtlas();
-  } catch {}
+  } catch {
+    atlasMode = "live";
+    renderAtlas();
+  }
 }
 
 atlasCanvas.addEventListener("mousemove", (e) => {
@@ -3169,16 +3313,26 @@ atlasCanvas.addEventListener("mousemove", (e) => {
     if (d < bd) { bd = d; best = p; }
   }
   if (!best) { atlasTip.hidden = true; return; }
-  const ex = best.e;
   atlasTip.textContent = "";
   const l1 = document.createElement("div");
-  l1.appendChild(tipK("Topic"));
-  l1.appendChild(document.createTextNode(" " + (atlasData.topics[ex.t] ?? "?")));
   const l2 = document.createElement("div");
-  l2.appendChild(tipK("Spec"));
-  l2.appendChild(document.createTextNode(" " + Math.round(ex.spec * 100) + "% · "));
-  l2.appendChild(tipK("Heat"));
-  l2.appendChild(document.createTextNode(" " + ex.heat));
+  if (atlasMode === "topic" && best.e) {
+    const ex = best.e;
+    l1.appendChild(tipK("Topic"));
+    l1.appendChild(document.createTextNode(" " + (atlasData.topics[ex.t] ?? "?")));
+    l2.appendChild(tipK("Spec"));
+    l2.appendChild(document.createTextNode(" " + Math.round(ex.spec * 100) + "% · "));
+    l2.appendChild(tipK("Heat"));
+    l2.appendChild(document.createTextNode(" " + ex.heat));
+  } else {
+    const c = best.c;
+    l1.appendChild(tipK("Expert"));
+    l1.appendChild(document.createTextNode(" L" + c.layer + " · E" + c.expert));
+    l2.appendChild(tipK(TIER_NAME[c.tier] ?? "tier"));
+    l2.appendChild(document.createTextNode(" · "));
+    l2.appendChild(tipK("Heat"));
+    l2.appendChild(document.createTextNode(" " + c.heat));
+  }
   atlasTip.appendChild(l1);
   atlasTip.appendChild(l2);
   atlasTip.hidden = false;

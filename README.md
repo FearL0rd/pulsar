@@ -400,7 +400,14 @@ attention residency on a second GPU · resident expert tiers on spare
 GPUs · temp/top-p/min-p sampling · interactive chat · OpenAI-compatible
 server (`pulsar-serve`: `/v1/models`, `/v1/chat/completions` with SSE
 streaming plus a built-in chat web UI at `/`, no build step, embedded via
-`include_str!`; local single-user, one request at a time).
+`include_str!`; local single-user, one request at a time). The web UI
+ships an **expert Atlas** tab: it plots every routed expert from `/experts`
+by where its weights live (VRAM core / RAM-cache ring / disk rim), dot
+size tracking routing heat — instant on model load, no command or build
+step. Drop a `<model>.atlas.json` sidecar in place (from
+`scripts/atlas_build.py`: routes ~40 topic probes, diffs per-expert heat,
+PCA to 2D) and the view upgrades to a topic-affinity galaxy; the UI polls
+for the sidecar and swaps automatically when it appears.
 
 Done since: DSA lightning indexer (GLM contexts past 2048, batch scorer
 on tensor cores) · Kimi K2.7/deepseek2 with llama.cpp-exact YaRN ·
