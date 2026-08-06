@@ -2513,13 +2513,22 @@ mod real {
         // kernels decode as noise (poolside's Laguna ggufs ship ALL
         // attention projections in f16; same trap as the dspark drafts).
         // 1D f16 stays raw - callers that want it use read_f16_as_f32.
-        if t.ty == TensorType::F16 && t.dims.len() >= 2 {
+        // BF16 2D tensors get the SAME treatment: unsloth UD-* ships the
+        // Q8_K_XL compressor/indexer projections as BF16, and raw BF16
+        // bytes fed to q8_0 kernels are noise too (same 2-byte width,
+        // different exponent bias - bf16 values read as f16 scales +
+        // int8 quants decode to garbage and the model collapses at once).
+        if (t.ty == TensorType::F16 || t.ty == TensorType::BF16) && t.dims.len() >= 2 {
             let n = t.n_elements() as usize;
             let mut out = Vec::with_capacity(n / 32 * 34);
             let mut f = vec![0f32; 32];
             for blk in buf.chunks_exact(64) {
                 for (i, c) in blk.chunks_exact(2).enumerate() {
-                    f[i] = requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                    f[i] = if t.ty == TensorType::BF16 {
+                        quant::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))
+                    } else {
+                        requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))
+                    };
                 }
                 requant::quantize_q8_0(&f, &mut out);
             }

@@ -253,7 +253,10 @@ impl ChatMarkers {
             // think block - thinking stays off, ds4's default here)
             return Ok(ChatMarkers {
                 style: ChatStyle::Deepseek,
-                bos: Some(t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?),
+                // DeepSeek-V4-Flash GGUF: add_bos_token=false, bos_token_id=0
+                // IS the EOS (<|endoftext|>). Prepending it corrupts the turn
+                // structure and the model collapses on the first generation.
+                bos: None,
                 eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
                 eot: None,
                 user: find("<｜User｜>")?,
