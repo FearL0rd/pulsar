@@ -243,13 +243,13 @@ fn run() -> Result<(), String> {
         let row = dims[0];
         let ok = match want {
             TensorType::Q2K | TensorType::Q3K | TensorType::Q4K | TensorType::Q5K
-            | TensorType::Q6K | TensorType::IQ2XXS => row % 256 == 0,
-            TensorType::Q8_0 => row % 32 == 0,
+            | TensorType::Q6K | TensorType::IQ2XXS => row.is_multiple_of(256),
+            TensorType::Q8_0 => row.is_multiple_of(32),
             _ => true,
         };
         if ok {
             want
-        } else if row % 32 == 0 {
+        } else if row.is_multiple_of(32) {
             eprintln!("pulsar-quant: {name} width {row} not /256, falling back to q8_0");
             TensorType::Q8_0
         } else {
@@ -445,7 +445,7 @@ fn run() -> Result<(), String> {
     }
 
     let mut summary: Vec<_> = by_type.into_iter().collect();
-    summary.sort_by(|a, b| b.1.cmp(&a.1));
+    summary.sort_by_key(|e| std::cmp::Reverse(e.1));
     for (ty, b) in summary {
         eprintln!("pulsar-quant: {ty}: {:.2} GB", b as f64 / 1e9);
     }

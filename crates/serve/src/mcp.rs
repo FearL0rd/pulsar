@@ -365,7 +365,7 @@ impl McpHub {
                     "function": {
                         "name": ns,
                         "description": t.description.clone().unwrap_or_default(),
-                        "parameters": schema_value(&t),
+                        "parameters": schema_value(t),
                     }
                 }));
             }

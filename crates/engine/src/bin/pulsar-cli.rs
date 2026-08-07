@@ -436,10 +436,10 @@ fn run() -> engine::Result {
         return Ok(());
     }
 
-    let mut pos = prompt_ids.len() as u32;
+    let pos0 = prompt_ids.len() as u32;
     let mut generated = Vec::new();
     let t2 = std::time::Instant::now();
-    for _ in 0..n_predict {
+    for pos in pos0..pos0.saturating_add(n_predict as u32) {
         let l = logits.as_ref().ok_or("no logits")?;
         let next = engine::argmax(l);
         if tok.is_eog(next) {
@@ -453,7 +453,6 @@ fn run() -> engine::Result {
             break;
         }
         logits = model.forward_token(&mut st, next, pos, true)?;
-        pos += 1;
     }
     println!();
     if std::env::var_os("PULSAR_PROFILE").is_some() {

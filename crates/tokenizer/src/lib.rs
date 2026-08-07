@@ -849,7 +849,7 @@ impl Tokenizer {
             "<|user|>", "<|observation|>", "<|return|>", "[EOS]",
         ];
         for (i, tok) in tokens.iter().enumerate() {
-            if EOG_TEXTS.iter().any(|t| *t == tok.as_str()) {
+            if EOG_TEXTS.contains(&tok.as_str()) {
                 stop_ids.push(i as u32);
             }
         }
@@ -1000,7 +1000,7 @@ impl Tokenizer {
             for i in 0..sym.len().saturating_sub(1) {
                 let key = format!("{} {}", sym[i], sym[i + 1]);
                 if let Some(&rank) = self.merge_rank.get(&key) {
-                    if best.map_or(true, |(_, r)| rank < r) {
+                    if best.is_none_or(|(_, r)| rank < r) {
                         best = Some((i, rank));
                     }
                 }
@@ -1036,7 +1036,7 @@ impl Tokenizer {
             for i in 0..sym.len().saturating_sub(1) {
                 let key = format!("{} {}", sym[i], sym[i + 1]);
                 if let Some(&rank) = self.merge_rank.get(&key) {
-                    if best.map_or(true, |(_, r)| rank < r) {
+                    if best.is_none_or(|(_, r)| rank < r) {
                         best = Some((i, rank));
                     }
                 }
@@ -1350,11 +1350,6 @@ fn kimi_is_han(cp: u32) -> bool {
         | 0x2B820..=0x2CEAF | 0x2F800..=0x2FA1F)
 }
 
-/// kimi-k2 pre-tokenizer (K2 regex via llama.cpp's custom handler):
-/// Han runs split alone; letter runs EXCLUDE Han, may take one leading
-/// non-letter/non-number char and attach an English contraction; the
-/// digit/punct/whitespace tail matches glm4 exactly.
-
 /// minimax-m2/m3 pre-tokenizer: kimi-k2's letter/contraction/digit/ws
 /// rules WITHOUT the Han split (Han joins letter runs), and punct runs
 /// absorb trailing '/' as well as newlines.
@@ -1537,6 +1532,10 @@ fn pretokenize_qwen2(s: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+/// kimi-k2 pre-tokenizer (K2 regex via llama.cpp's custom handler):
+/// Han runs split alone; letter runs EXCLUDE Han, may take one leading
+/// non-letter/non-number char and attach an English contraction; the
+/// digit/punct/whitespace tail matches glm4 exactly.
 fn pretokenize_kimi_k2(s: &[u8]) -> Vec<&[u8]> {
     let len = s.len();
     let mut out = Vec::new();

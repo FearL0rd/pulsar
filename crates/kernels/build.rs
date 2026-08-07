@@ -38,7 +38,7 @@ fn main() {
     // CUDA 12.0 caps at gcc 12 while distro c++ is gcc 13). Probe a tiny
     // compile with candidate ccbins and take the first one nvcc accepts.
     if let Some(ccbin) = pick_ccbin() {
-        build.flag(&format!("-ccbin={ccbin}"));
+        build.flag(format!("-ccbin={ccbin}"));
     }
     let list: Vec<&str> = archs
         .iter()

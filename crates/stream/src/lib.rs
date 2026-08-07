@@ -194,8 +194,7 @@ pub mod uring {
                 let r = reads[next];
                 let aligned_off = r.offset & !(align - 1);
                 let payload_off = (r.offset - aligned_off) as usize;
-                let disk_len =
-                    ((payload_off as u64 + r.len + align - 1) / align) * align;
+                let disk_len = (payload_off as u64 + r.len).div_ceil(align) * align;
                 let slot = slots
                     .iter()
                     .position(|s| s.is_none())

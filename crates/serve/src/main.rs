@@ -709,15 +709,16 @@ fn run() -> engine::Result {
                         let cfg = v
                             .get("config")
                             .and_then(|c| serde_json::from_value::<mcp::McpServerCfg>(c.clone()).ok());
-                        if name.is_empty() || cfg.is_none() {
-                            respond_json(
+                        match cfg {
+                            Some(cfg) if !name.is_empty() => {
+                                m.upsert_server(&name, cfg);
+                                respond_json(&mut stream, 200, &m.status_json())
+                            }
+                            _ => respond_json(
                                 &mut stream,
                                 400,
                                 &serde_json::json!({"error": {"message": "invalid server config"}}),
-                            )
-                        } else {
-                            m.upsert_server(&name, cfg.unwrap());
-                            respond_json(&mut stream, 200, &m.status_json())
+                            ),
                         }
                     }
                     None => respond_json(
@@ -852,7 +853,7 @@ fn host_allowed(host: Option<&str>, allowed: Option<&Vec<String>>) -> bool {
     let Some(allowed) = allowed else { return true };
     let Some(h) = host else { return true };
     let h = h.to_ascii_lowercase();
-    allowed.iter().any(|a| *a == h)
+    allowed.contains(&h)
 }
 
 /// True when a POST may proceed: either it carries no `Origin` (every
@@ -1389,6 +1390,7 @@ fn prefix_common(
     Ok(common)
 }
 
+#[allow(clippy::too_many_arguments)] // one call site; the request fields do not want a struct
 fn handle_chat(
     stream: &mut std::net::TcpStream,
     body: &[u8],
@@ -1864,7 +1866,7 @@ fn handle_chat(
                 }));
             }
             last_finish = "tool_calls";
-            prev_calls = calls.iter().cloned().collect();
+            prev_calls = calls.to_vec();
         }
         let mut message = serde_json::json!({"role": "assistant", "content": clean});
         if !reasoning.is_empty() {

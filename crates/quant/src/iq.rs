@@ -75,8 +75,8 @@ pub fn tables() -> &'static Iq2Tables {
         // NWANT smallest distinct distances, sorted by (d2, index)
         let mut neighbours = Vec::new();
         let mut dist: Vec<(i32, usize)> = Vec::with_capacity(256);
-        for i in 0..KMAP_SIZE {
-            if kmap[i] >= 0 {
+        for (i, km) in kmap.iter_mut().enumerate() {
+            if *km >= 0 {
                 continue;
             }
             let mut pos = [0i32; 8];
@@ -108,7 +108,7 @@ pub fn tables() -> &'static Iq2Tables {
                 n += 1;
             }
             neighbours[start] = n;
-            kmap[i] = -((start + 1) as i32);
+            *km = -((start + 1) as i32);
         }
         Iq2Tables { grid, kmap, neighbours }
     })
@@ -130,7 +130,7 @@ fn make_qp_quants(n: usize, nmax: i32, x: &[f32], ls: &mut [u8], qw: &[f32]) -> 
         return 0.0;
     }
     let mut iscale = nmax as f32 / max;
-    let mut scale = 1.0 / iscale;
+    let scale = 1.0 / iscale;
     let mut best_mse = 0f32;
     for i in 0..n {
         let l = nearest_int(iscale * x[i]).min(nmax);
@@ -366,8 +366,8 @@ pub fn quantize_row_iq2_xxs(x: &[f32], qw: &[f32], out: &mut Vec<u8>) {
             }
             if scale < 0.0 {
                 scale = -scale;
-                for k in 0..4 {
-                    block_signs[k] = !block_signs[k] & 127;
+                for bs in &mut block_signs {
+                    *bs = !*bs & 127;
                 }
             }
             for k in 0..4 {
@@ -512,9 +512,9 @@ mod tests {
                 for k in 0..4 {
                     let g = grid[((a0 >> (8 * k)) & 255) as usize].to_le_bytes();
                     let signs = ksigns[((a1 >> (7 * k)) & 127) as usize];
-                    for i in 0..8 {
+                    for (i, &gv) in g.iter().enumerate() {
                         let s = if signs & (1 << i) != 0 { -1.0 } else { 1.0 };
-                        out.push(db * g[i] as f32 * s);
+                        out.push(db * gv as f32 * s);
                     }
                 }
             }

@@ -614,7 +614,7 @@ mod real {
         /// True when this tensor should stay native: a K-quant with a
         /// warp-cooperative dot and a 256-divisible contraction dim.
         fn keep_native(t: &TensorInfo) -> bool {
-            matches!(t.ty, TensorType::Q4K | TensorType::Q6K) && t.dims[0] % 256 == 0
+            matches!(t.ty, TensorType::Q4K | TensorType::Q6K) && t.dims[0].is_multiple_of(256)
         }
 
         fn load(file: &VFile, g: &Gguf, name: &str) -> Result<MatW> {
@@ -627,6 +627,7 @@ mod real {
         }
     }
 
+    #[allow(clippy::large_enum_variant)] // one Ffn per layer; boxing would indirect the decode hot path
     enum Ffn {
         Dense {
             gate: DeviceBuf,
@@ -921,7 +922,7 @@ mod real {
     /// layer 6 run the full indexer; the layers between reuse the last
     /// indexer layer's selection (verbatim from ds4).
     fn uses_full_indexer(il: usize, n_leading_dense: u32) -> bool {
-        il < n_leading_dense as usize || (il >= 6 && (il - 6) % 4 == 0)
+        il < n_leading_dense as usize || (il >= 6 && (il - 6).is_multiple_of(4))
     }
 
     /// gpt-oss attention biases, all f32. Every other arch here projects
@@ -1613,7 +1614,7 @@ mod real {
             }
             let gid = self.next_group;
             self.next_group = self.next_group.wrapping_add(1).max(1);
-            for (j, (i, off, payload)) in need.iter().enumerate() {
+            for (i, off, payload) in need.iter() {
                 let slot = self.free_list.pop().ok_or("triple admit: free_list empty")?;
                 let base = slot as usize * self.slab_bytes;
                 self.pool.write(base, payload)?;
@@ -2021,17 +2022,6 @@ mod real {
                 pool.submit(jobs)
             }
 
-            /// debug: (first mids, per-expert slot weights, expert order)
-            pub fn dbg(&self) -> (Vec<f32>, Vec<Vec<f32>>, Vec<i32>) {
-                let mut order: Vec<(i32, usize)> = self.idx.iter().map(|(&e, &ci)| (e, ci)).collect();
-                order.sort_by_key(|&(_, ci)| ci);
-                (
-                    self.mids.iter().take(4).copied().collect(),
-                    self.pairs.iter().map(|p| p.iter().map(|x| x.1).collect()).collect(),
-                    order.into_iter().map(|(e, _)| e).collect(),
-                )
-            }
-
             /// after the stage-A join: quantize mids, run the down-proj
             /// fan-out, return the per-token f32 partial [n_tok * ne]
             pub fn finish(&self, pool: &Pool, n_tok: usize) -> Vec<f32> {
@@ -2112,7 +2102,7 @@ mod real {
             match op {
                 1 => {
                     0.5 * g
-                        * (1.0 + (0.797_884_560_802_865_4_f32 * (g + 0.044715 * g * g * g)).tanh())
+                        * (1.0 + (0.797_884_6_f32 * (g + 0.044715 * g * g * g)).tanh())
                         * u
                 }
                 2 => {
@@ -2250,7 +2240,7 @@ mod real {
                 }
             }
         }
-        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        rows.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
         rows.truncate(4096);
         let mut out = format!("# n_layer={n_layer} n_expert={n_expert}\n");
         for (_, line) in rows {
@@ -2447,7 +2437,7 @@ mod real {
                         let (ql, qh) = (&ql[chunk * 64..], &qh[chunk * 32..]);
                         let sc = &scales[chunk * 8..];
                         for l in 0..32 {
-                            let q0 = ((ql[l] & 0x0f) as i32 | (((qh[l] >> 0) & 3) as i32) << 4) - 32;
+                            let q0 = ((ql[l] & 0x0f) as i32 | ((qh[l] & 3) as i32) << 4) - 32;
                             let q1 = ((ql[32 + l] & 0x0f) as i32 | (((qh[l] >> 2) & 3) as i32) << 4) - 32;
                             let q2 = ((ql[l] >> 4) as i32 | (((qh[l] >> 4) & 3) as i32) << 4) - 32;
                             let q3 = ((ql[32 + l] >> 4) as i32 | (((qh[l] >> 6) & 3) as i32) << 4) - 32;
@@ -2532,7 +2522,7 @@ mod real {
                 }
                 requant::quantize_q8_0(&f, &mut out);
             }
-            if n % 32 != 0 {
+            if !n.is_multiple_of(32) {
                 return Err(format!("{name}: f16 width not a multiple of 32").into());
             }
             return Ok(out);
@@ -2658,7 +2648,7 @@ mod real {
                 // 34-bytes-per-32; a width that is not a multiple of 32
                 // would otherwise short-read
                 let bytes = t.byte_size().ok_or_else(|| meta_err(name))? as usize;
-                if n % 32 != 0 {
+                if !n.is_multiple_of(32) {
                     return Err(format!("{name}: q8_0 width {n} not a multiple of 32").into());
                 }
                 let mut buf = vec![0u8; bytes];
@@ -2867,7 +2857,7 @@ mod real {
                 let sufs = if shape.family == Family::K3 { K3_SUF } else { MLA_SUF };
                 let mut lb = vec![0u64; shape.n_exec_layer as usize];
                 for il in 0..shape.n_exec_layer {
-                    for suf in sufs.iter().copied() {
+                    for suf in sufs {
                         if let Some(ti) = gguf.tensor(&format!("blk.{il}.{suf}")) {
                             lb[il as usize] += ti.byte_size().unwrap_or(0);
                         }
@@ -2877,7 +2867,7 @@ mod real {
                     .filter(|&d| d != primary)
                     .filter_map(|d| kernels::mem_info(d).ok().map(|(f, _)| (f, d)))
                     .collect();
-                cards.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                cards.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
                 // CUDA context + per-card scratch/hop buffers + slack; KV
                 // and idx cache sizes are ctx-dependent and resolved at
                 // State::new, which fails with a clear message when the
@@ -4060,8 +4050,8 @@ mod real {
                 }
             }
         }
-        triples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        sink_triples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        triples.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
+        sink_triples.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
         triples.extend(sink_triples);
         if triples.is_empty() {
             // fully-resident model (DenseKq): a tier would just grab the
@@ -4266,20 +4256,10 @@ mod real {
         // MLA scratch (dummies for Gqa); on the attn GPU when one is set
         q_rank: DeviceBuf,
         q_rank_norm: DeviceBuf,
-        kv_raw: DeviceBuf,
-        kv_norm: DeviceBuf,
-        qk_low: DeviceBuf,
-        mla_selected: DeviceBuf,
-        // DSA indexer scratch (1-float dummies when absent): per-indexer-
-        // layer K caches + q/weights/scores; selection count persists
-        // across layers so non-indexer layers reuse the last list
+        // DSA indexer K caches (1-float dummies when absent); selection
+        // count persists across layers so non-indexer layers reuse the
+        // last list
         idx_kcache: Vec<DeviceBuf>,
-        idx_kraw: DeviceBuf,
-        /// f16 staging for the tensor-core batch scorer
-        idx_q16: DeviceBuf,
-        idx_q: DeviceBuf,
-        idx_w: DeviceBuf,
-        idx_scores: DeviceBuf,
         idx_last_sel: u32,
         // attn-GPU hop buffers (1-float dummies otherwise): normed input
         // copied primary->attn GPU, attn output copied back
@@ -4426,7 +4406,7 @@ mod real {
         /// Restore the latest checkpoint at or before `upto`; drops the
         /// ones past it (their content no longer matches the stream).
         /// Returns the restored position.
-        pub fn restore_nearest_ckpt(&mut self, m: &Model, upto: u32) -> Result<Option<u32>> {
+        pub fn restore_nearest_ckpt(&mut self, _m: &Model, upto: u32) -> Result<Option<u32>> {
             let Some(i) = self
                 .ckpts
                 .iter()
@@ -4483,8 +4463,7 @@ mod real {
                 out.extend_from_slice(&host);
                 Ok(())
             };
-            for il in 0..s.n_exec_layer as usize {
-                let (n_comp, _) = counts[il];
+            for (il, &(n_comp, _)) in counts.iter().enumerate().take(s.n_exec_layer as usize) {
                 put(&mut out, &self.kcache[il], self.kcache[il].bytes())?;
                 put(&mut out, &self.vcache[il], n_comp as usize * s.head_dim as usize * 4)?;
                 let ik = &self.idx_kcache[il];
@@ -4707,7 +4686,7 @@ mod real {
                 .into_iter()
                 .map(|(off, (len, count))| (count, off, len))
                 .collect();
-            entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            entries.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
             let mut bytes = Vec::with_capacity(entries.len() * 24);
             for (count, off, len) in &entries {
                 bytes.extend_from_slice(&off.to_le_bytes());
@@ -4797,7 +4776,7 @@ mod real {
                     }
                 }
             }
-            triples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            triples.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
             // seed touch for every census entry (including slabs not in a triple)
             for (&off, &(count, len)) in &heat {
                 if in_tier(off) {
@@ -4837,7 +4816,7 @@ mod real {
                 .filter(|(&off, _)| !covered.contains(&off) && !in_tier(off))
                 .map(|(&off, &(count, len))| (count, off, len))
                 .collect();
-            extras.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            extras.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
             for &(_c, offset, len) in &extras {
                 if host_bytes + len > host_budget {
                     break;
@@ -4958,7 +4937,7 @@ mod real {
                             (s.n_kv_lora + s.qk_rope) as usize * ctx as usize * 4
                         } else if s.family == Family::Qwen35 {
                             if i == s.n_exec_layer as usize
-                                || (i as u32 + 1) % s.full_attn_interval == 0
+                                || (i as u32 + 1).is_multiple_of(s.full_attn_interval)
                             {
                                 2 * s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4
                             } else {
@@ -4968,7 +4947,7 @@ mod real {
                             // raw SWA ring + compressed rows (vcache) are
                             // both flat head_dim-wide latent rows in f32
                             let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
-                            let comp = if ratio > 0 { ctx as usize / ratio + 2 } else { 0 };
+                            let comp = (ctx as usize).checked_div(ratio).map_or(0, |c| c + 2);
                             (s.n_swa as usize + comp) * s.head_dim as usize * 4
                         } else {
                             let (hkv, hd) = match m.geom.get(i) {
@@ -5009,7 +4988,7 @@ mod real {
                     Some("q4_0") | Some("q4") => (5, false),
                     Some("turbo8") | Some("rotq8") | Some("turboq8") => (4, true),
                     Some("turbo4") | Some("rotq4") | Some("turboq4") => (5, true),
-                    None => {
+                    None
                         // A too-big f32 KV never OOMs on a streaming model -
                         // it silently eats the expert cache instead (measured:
                         // gpt-oss ctx 131072 one card, f32 left 0.4GB of
@@ -5019,8 +4998,7 @@ mod real {
                         // the KV card's free VRAM, default to fp8. The 2GB
                         // absolute floor keeps small-ctx runs (bench.sh 512,
                         // check.sh 256) on the bit-exact f32 path.
-                        if kv_auto_fp8(kv_f32_total()) { (1, false) } else { (0, false) }
-                    }
+                        if kv_auto_fp8(kv_f32_total()) => { (1, false) }
                     _ => (0, false),
                 };
                 // Rotation writes head_dim-strided vectors into qrot, which is
@@ -5126,14 +5104,14 @@ mod real {
                         (0..s.n_exec_layer as usize + usize::from(m.mtp.is_some()))
                             .map(|i| {
                                 let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
-                                let comp = if ratio > 0 { ctx as usize / ratio + 2 } else { 0 };
+                                let comp = (ctx as usize).checked_div(ratio).map_or(0, |c| c + 2);
                                 (s.n_swa as usize + comp) * s.head_dim as usize * 4
                             })
                             .sum(),
                         (0..s.n_exec_layer as usize + usize::from(m.mtp.is_some()))
                             .map(|i| {
                                 let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
-                                let comp = if ratio > 0 { ctx as usize / ratio + 2 } else { 0 };
+                                let comp = (ctx as usize).checked_div(ratio).map_or(0, |c| c + 2);
                                 (s.n_swa as usize + comp) * kv_row(s.head_dim as usize)
                             })
                             .sum(),
@@ -5171,7 +5149,7 @@ mod real {
                     eprintln!(
                         "pulsar: block-KV head_dim={} ({}divisible by 32)",
                         s.head_dim,
-                        if s.head_dim % 32 == 0 { "" } else { "NOT " }
+                        if s.head_dim.is_multiple_of(32) { "" } else { "NOT " }
                     );
                 }
                 if kvq_rot {
@@ -5263,7 +5241,7 @@ mod real {
                 let (kb, vb) = if s.family == Family::Qwen35 {
                     // only full-attention layers hold KV; the nextn/MTP
                     // draft slot is a full-attention layer too
-                    if i == s.n_exec_layer as usize || (i as u32 + 1) % s.full_attn_interval == 0 {
+                    if i == s.n_exec_layer as usize || (i as u32 + 1).is_multiple_of(s.full_attn_interval) {
                         (k_bytes, v_bytes)
                     } else {
                         (4, 4)
@@ -5276,11 +5254,9 @@ mod real {
                     if is_mla { (k_bytes, v_bytes) } else { (4, 4) }
                 } else if s.family == Family::Dsv4 {
                     let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
-                    let comp = if ratio > 0 {
-                        (ctx as usize / ratio + 2) * kv_row(s.head_dim as usize)
-                    } else {
-                        4
-                    };
+                    let comp = (ctx as usize)
+                        .checked_div(ratio)
+                        .map_or(4, |c| (c + 2) * kv_row(s.head_dim as usize));
                     (k_bytes, comp)
                 } else {
                     match m.geom.get(i) {
@@ -5316,10 +5292,6 @@ mod real {
             let heads = f32s(if mla { 1 } else { mb * s.heads_dim().max(s.n_head * s.head_dim) })?;
             let q_rank = f32s(if mla { 1 } else { mb * s.n_lora_q.max(1) })?;
             let q_rank_norm = f32s(if mla { 1 } else { mb * s.n_lora_q.max(1) })?;
-            let kv_raw = f32s(if mla { 1 } else { mb * (s.n_kv_lora + s.qk_rope).max(1) })?;
-            let kv_norm = f32s(if mla { 1 } else { mb * s.n_kv_lora.max(1) })?;
-            let qk_low = f32s(if mla { 1 } else { mb * s.n_head * s.n_kv_lora.max(1) })?;
-            let mla_selected = DeviceBuf::alloc(if mla { 4 } else { mb as usize * ctx as usize * 4 })?;
             // DSA indexer buffers live beside the attn stack (same device)
             let has_idx = s.n_idx_topk > 0 && s.family == Family::Mla;
             let mut idx_kcache = Vec::new();
@@ -5343,11 +5315,6 @@ mod real {
             if attn_split {
                 kernels::set_device(m.attn_dev.unwrap_or(primary))?;
             }
-            let idx_kraw = f32s(if has_idx && !mla { mb * s.n_idx_dim } else { 1 })?;
-            let idx_q = f32s(if has_idx && !mla { mb * s.n_idx_head * s.n_idx_dim } else { 1 })?;
-            let idx_q16 = DeviceBuf::alloc(if has_idx && !mla { (mb * s.n_idx_head * s.n_idx_dim) as usize * 2 } else { 1 })?;
-            let idx_w = f32s(if has_idx && !mla { mb * s.n_idx_head } else { 1 })?;
-            let idx_scores = f32s(if has_idx && !mla { mb * ctx } else { 1 })?;
             // per-owner attention scratch (Mla only; see MlaScratch)
             let mut attn_sc: Vec<MlaScratch> = Vec::new();
             if mla {
@@ -5602,18 +5569,9 @@ mod real {
                 },
                 q_rank,
                 q_rank_norm,
-                kv_raw,
-                kv_norm,
-                qk_low,
-                mla_selected,
                 attn_sc,
                 sel_dev: -1,
                 idx_kcache,
-                idx_kraw,
-                idx_q16,
-                idx_q,
-                idx_w,
-                idx_scores,
                 idx_last_sel: 0,
                 normed_a,
                 attn_out_a,
@@ -5807,7 +5765,7 @@ mod real {
                         .chain(st.vcache.iter())
                         .map(|b| b.bytes())
                         .sum();
-                    let kv_on_primary = m.attn_dev.map_or(true, |d| d == primary) && !dense_split;
+                    let kv_on_primary = m.attn_dev.is_none_or(|d| d == primary) && !dense_split;
                     if kv_on_primary
                         && (st.max_batch <= 16 || dev_bytes < (1 << 30))
                         && kv_here > (free + kv_here) / 3
@@ -6085,7 +6043,7 @@ mod real {
                         let rot = if gm.is_some() { hd } else { s.rot_dim };
                         let factors = gm
                             .filter(|g| g.factors)
-                            .and_then(|_| self.rope_factors.as_ref());
+                            .and(self.rope_factors.as_ref());
                         // Gqa attn offload (opt-in): hop the normed input
                         // over and run the whole segment on the attn card,
                         // exactly like the Mla path below
@@ -6295,7 +6253,7 @@ mod real {
                         // over when off-primary. Blocking copies are
                         // legacy-stream ordered on the issuing device, so
                         // producer kernels have landed before they run.
-                        let a_dev = self.attn_layer_dev.get(il as usize).copied().unwrap_or(primary);
+                        let a_dev = self.attn_layer_dev.get(il).copied().unwrap_or(primary);
                         let sci = st
                             .attn_sc
                             .iter()
@@ -6828,8 +6786,8 @@ mod real {
                         let cpu_on = st.cpu_pool.is_some()
                             && n_tok <= 8
                             && !st.unified
-                            && s.n_embd % 256 == 0
-                            && s.n_ff_exp % 256 == 0
+                            && s.n_embd.is_multiple_of(256)
+                            && s.n_ff_exp.is_multiple_of(256)
                             && gate_exps.quant == up_exps.quant
                             && [gate_exps.quant, down_exps.quant]
                                 .iter()
@@ -7050,7 +7008,6 @@ mod real {
                         let unified = st.unified;
                         let async_h2d = st.async_expert_h2d;
                         let mut h2d = std::time::Duration::ZERO;
-                        let mut fetch_wait = std::time::Duration::ZERO;
                         let mut async_queued = false;
                         // TRIED AND REVERTED (2026-07-25): splitting this into
                         // two waves - launch the experts the host store already
@@ -7091,11 +7048,11 @@ mod real {
                         // primary MoE, so it just moves them under a different
                         // shadow.
                         let t_host = std::time::Instant::now();
-                        {
+                        let fetch_wait = {
                             let dev_cache = &mut st.dev_cache;
                             let staging = &mut st.staging;
                             let expert_h2d = &st.expert_h2d;
-                            fetch_wait = st.store.ensure_with(&wants, |off, payload| {
+                            st.store.ensure_with(&wants, |off, payload| {
                                 if unified {
                                     resolved.insert(
                                         off,
@@ -7134,8 +7091,8 @@ mod real {
                                 h2d += t.elapsed();
                                 resolved.insert(off, p);
                                 Ok(())
-                            })?;
-                        }
+                            })?
+                        };
                         let ensure_elapsed = t_host.elapsed();
                         // disk-fetch (pure io_uring wait) split into its own bucket;
                         // host = ensure wall minus h2d copies and the disk wait,
@@ -7280,7 +7237,7 @@ mod real {
                         let grouped = n_tok >= 16 && s.n_expert_used <= 16 && smem_ok
                             // grouped down stages rows in smem with no
                             // slack for the sub-block tail overread
-                            && s.n_ff_exp % 256 == 0
+                            && s.n_ff_exp.is_multiple_of(256)
                             && std::env::var_os("PULSAR_NO_GROUPED").is_none();
                         let mut n_group = 0u32;
                         if grouped {

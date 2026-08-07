@@ -52,6 +52,6 @@ fn parses_hy3_production_header() {
         assert_eq!(t.byte_size().unwrap(), slab, "layer {il} slab mismatch");
     }
 
-    assert!(g.data_offset % g.alignment == 0);
+    assert!(g.data_offset.is_multiple_of(g.alignment));
     assert!(g.tensors.len() > 900, "expected ~1k tensors, got {}", g.tensors.len());
 }

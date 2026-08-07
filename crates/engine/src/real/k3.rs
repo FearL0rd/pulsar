@@ -15,8 +15,8 @@
 //! them. Rather than branch the hot MLA kernel, we hand it a rope config
 //! whose rotation IS the identity: with ext_factor 0 the kernel takes
 //! theta = freq_scale * theta_extrap, so freq_scale 0 gives theta 0, and
-//! with attn_factor 1 that is exactly cos 1 / sin 0. Not an approximation
-//! - see mla_rope_yarn in mla_kernels.inc. The q-side tail is simply
+//! with attn_factor 1 that is exactly cos 1 / sin 0. Not an approximation;
+//! see mla_rope_yarn in mla_kernels.inc. The q-side tail is simply
 //! never passed through mla_rope_tail.
 
 use super::{Attn, Ffn, K3W, LayerW, MatW, Model, Result, State};
@@ -221,7 +221,7 @@ impl K3Rt {
         }
 
         // one scratch set per card any layer actually lands on
-        let mut devs: Vec<i32> = m.attn_layer_dev.iter().copied().collect();
+        let mut devs: Vec<i32> = m.attn_layer_dev.to_vec();
         devs.push(primary);
         devs.sort_unstable();
         devs.dedup();
@@ -331,7 +331,7 @@ impl Model {
             kernels::k3_attn_res(
                 &mut rt.mixed,
                 &st.cur,
-                Some(&rt.ckpt).filter(|_| rt.n_ckpt > 0),
+                (rt.n_ckpt > 0).then_some(&rt.ckpt),
                 w,
                 1,
                 s.n_embd,
@@ -359,12 +359,12 @@ impl Model {
         // ---- AttnRes mix #1, then bank this layer's RAW input.
         // Order matters: the checkpoint is the raw residual entering the
         // layer, not the mixed value the layer goes on to read.
-        let banked = s.attn_res_block > 0 && il % s.attn_res_block as usize == 0;
+        let banked = s.attn_res_block > 0 && il.is_multiple_of(s.attn_res_block as usize);
         if s.attn_res_block > 0 {
             kernels::k3_attn_res(
                 &mut rt.mixed,
                 &st.cur,
-                Some(&rt.ckpt).filter(|_| rt.n_ckpt > 0),
+                (rt.n_ckpt > 0).then_some(&rt.ckpt),
                 &w.attn_res_score,
                 1,
                 n_embd,
@@ -547,7 +547,7 @@ impl Model {
             kernels::k3_attn_res(
                 &mut rt.mixed,
                 &st.after_attn,
-                Some(&rt.ckpt).filter(|_| rt.n_ckpt > 0),
+                (rt.n_ckpt > 0).then_some(&rt.ckpt),
                 &w.ffn_res_score,
                 1,
                 n_embd,

@@ -807,6 +807,7 @@ mod real {
     /// DSpark fused markov argmax over one logits row: returns
     /// argmax_v logits[row_off + v] + q8dot(w2[v], state). `scratch` needs
     /// 128 * 8 bytes; `out` 4 bytes (device); the id is read back here.
+    #[allow(clippy::too_many_arguments)] // kernel launch mirrors the CUDA signature
     pub fn dspark_markov_argmax(
         logits: &DeviceBuf,
         row_off_elems: usize,
@@ -1030,6 +1031,7 @@ mod real {
         check(unsafe { pulsar_gqa_head_rms_norm(x.ptr_mut(), w.map_or(std::ptr::null(), |b| b.ptr()), rows, head_dim, eps) }, "gqa_head_rms_norm")
     }
 
+    #[allow(clippy::too_many_arguments)] // kernel launch mirrors the CUDA signature
     pub fn gqa_rope(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: Option<&DeviceBuf>) -> Result {
         check(unsafe { pulsar_gqa_rope(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos0, theta, factors.map_or(std::ptr::null(), |b| b.ptr())) }, "gqa_rope")
     }
@@ -1199,6 +1201,7 @@ mod real {
     /// Store one dsv4 latent row into a ring/comp slot, quantized per kvq
     /// (0 f32, 1 fp8, 2 fp16, 3 int8, 4 q8_0, 5 q4_0) with optional turbo
     /// (pi rotation for block formats).
+    #[allow(clippy::too_many_arguments)] // kernel launch mirrors the CUDA signature
     pub fn dsv4_kv_store(dst: &mut DeviceBuf, dst_off: usize, src: &DeviceBuf, src_off: usize, head_dim: u32, kvq: u32, turbo: u32, pi: Option<&DeviceBuf>) -> Result {
         let dst_ptr = unsafe { (dst.ptr_mut() as *mut u8).add(dst_off) as *mut c_void };
         let src_ptr = unsafe { (src.ptr() as *const u8).add(src_off) as *const c_void };
@@ -1462,8 +1465,8 @@ mod tests {
         super::add(&mut dy, &da, &db, 1024).unwrap();
         super::sync().unwrap();
         let y = dy.read_f32(1024).unwrap();
-        for i in 0..1024 {
-            assert_eq!(y[i], 3.0 * i as f32);
+        for (i, &v) in y.iter().enumerate() {
+            assert_eq!(v, 3.0 * i as f32);
         }
     }
 }

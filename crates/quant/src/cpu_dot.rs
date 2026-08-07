@@ -32,7 +32,7 @@ pub fn quantize_row_q8_k(x: &[f32]) -> Q8KRow {
         let amax = b.iter().fold(0f32, |a, &v| a.max(v.abs()));
         if amax == 0.0 {
             d.push(0.0);
-            qs.extend(std::iter::repeat(0i8).take(QK_K));
+            qs.extend(std::iter::repeat_n(0i8, QK_K));
             continue;
         }
         let scale = amax / 127.0;
@@ -54,20 +54,19 @@ fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits & 0x8000) as u32) << 16;
     let exp = ((bits >> 10) & 0x1f) as u32;
     let man = (bits & 0x3ff) as u32;
-    let f = if exp == 0 {
+    if exp == 0 {
         f32::from_bits(sign | 0x3880_0000) * (man as f32 / 1024.0)
     } else if exp == 31 {
         f32::from_bits(sign | 0x7f80_0000 | (man << 13))
     } else {
         f32::from_bits(sign | ((exp + 112) << 23) | (man << 13))
-    };
-    f
+    }
 }
 
 /// full 8-bit sign mask from the stored 7 bits (bit 7 keeps popcount even)
 #[inline]
 fn sign_mask(s7: u32) -> u32 {
-    s7 | (((s7.count_ones() & 1) as u32) << 7)
+    s7 | ((s7.count_ones() & 1) << 7)
 }
 
 /// One expert row (n columns, iq2_xxs) dotted against a q8_K activation
@@ -781,8 +780,8 @@ pub fn dequant_row_iq2_xxs(row: &[u8], n: usize, out: &mut Vec<f32>) {
             for k in 0..4 {
                 let g = grid[((aux0 >> (8 * k)) & 0xff) as usize].to_le_bytes();
                 let sm = sign_mask((aux1 >> (7 * k)) & 127);
-                for i in 0..8 {
-                    let v = db * g[i] as i8 as f32;
+                for (i, &gb) in g.iter().enumerate() {
+                    let v = db * gb as i8 as f32;
                     out.push(if (sm >> i) & 1 == 1 { -v } else { v });
                 }
             }
@@ -839,9 +838,9 @@ mod tests {
         let mut deq = Vec::new();
         dequant_row_iq2_xxs(&row, n, &mut deq);
         let mut reference = 0f64;
-        for i in 0..n {
+        for (i, &dv) in deq.iter().enumerate() {
             let a = xq.d[i / QK_K] as f64 * xq.qs[i] as f64;
-            reference += deq[i] as f64 * a;
+            reference += dv as f64 * a;
         }
         let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
         assert!(rel < 1e-4, "dot {got} vs reference {reference} (rel {rel})");
@@ -860,12 +859,12 @@ mod tests {
             let (sc, q2) = (&blk[..16], &blk[16..80]);
             let xd = f16_to_f32(u16::from_le_bytes([blk[80], blk[81]]));
             let xmin = f16_to_f32(u16::from_le_bytes([blk[82], blk[83]]));
-            for c in 0..16 {
+            for (c, &scb) in sc.iter().enumerate() {
                 let (k, js, half) = (c / 8, (c % 8) / 2, c % 2);
                 for i in 0..16 {
                     let q = (q2[32 * k + 16 * half + i] >> (2 * js)) & 3;
                     out.push(
-                        xd * (sc[c] & 0x0f) as f32 * q as f32 - xmin * (sc[c] >> 4) as f32,
+                        xd * (scb & 0x0f) as f32 * q as f32 - xmin * (scb >> 4) as f32,
                     );
                 }
             }
@@ -894,8 +893,8 @@ mod tests {
         let mut deq = Vec::new();
         dequant_q2_k(&row, n, &mut deq);
         let mut reference = 0f64;
-        for i in 0..n {
-            reference += deq[i] as f64 * (xq.d[i / QK_K] as f64 * xq.qs[i] as f64);
+        for (i, &dv) in deq.iter().enumerate() {
+            reference += dv as f64 * (xq.d[i / QK_K] as f64 * xq.qs[i] as f64);
         }
         let rel = ((got as f64 - reference) / reference.abs().max(1e-6)).abs();
         assert!(rel < 1e-4, "q2k dot {got} vs reference {reference} (rel {rel})");
@@ -925,7 +924,7 @@ mod tests {
             let (hm, q3) = (&blk[..32], &blk[32..96]);
             let xd = f16_to_f32(u16::from_le_bytes([blk[108], blk[109]])) as f64;
             let sc = k3_scales(&blk[96..108]);
-            for c in 0..16 {
+            for (c, &scv) in sc.iter().enumerate() {
                 let (k, js, half) = (c / 8, (c % 8) / 2, c % 2);
                 for i in 0..16 {
                     let l = half * 16 + i;
@@ -933,7 +932,7 @@ mod tests {
                     if hm[l] & (1 << (4 * k + js)) == 0 {
                         q -= 4;
                     }
-                    let v = xd * sc[c] as f64 * q as f64;
+                    let v = xd * scv as f64 * q as f64;
                     let idx = ibl * QK_K + 16 * c + i;
                     reference += v * (xq.d[idx / QK_K] as f64 * xq.qs[idx] as f64);
                 }
@@ -1015,8 +1014,8 @@ mod tests {
                     let gr = grid[(q & 511) as usize].to_le_bytes();
                     let sm = sign_mask((q >> 9) as u32);
                     let ls = if j < 2 { 2 * (sc & 0x0f) + 1 } else { 2 * (sc >> 4) + 1 } as f64;
-                    for i in 0..8 {
-                        let w = gr[i] as i8 as f64 * if (sm >> i) & 1 == 1 { -1.0 } else { 1.0 };
+                    for (i, &gv) in gr.iter().enumerate() {
+                        let w = gv as i8 as f64 * if (sm >> i) & 1 == 1 { -1.0 } else { 1.0 };
                         let idx = ibl * QK_K + 32 * g + 8 * j + i;
                         reference += 0.125 * xd * ls * w
                             * (xq.d[idx / QK_K] as f64 * xq.qs[idx] as f64);

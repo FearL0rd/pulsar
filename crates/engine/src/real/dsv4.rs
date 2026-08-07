@@ -31,7 +31,7 @@ const NEG_INF: f32 = -1.0e30; // DS4_NEG_INF (finite on purpose)
 /// Batched prefill chunk width (matches the qwen35 blueprint; the
 /// per-token interleave keeps the SWA ring correct within a chunk).
 const T_MAX: usize = 16;
-const ROUTER_FLOOR: f32 = 6.103515625e-5;
+const ROUTER_FLOOR: f32 = 6.103_515_6e-5;
 
 /* ---- host float helpers (reference math) ------------------------------- */
 
@@ -141,8 +141,8 @@ fn round_half_even(x: f32) -> i32 {
 #[allow(dead_code)] // host reference, exercised by the unit tests
 fn e4m3_enc(x: f32) -> u8 {
     let (s, x) = if x < 0.0 { (0x80u8, -x) } else { (0u8, x) };
-    if !(x > 0.0) {
-        return s; // zero and NaN
+    if x == 0.0 || x.is_nan() {
+        return s;
     }
     if x >= 448.0 {
         return s | 0x7e;
@@ -487,7 +487,7 @@ impl CompLane {
     fn pool(&self) -> Vec<f32> {
         let (w, hd, r) = (self.width, self.head_dim, self.ratio);
         let mut out = vec![0f32; hd];
-        for j in 0..hd {
+        for (j, o) in out.iter_mut().enumerate() {
             let mut max_score = NEG_INF;
             if r == 4 {
                 for row in 0..r {
@@ -519,13 +519,14 @@ impl CompLane {
                     sum += ws * self.st_kv[row * w + j];
                 }
             }
-            out[j] = if denom > 0.0 { sum / denom } else { 0.0 };
+            *o = if denom > 0.0 { sum / denom } else { 0.0 };
         }
         out
     }
 
     /// Feed one token's kv/score projections; on a ratio boundary emit
     /// the pooled + normed + roped + quant-sim'd + f16-rounded row.
+    #[allow(clippy::too_many_arguments)]
     fn step(&mut self, kv_cur: &[f32], sc_cur: &[f32], ape: &[f32], norm: &[f32], pos: u32, rms_eps: f32, rope: &kernels::RopeCfg, n_rot: usize) -> Option<Vec<f32>> {
         let (w, hd, r) = (self.width, self.head_dim, self.ratio);
         let pos_mod = pos as usize % r;
@@ -534,7 +535,7 @@ impl CompLane {
             self.st_kv[row * w + j] = kv_cur[j];
             self.st_sc[row * w + j] = sc_cur[j] + ape[pos_mod * w + j];
         }
-        if (pos as usize + 1) % r != 0 {
+        if !(pos as usize + 1).is_multiple_of(r) {
             return None;
         }
         let pooled = self.pool();
@@ -573,7 +574,6 @@ impl CompLane {
 struct DevLane {
     st_kv: DeviceBuf, // [rows][width]
     st_sc: DeviceBuf,
-    width: u32,
     ratio: u32,
 }
 
@@ -585,7 +585,6 @@ impl DevLane {
         let mut l = DevLane {
             st_kv: DeviceBuf::alloc((rows * width) as usize * 4)?,
             st_sc: DeviceBuf::alloc((rows * width) as usize * 4)?,
-            width,
             ratio,
         };
         l.reset()?;
@@ -742,7 +741,7 @@ impl Dsv4Rt {
 }
 
 /// One layer's recurrent snapshot (dsv4).
-pub(super) struct Dsv4LayerCkpt {
+pub struct Dsv4LayerCkpt {
     comp: Option<(DeviceBuf, DeviceBuf)>,
     n_comp: u32,
     idx: Option<(DeviceBuf, DeviceBuf)>,
@@ -754,6 +753,7 @@ pub(super) struct Dsv4LayerCkpt {
 
 /// Score compressed rows with the QAT'd indexer query and pick top-k.
 /// Returns None when every row is visible (n_comp <= top_k).
+#[allow(clippy::too_many_arguments)]
 fn indexer_allowed(q: &mut [f32], weights: &[f32], idx_cache: &[f32], n_comp: usize, n_head: usize, head_dim: usize, top_k: usize, pos: u32, rope: &kernels::RopeCfg, n_rot: usize) -> Option<Vec<u8>> {
     if n_comp <= top_k {
         return None;
@@ -901,6 +901,7 @@ impl Model {
     /// the Sinkhorn split ON DEVICE into a coef buffer (was 2 host
     /// readbacks per layer per token), reduce the streams into st.cur.
     /// `ffn` picks which coef buffer holds this half's gates.
+    #[allow(clippy::too_many_arguments)]
     fn dsv4_hc_pre(&self, st: &mut State, rt: &mut Dsv4Rt, fn_w: &DeviceBuf, scale: &DeviceBuf, base: &DeviceBuf, ffn: bool, t: u32) -> Result {
         let s = self.shape;
         let ones = self.ones_hc.as_ref().ok_or("ones_hc missing")?;
@@ -924,6 +925,7 @@ impl Model {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn eval_dsv4_layer(&self, st: &mut State, rt: &mut Dsv4Rt, il: usize, l: &LayerW, tokens: &[u32], pos0: u32, t: u32) -> Result {
         let s = self.shape;
         let eps = s.rms_eps;
@@ -1028,7 +1030,7 @@ impl Model {
         for i in 0..t as usize {
             let pos = pos0 + i as u32;
             let n_raw = (pos + 1).min(s.n_swa);
-            let emit = w.ratio != 0 && (pos + 1) % w.ratio == 0;
+            let emit = w.ratio != 0 && (pos + 1).is_multiple_of(w.ratio);
             // raw ring push: quantized per kvq (turbo rotates the row by Π
             // inside the store kernel so ring and comp rows match). The f16
             // sim was dropped above when kvq != 0, so this store is the
@@ -1249,8 +1251,8 @@ impl Model {
         let cpu_on = st.cpu_pool.is_some()
             && n_tok <= 8
             && !st.unified
-            && w_exp % 256 == 0
-            && s.n_ff_exp % 256 == 0
+            && w_exp.is_multiple_of(256)
+            && s.n_ff_exp.is_multiple_of(256)
             && gate_exps.quant == up_exps.quant
             && [gate_exps.quant, down_exps.quant]
                 .iter()
@@ -1416,7 +1418,7 @@ impl Model {
         // DFlash verify cost at 6.5ms/layer).
         let grouped = n_tok >= 16
             && s.n_expert_used <= 16
-            && s.n_ff_exp % 256 == 0
+            && s.n_ff_exp.is_multiple_of(256)
             && 2 * gate_exps.row_bytes.max(up_exps.row_bytes) * 4 <= 49152
             && down_exps.row_bytes * 4 <= 49152
             && std::env::var_os("PULSAR_NO_GROUPED").is_none();
@@ -1543,6 +1545,165 @@ impl Model {
             kernels::add_assign(&mut st.moe_out, &st.cpu_ret, n_tok * w_exp)?;
         }
         Ok(())
+    }
+}
+
+/* ---- prefix persistence (serve --prefix-file) --------------------------- */
+
+fn put_buf(out: &mut Vec<u8>, b: &DeviceBuf, bytes: usize) -> Result {
+    let mut host = vec![0u8; bytes];
+    b.read(0, &mut host)?;
+    out.extend_from_slice(&(bytes as u64).to_le_bytes());
+    out.extend_from_slice(&host);
+    Ok(())
+}
+
+fn take_buf(inp: &mut &[u8], b: &mut DeviceBuf) -> Result {
+    let n = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+    *inp = &inp[8..];
+    if n > b.bytes() {
+        return Err("prefix file: buffer larger than allocation".into());
+    }
+    b.write(0, &inp[..n])?;
+    *inp = &inp[n..];
+    Ok(())
+}
+
+fn put_lane(out: &mut Vec<u8>, lane: &Option<DevLane>) -> Result {
+    match lane {
+        Some(l) => {
+            out.push(1);
+            put_buf(out, &l.st_kv, l.st_kv.bytes())?;
+            put_buf(out, &l.st_sc, l.st_sc.bytes())?;
+        }
+        None => out.push(0),
+    }
+    Ok(())
+}
+
+fn take_lane(inp: &mut &[u8], lane: &mut Option<DevLane>) -> Result {
+    let has = inp[0] == 1;
+    *inp = &inp[1..];
+    if has {
+        let l = lane.as_mut().ok_or("prefix file: lane mismatch")?;
+        take_buf(inp, &mut l.st_kv)?;
+        take_buf(inp, &mut l.st_sc)?;
+    }
+    Ok(())
+}
+
+/// ckpt lanes ride the same wire format; DeviceBuf pairs in RecurrentCkpt
+/// entries are full-size copies, so put_buf/take_buf apply unchanged.
+pub(super) fn ckpt_write(out: &mut Vec<u8>, ck: &[Dsv4LayerCkpt]) -> Result {
+    out.extend_from_slice(&(ck.len() as u32).to_le_bytes());
+    for c in ck {
+        match &c.comp {
+            Some((kv, sc)) => {
+                out.push(1);
+                put_buf(out, kv, kv.bytes())?;
+                put_buf(out, sc, sc.bytes())?;
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&c.n_comp.to_le_bytes());
+        match &c.idx {
+            Some((kv, sc)) => {
+                out.push(1);
+                put_buf(out, kv, kv.bytes())?;
+                put_buf(out, sc, sc.bytes())?;
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&c.n_idx_comp.to_le_bytes());
+        out.extend_from_slice(&(c.host_len as u64).to_le_bytes());
+    }
+    Ok(())
+}
+
+pub(super) fn ckpt_read(inp: &mut &[u8]) -> Result<Vec<Dsv4LayerCkpt>> {
+    let n = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+    *inp = &inp[4..];
+    let mut out = Vec::with_capacity(n);
+    let pair = |inp: &mut &[u8]| -> Result<Option<(DeviceBuf, DeviceBuf)>> {
+        let has = inp[0] == 1;
+        *inp = &inp[1..];
+        if !has {
+            return Ok(None);
+        }
+        let rd = |inp: &mut &[u8]| -> Result<DeviceBuf> {
+            let bytes = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+            *inp = &inp[8..];
+            let mut b = DeviceBuf::alloc(bytes.max(4))?;
+            b.write(0, &inp[..bytes])?;
+            *inp = &inp[bytes..];
+            Ok(b)
+        };
+        Ok(Some((rd(inp)?, rd(inp)?)))
+    };
+    for _ in 0..n {
+        let comp = pair(inp)?;
+        let n_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
+        *inp = &inp[4..];
+        let idx = pair(inp)?;
+        let n_idx_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
+        *inp = &inp[4..];
+        let host_len = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+        *inp = &inp[8..];
+        out.push(Dsv4LayerCkpt { comp, n_comp, idx, n_idx_comp, host_len });
+    }
+    Ok(out)
+}
+
+impl Dsv4Rt {
+    /// Serialize per-layer runtime state (compressor lanes, counters,
+    /// indexer host mirror). The big append-only caches (SWA ring, comp
+    /// KV, indexer keys) live in State and are written by save_prefix.
+    pub(super) fn save_layers(&self, out: &mut Vec<u8>) -> Result {
+        out.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
+        for l in &self.layers {
+            put_lane(out, &l.comp)?;
+            out.extend_from_slice(&l.n_comp.to_le_bytes());
+            put_lane(out, &l.idx)?;
+            out.extend_from_slice(&l.n_idx_comp.to_le_bytes());
+            out.extend_from_slice(&(l.idx_cache_host.len() as u64).to_le_bytes());
+            out.extend_from_slice(kernels::as_bytes(&l.idx_cache_host));
+        }
+        Ok(())
+    }
+
+    pub(super) fn load_layers(&mut self, inp: &mut &[u8]) -> Result {
+        let n = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+        *inp = &inp[4..];
+        if n != self.layers.len() {
+            return Err("prefix file: layer count mismatch".into());
+        }
+        for l in &mut self.layers {
+            take_lane(inp, &mut l.comp)?;
+            l.n_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
+            *inp = &inp[4..];
+            take_lane(inp, &mut l.idx)?;
+            l.n_idx_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
+            *inp = &inp[4..];
+            let hl = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+            *inp = &inp[8..];
+            l.idx_cache_host.clear();
+            l.idx_cache_host.extend(
+                inp[..hl * 4].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())),
+            );
+            *inp = &inp[hl * 4..];
+            // re-mirror the host cache into the device copy (selection
+            // reads host, attention-side emits read device)
+            if hl > 0 {
+                l.idx_cache.write(0, kernels::as_bytes(&l.idx_cache_host))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// (n_comp, n_idx_comp) per layer, for sizing the State-side cache
+    /// prefixes in save_prefix.
+    pub(super) fn layer_counts(&self) -> Vec<(u32, u32)> {
+        self.layers.iter().map(|l| (l.n_comp, l.n_idx_comp)).collect()
     }
 }
 
@@ -1709,164 +1870,5 @@ mod tests {
             beta_slow: 1.0,
             kq_mult: 1.0,
         }
-    }
-}
-
-/* ---- prefix persistence (serve --prefix-file) --------------------------- */
-
-fn put_buf(out: &mut Vec<u8>, b: &DeviceBuf, bytes: usize) -> Result {
-    let mut host = vec![0u8; bytes];
-    b.read(0, &mut host)?;
-    out.extend_from_slice(&(bytes as u64).to_le_bytes());
-    out.extend_from_slice(&host);
-    Ok(())
-}
-
-fn take_buf(inp: &mut &[u8], b: &mut DeviceBuf) -> Result {
-    let n = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
-    *inp = &inp[8..];
-    if n > b.bytes() {
-        return Err("prefix file: buffer larger than allocation".into());
-    }
-    b.write(0, &inp[..n])?;
-    *inp = &inp[n..];
-    Ok(())
-}
-
-fn put_lane(out: &mut Vec<u8>, lane: &Option<DevLane>) -> Result {
-    match lane {
-        Some(l) => {
-            out.push(1);
-            put_buf(out, &l.st_kv, l.st_kv.bytes())?;
-            put_buf(out, &l.st_sc, l.st_sc.bytes())?;
-        }
-        None => out.push(0),
-    }
-    Ok(())
-}
-
-fn take_lane(inp: &mut &[u8], lane: &mut Option<DevLane>) -> Result {
-    let has = inp[0] == 1;
-    *inp = &inp[1..];
-    if has {
-        let l = lane.as_mut().ok_or("prefix file: lane mismatch")?;
-        take_buf(inp, &mut l.st_kv)?;
-        take_buf(inp, &mut l.st_sc)?;
-    }
-    Ok(())
-}
-
-/// ckpt lanes ride the same wire format; DeviceBuf pairs in RecurrentCkpt
-/// entries are full-size copies, so put_buf/take_buf apply unchanged.
-pub(super) fn ckpt_write(out: &mut Vec<u8>, ck: &[Dsv4LayerCkpt]) -> Result {
-    out.extend_from_slice(&(ck.len() as u32).to_le_bytes());
-    for c in ck {
-        match &c.comp {
-            Some((kv, sc)) => {
-                out.push(1);
-                put_buf(out, kv, kv.bytes())?;
-                put_buf(out, sc, sc.bytes())?;
-            }
-            None => out.push(0),
-        }
-        out.extend_from_slice(&c.n_comp.to_le_bytes());
-        match &c.idx {
-            Some((kv, sc)) => {
-                out.push(1);
-                put_buf(out, kv, kv.bytes())?;
-                put_buf(out, sc, sc.bytes())?;
-            }
-            None => out.push(0),
-        }
-        out.extend_from_slice(&c.n_idx_comp.to_le_bytes());
-        out.extend_from_slice(&(c.host_len as u64).to_le_bytes());
-    }
-    Ok(())
-}
-
-pub(super) fn ckpt_read(inp: &mut &[u8]) -> Result<Vec<Dsv4LayerCkpt>> {
-    let n = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
-    *inp = &inp[4..];
-    let mut out = Vec::with_capacity(n);
-    let mut pair = |inp: &mut &[u8]| -> Result<Option<(DeviceBuf, DeviceBuf)>> {
-        let has = inp[0] == 1;
-        *inp = &inp[1..];
-        if !has {
-            return Ok(None);
-        }
-        let mut rd = |inp: &mut &[u8]| -> Result<DeviceBuf> {
-            let bytes = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
-            *inp = &inp[8..];
-            let mut b = DeviceBuf::alloc(bytes.max(4))?;
-            b.write(0, &inp[..bytes])?;
-            *inp = &inp[bytes..];
-            Ok(b)
-        };
-        Ok(Some((rd(inp)?, rd(inp)?)))
-    };
-    for _ in 0..n {
-        let comp = pair(inp)?;
-        let n_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
-        *inp = &inp[4..];
-        let idx = pair(inp)?;
-        let n_idx_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
-        *inp = &inp[4..];
-        let host_len = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
-        *inp = &inp[8..];
-        out.push(Dsv4LayerCkpt { comp, n_comp, idx, n_idx_comp, host_len });
-    }
-    Ok(out)
-}
-
-impl Dsv4Rt {
-    /// Serialize per-layer runtime state (compressor lanes, counters,
-    /// indexer host mirror). The big append-only caches (SWA ring, comp
-    /// KV, indexer keys) live in State and are written by save_prefix.
-    pub(super) fn save_layers(&self, out: &mut Vec<u8>) -> Result {
-        out.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
-        for l in &self.layers {
-            put_lane(out, &l.comp)?;
-            out.extend_from_slice(&l.n_comp.to_le_bytes());
-            put_lane(out, &l.idx)?;
-            out.extend_from_slice(&l.n_idx_comp.to_le_bytes());
-            out.extend_from_slice(&(l.idx_cache_host.len() as u64).to_le_bytes());
-            out.extend_from_slice(kernels::as_bytes(&l.idx_cache_host));
-        }
-        Ok(())
-    }
-
-    pub(super) fn load_layers(&mut self, inp: &mut &[u8]) -> Result {
-        let n = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
-        *inp = &inp[4..];
-        if n != self.layers.len() {
-            return Err("prefix file: layer count mismatch".into());
-        }
-        for l in &mut self.layers {
-            take_lane(inp, &mut l.comp)?;
-            l.n_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
-            *inp = &inp[4..];
-            take_lane(inp, &mut l.idx)?;
-            l.n_idx_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
-            *inp = &inp[4..];
-            let hl = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
-            *inp = &inp[8..];
-            l.idx_cache_host.clear();
-            l.idx_cache_host.extend(
-                inp[..hl * 4].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())),
-            );
-            *inp = &inp[hl * 4..];
-            // re-mirror the host cache into the device copy (selection
-            // reads host, attention-side emits read device)
-            if hl > 0 {
-                l.idx_cache.write(0, kernels::as_bytes(&l.idx_cache_host))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// (n_comp, n_idx_comp) per layer, for sizing the State-side cache
-    /// prefixes in save_prefix.
-    pub(super) fn layer_counts(&self) -> Vec<(u32, u32)> {
-        self.layers.iter().map(|l| (l.n_comp, l.n_idx_comp)).collect()
     }
 }

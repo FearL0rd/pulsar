@@ -75,7 +75,7 @@ pub fn f32_to_f16(x: f32) -> u16 {
         let rounded = half + ((rem > halfway) as u32 | ((rem == halfway) as u32 & (half & 1)));
         return s | rounded as u16;
     }
-    let half = (s as u32) << 0 | ((e16 as u32) << 10) as u32 | (m >> 13);
+    let half = s as u32 | ((e16 as u32) << 10) | (m >> 13);
     let rem = m & 0x1fff;
     let rounded = half + ((rem > 0x1000) as u32 | ((rem == 0x1000) as u32 & (half & 1)));
     rounded as u16
@@ -140,10 +140,10 @@ fn make_qx_quants(n: usize, nmax: i32, x: &[f32], ls: &mut [i8]) -> f32 {
         iscale = -(nmax as f32 + 0.1 * is as f32) / max;
         let mut sumlx = 0f32;
         let mut suml2 = 0f32;
-        for i in 0..n {
-            let l = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
-            let w = x[i] * x[i];
-            sumlx += w * x[i] * l as f32;
+        for &xv in x.iter().take(n) {
+            let l = nearest_int(iscale * xv).clamp(-nmax, nmax - 1);
+            let w = xv * xv;
+            sumlx += w * xv * l as f32;
             suml2 += w * (l * l) as f32;
         }
         if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
@@ -293,26 +293,24 @@ pub fn quantize_row_q2_k(x: &[f32], out: &mut Vec<u8>) {
             max_min = max_min.max(m);
         }
         let mut sc_bytes = [0u8; 16];
-        let d;
-        let dmin;
-        if max_scale > 0.0 {
+        let d = if max_scale > 0.0 {
             let iscale = 15.0 / max_scale;
             for j in 0..16 {
                 sc_bytes[j] = nearest_int(iscale * scales[j]).clamp(0, 15) as u8;
             }
-            d = max_scale / 15.0;
+            max_scale / 15.0
         } else {
-            d = 0.0;
-        }
-        if max_min > 0.0 {
+            0.0
+        };
+        let dmin = if max_min > 0.0 {
             let iscale = 15.0 / max_min;
             for j in 0..16 {
                 sc_bytes[j] |= (nearest_int(iscale * mins[j]).clamp(0, 15) as u8) << 4;
             }
-            dmin = max_min / 15.0;
+            max_min / 15.0
         } else {
-            dmin = 0.0;
-        }
+            0.0
+        };
         // requantize with the quantized scales
         for j in 0..16 {
             let dj = d * (sc_bytes[j] & 0xF) as f32;
@@ -395,8 +393,8 @@ fn make_q3_quants(n: usize, nmax: i32, x: &[f32], ls: &mut [i8]) -> f32 {
             break;
         }
     }
-    for i in 0..n {
-        ls[i] += nmax as i8;
+    for l in ls.iter_mut().take(n) {
+        *l += nmax as i8;
     }
     if suml2 > 0.0 {
         sumlx / suml2
@@ -932,7 +930,7 @@ mod tests {
 
     #[test]
     fn f16_conv_roundtrip() {
-        for v in [0.0f32, 1.0, -1.0, 0.5, 65504.0, 1e-5, -3.14159] {
+        for v in [0.0f32, 1.0, -1.0, 0.5, 65504.0, 1e-5, -std::f32::consts::PI] {
             let h = f32_to_f16(v);
             let back = f16_to_f32(h);
             assert!((back - v).abs() <= v.abs() * 0.001 + 1e-7, "{v} -> {back}");
