@@ -8,11 +8,21 @@ resident generalists show ~no per-topic heat signal (served from the tier,
 not the host cache) so they collapse to the core; disk/RAM specialists carry
 the topic signal and spread out - exactly the colibri galaxy structure.
 """
-import json, sys, time, urllib.request
+import json, os, sys, time, urllib.request
 import numpy as np
 
-BASE = "http://100.84.87.107:11435"
-OUT = "/mnt/models/atlas.json"
+# Usage: atlas_build.py [BASE_URL] [MODEL_PATH]
+#   BASE_URL    pulsar-serve origin (default $PULSAR_BASE or http://127.0.0.1:8080)
+#   MODEL_PATH  path to the .gguf the server has loaded, used to place the sidecar
+#               at <MODEL_PATH>.atlas.json — the exact path pulsar-serve reads.
+#               (default $PULSAR_MODEL; falls back to a local ./atlas.json with a warning)
+BASE = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PULSAR_BASE", "http://127.0.0.1:8080")
+MODEL = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("PULSAR_MODEL")
+OUT = (MODEL + ".atlas.json") if MODEL else "atlas.json"
+if not MODEL:
+    sys.stderr.write("warning: PULSAR_MODEL not set — writing to ./atlas.json, "
+                     "which pulsar-serve will NOT find. Pass the model path:\n"
+                     "  python scripts/atlas_build.py " + BASE + " /path/to/MODEL.gguf\n")
 
 TOPICS = {
     "poetry": ["Write a short poem about the sea at dawn.", "Compose four lines of verse about autumn leaves.", "Write a haiku about a mountain river.", "Write a rhyming couplet about the moon."],
