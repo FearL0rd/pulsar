@@ -73,8 +73,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .as_str();
     let variant = positional.get(1).map(|s| s.as_str());
 
-    let mut opts = tokenizer::ChatTemplateOptions::default();
-    opts.offline = offline;
+    let opts = tokenizer::ChatTemplateOptions {
+        offline,
+        ..Default::default()
+    };
 
     let resolved = tokenizer::get_chat_template_with_options(spec, variant, &opts)?;
 

@@ -1077,15 +1077,10 @@ pub fn render_chat_prompt_from_gguf(
     opts: &ChatTemplateOptions,
 ) -> Result<(String, ResolvedChatTemplate), ChatTemplateError> {
     let resolved = get_chat_template_from_gguf(g, gguf_path, None, opts)?;
-    let bos = g
-        .metadata
-        .get("tokenizer.ggml.bos_token_id")
-        .and_then(|v| v.as_u64())
-        .and_then(|_id| {
-            // We only have the id here; token string needs the vocab. Leave empty;
-            // most templates use special tokens as literal text already in-template.
-            None::<String>
-        });
+    // The metadata carries a bos ID, but rendering needs the token STRING and
+    // the vocab is not threaded in here. Templates that need it already spell
+    // the special token literally, so pass none rather than a half-resolved id.
+    let bos: Option<String> = None;
     let text = apply_chat_template(
         &resolved.template,
         messages,

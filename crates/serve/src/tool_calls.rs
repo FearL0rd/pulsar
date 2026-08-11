@@ -206,15 +206,7 @@ enum ToolKind {
 }
 
 fn next_tool_region(s: &str) -> Option<(ToolKind, usize)> {
-    let generic = s.find("<tool_call>").and_then(|i| {
-        if s[i..].starts_with("<tool_call:opensource>")
-            || s[i..].starts_with("<tool_calls:opensource>")
-        {
-            None
-        } else {
-            Some(i)
-        }
-    });
+    let generic = s.find("<tool_call>").filter(|&i| !(s[i..].starts_with("<tool_call:opensource>") || s[i..].starts_with("<tool_calls:opensource>")));
     // Also catch unclosed-looking open that is actually opensource plural
     let hy3 = s
         .find("<tool_calls:opensource>")
@@ -321,7 +313,7 @@ fn take_generic(s: &str) -> Option<(String, String, usize)> {
     let consumed = OPEN.len() + end + CLOSE.len();
     let v: serde_json::Value = serde_json::from_str(block).ok()?;
     let name = v.get("name")?.as_str()?.to_string();
-    let args = if v.get("arguments").map_or(true, |a| a.is_null()) {
+    let args = if v.get("arguments").is_none_or(|a| a.is_null()) {
         "{}".into()
     } else {
         v["arguments"].to_string()

@@ -151,8 +151,10 @@ fn run() -> engine::Result {
     // path never touches the network. With --jinja-chat: embed → cache → HF →
     // llama.cpp catalog (unless PULSAR_OFFLINE).
     let chat_template = if jinja_chat {
-        let mut opts = tokenizer::ChatTemplateOptions::default();
-        opts.offline = env_offline;
+        let opts = tokenizer::ChatTemplateOptions {
+            offline: env_offline,
+            ..Default::default()
+        };
         match tokenizer::get_chat_template_from_gguf(
             &model.gguf,
             Some(std::path::Path::new(&model_path)),
@@ -213,7 +215,6 @@ fn run() -> engine::Result {
             }
         }
     };
-    let mut jinja_chat = jinja_chat;
     if jinja_chat {
         if chat_template.is_some() {
             eprintln!("pulsar-serve: using Jinja chat template for /v1/chat/completions");
@@ -1279,6 +1280,7 @@ fn message_text_of(content: &serde_json::Value) -> String {
 
 /// Pick Jinja or ChatMarkers encoding for a message list.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)] // one call site; the request fields do not want a struct
 fn encode_messages_auto(
     tok: &tokenizer::Tokenizer,
     m: &tokenizer::ChatMarkers,

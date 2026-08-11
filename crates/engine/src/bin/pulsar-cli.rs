@@ -31,6 +31,7 @@ fn main() {
 /// Flush the longest valid UTF-8 prefix of `buf` to stdout, keeping any
 /// incomplete trailing multi-byte sequence for the next token.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // used by the streaming chat path; dead in --chat-less builds
 fn print_utf8_prefix(buf: &mut Vec<u8>) {
     use std::io::Write;
     let valid_len = match std::str::from_utf8(buf) {
@@ -236,11 +237,10 @@ fn run_chat(
                     }
                     Err(e) => {
                         let n = e.valid_up_to();
-                        if n > 0 {
-                            if chat_template.is_some() {
+                        if n > 0
+                            && chat_template.is_some() {
                                 reply.push_str(std::str::from_utf8(&bytes[..n]).unwrap_or(""));
                             }
-                        }
                         n
                     }
                 };
@@ -366,8 +366,10 @@ fn run() -> engine::Result {
     // HF → llama.cpp catalog) unless PULSAR_OFFLINE. Without Jinja, offline
     // peek only so a normal CLI load never phones home.
     let chat_template = {
-        let mut opts = tokenizer::ChatTemplateOptions::default();
-        opts.offline = if jinja_chat { env_offline } else { true };
+        let opts = tokenizer::ChatTemplateOptions {
+            offline: if jinja_chat { env_offline } else { true },
+            ..Default::default()
+        };
         match tokenizer::get_chat_template_from_gguf(
             &model.gguf,
             Some(std::path::Path::new(&model_path)),

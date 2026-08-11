@@ -1,4 +1,7 @@
 //! Integration tests for multi-format tool-call parsing (no CUDA / linux).
+// Only the parse helpers are exercised here; the formatters and holdback
+// helper are used by the server binary, so they read as dead in this target.
+#[allow(dead_code)]
 #[path = "../src/tool_calls.rs"]
 mod tool_calls;
 

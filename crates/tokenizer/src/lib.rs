@@ -953,7 +953,7 @@ impl Tokenizer {
             .map(|(i, t)| (t.clone(), i as u32))
             .collect();
         // Longest match first so `<|im_start|>` wins over `<|im`.
-        specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
 
         Ok(Tokenizer {
             tokens,
