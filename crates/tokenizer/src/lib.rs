@@ -6,6 +6,16 @@
 //! splits produce different merges, and therefore different token streams,
 //! even when the text bytes are identical.
 
+mod chat_template;
+
+pub use chat_template::{
+    apply_chat_template, apply_chat_template_ex, catalog_candidate_filenames,
+    chat_template_from_tokenizer_config, get_chat_template, get_chat_template_from_gguf,
+    get_chat_template_with_options, model_id_candidates, render_chat_prompt_from_gguf,
+    strip_quant_suffix, ChatMessage, ChatTemplateError, ChatTemplateOptions,
+    ChatTemplateSource, ResolvedChatTemplate,
+};
+
 use std::collections::HashMap;
 
 use gguf::{Gguf, Value};
@@ -46,6 +56,10 @@ pub struct Tokenizer {
     /// tokenizer.ggml.add_bos_token if present, else SPM yes / BPE no).
     pub add_bos: bool,
     pre: Pre,
+    /// Special / control vocab strings (longest first) used by
+    /// [`Tokenizer::encode_with_specials`] when applying a Jinja chat
+    /// template that embeds marker text rather than raw token ids.
+    specials: Vec<(String, u32)>,
 }
 
 /// Pre-tokenizer split family, from `tokenizer.ggml.pre`. The split shape
@@ -140,6 +154,28 @@ pub struct ChatMarkers {
 }
 
 impl ChatMarkers {
+    /// Stops-only markers for the Jinja chat-template path when the vocab
+    /// does not match any hardcoded style. Render methods must not be used;
+    /// generation still needs `is_stop` / `eos`.
+    pub fn jinja_fallback(t: &Tokenizer) -> Result<ChatMarkers, Error> {
+        let eos = t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?;
+        Ok(ChatMarkers {
+            // ChatMl is the least opinionated opener family; unused when
+            // encode goes through apply_chat_template.
+            style: ChatStyle::ChatMl,
+            bos: t.bos_id,
+            eos,
+            eot: t.eot_id,
+            user: 0,
+            assistant: 0,
+            aux0: 0,
+            aux1: 0,
+            stops: t.stop_ids.clone(),
+            think: false,
+            reasoning: "medium",
+        })
+    }
+
     pub fn resolve(t: &Tokenizer) -> Result<ChatMarkers, Error> {
         let find = |s: &'static str| t.find_token(s).ok_or(Error::MissingKey(s));
         // K3 before K2: K3 has no <|im_middle|>, but keep the order
@@ -432,16 +468,24 @@ impl ChatMarkers {
 
     /// True when the assistant opener leaves a reasoning block OPEN, so
     /// generation starts inside it and the first `</think>` closes it.
-    /// GLM with thinking on is the only such style: `<think>` is the last
-    /// PROMPT token, never a generated one, so a consumer that waits for an
-    /// opening tag would route the whole reply to reasoning.
+    /// GLM and Laguna (Jinja / markers with thinking on) put `<think>` as
+    /// the last PROMPT token, never a generated one — a consumer that waits
+    /// for an opening tag would route the whole reply to reasoning.
     pub fn opens_thinking(&self) -> bool {
-        self.style == ChatStyle::Glm && self.think
+        matches!(self.style, ChatStyle::Glm | ChatStyle::Laguna) && self.think
     }
 
     /// Whether this style has a reasoning mode a caller can steer.
     pub fn reasoning_capable(&self) -> bool {
-        matches!(self.style, ChatStyle::Glm | ChatStyle::Harmony)
+        matches!(
+            self.style,
+            ChatStyle::Glm | ChatStyle::Harmony | ChatStyle::Laguna
+        )
+    }
+
+    /// poolside Laguna (`<assistant>` / `<think>` role tags).
+    pub fn is_laguna(&self) -> bool {
+        self.style == ChatStyle::Laguna
     }
 
     /// The effort levels this style understands, weakest first. Clients
@@ -798,6 +842,50 @@ fn gpt2_byte_to_char(b: u8) -> char {
     char::from_u32(256 + n).unwrap()
 }
 
+/// Heuristic: control / chat-marker vocab entries that Jinja templates emit
+/// as literal text. Ordinary words and byte-fallback tokens stay out so the
+/// longest-match pass stays small.
+fn looks_like_special_token(t: &str) -> bool {
+    if t.len() < 3 || t.len() > 80 {
+        return false;
+    }
+    // Chat / control markers across the families pulsar serves.
+    if t.starts_with("<|")
+        || t.starts_with("<｜")
+        || t.starts_with("<start_")
+        || t.starts_with("<end_")
+        || t.starts_with("]~")
+        || t.starts_with("[e~")
+        || t.starts_with("[gMASK]")
+        || t == "<sop>"
+        || t == "<think>"
+        || t == "</think>"
+        || t == "<think:opensource>"
+        || t == "</think:opensource>"
+    {
+        return true;
+    }
+    // Laguna BOS uses CJK angle brackets: 〈|EOS|〉 (not ASCII <>).
+    if (t.starts_with('〈') && t.ends_with('〉')) || t.contains("|EOS|") {
+        return true;
+    }
+    // Angle-bracket control tags: <assistant>, <user>, <system>,
+    // </assistant>, <tool_call>, <tool_response>, … — not only those with
+    // `_`/`/` (the old filter missed Laguna open tags, so Jinja prompts
+    // BPE-split `<assistant>` and the model spewed garbage like `NAT</think>NAT`).
+    if t.starts_with('<') && t.ends_with('>') {
+        let inner = &t[1..t.len() - 1];
+        if !inner.is_empty()
+            && inner.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | ':' | '|' | '.' | '-')
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn string_array(g: &Gguf, key: &'static str) -> Result<Vec<String>, Error> {
     let Some(Value::Array(a)) = g.metadata.get(key) else {
         return Err(Error::MissingKey(key));
@@ -858,6 +946,15 @@ impl Tokenizer {
         if let Some(b) = id_key("tokenizer.ggml.bos_token_id") {
             stop_ids.retain(|&x| x != b);
         }
+        let mut specials: Vec<(String, u32)> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| looks_like_special_token(t))
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect();
+        // Longest match first so `<|im_start|>` wins over `<|im`.
+        specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
         Ok(Tokenizer {
             tokens,
             token_to_id,
@@ -895,6 +992,7 @@ impl Tokenizer {
                     _ => Pre::JoyAi,
                 }
             },
+            specials,
         })
     }
 
@@ -916,6 +1014,55 @@ impl Tokenizer {
     /// True when `id` is any end-of-generation token for this model.
     pub fn is_eog(&self, id: u32) -> bool {
         self.stop_ids.binary_search(&id).is_ok()
+    }
+
+    /// Encode a chat-template string: longest-match special tokens from the
+    /// vocab first, ordinary BPE on the gaps. Used after Jinja rendering so
+    /// markers like `<|im_start|>` become their real ids instead of byte pieces.
+    pub fn encode_with_specials(&self, text: &str) -> Vec<u32> {
+        if self.specials.is_empty() {
+            return self.encode(text);
+        }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < text.len() {
+            let rest = &text[i..];
+            let mut hit: Option<&(String, u32)> = None;
+            for sp in &self.specials {
+                if rest.starts_with(&sp.0) {
+                    hit = Some(sp);
+                    break; // specials sorted longest-first
+                }
+            }
+            if let Some((s, id)) = hit {
+                out.push(*id);
+                i += s.len();
+                continue;
+            }
+            // Ordinary span up to the next special (or end of text).
+            let mut span_end = text.len();
+            for sp in &self.specials {
+                if let Some(pos) = rest.find(&sp.0) {
+                    if pos > 0 {
+                        span_end = span_end.min(i + pos);
+                    }
+                }
+            }
+            if span_end > i {
+                out.extend(self.encode(&text[i..span_end]));
+                i = span_end;
+            } else {
+                // No progress; emit one char via BPE so we never hang.
+                let ch_end = text[i..]
+                    .chars()
+                    .next()
+                    .map(|c| i + c.len_utf8())
+                    .unwrap_or(text.len());
+                out.extend(self.encode(&text[i..ch_end]));
+                i = ch_end;
+            }
+        }
+        out
     }
 
     /// Encode plain text (no special-token recognition; chat markers are
@@ -1791,6 +1938,36 @@ fn pretokenize_glm4(s: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn laguna_role_tags_look_like_specials() {
+        // Open tags have no `_`/`/` — old filter missed them and Jinja
+        // BPE-split `<assistant>` (serve showed garbage like NAT</think>NAT).
+        for t in [
+            "<assistant>",
+            "</assistant>",
+            "<user>",
+            "</user>",
+            "<system>",
+            "</system>",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "〈|EOS|〉",
+        ] {
+            assert!(
+                looks_like_special_token(t),
+                "expected special: {t:?}"
+            );
+        }
+        // Ordinary words must stay out of the longest-match table.
+        assert!(!looks_like_special_token("assistant"));
+        assert!(!looks_like_special_token("hi"));
+        assert!(!looks_like_special_token("<>"));
+    }
 
     #[test]
     fn kimi_k2_han_runs_and_inline_contractions() {

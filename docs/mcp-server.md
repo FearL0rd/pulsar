@@ -111,7 +111,24 @@ The management surface lives in the left sidebar as its own group, between **Con
 Non-stream branch of `handle_chat` only (`main.rs`, `MAX_TURNS = 8`). The stream branch stays single-turn for now.
 
 1. Enabled MCP tools are merged into the request's `tools` array as OpenAI function specs, namespaced `server__tool`. The existing prompt builder (`encode_messages`) injects the `# Tools` schemas and already knows how to replay `tool_calls` / `tool` message roles.
-2. Generate. The model emits `<tool_call>{"name":"SearchTool__search_searxng","arguments":{…}}</tool_call>` blocks; `extract_tool_calls` returns `(clean_text, Vec<(name, args_json)>)` — the namespaced names flow through unchanged.
+2. Generate. The model emits tool-call markup; `extract_tool_calls` (in
+   `tool_calls.rs`) returns `(clean_text, Vec<(name, args_json)>)`. Accepted
+   formats:
+   - **Generic JSON** (what the `# Tools` system prompt teaches):  
+     `<tool_call>{"name":"SearchTool__search_searxng","arguments":{…}}</tool_call>`
+   - **Hy3 opensource** (native Jinja / chat template):  
+     `<tool_calls:opensource><tool_call:opensource>NAME<tool_sep:opensource>…arg_key/arg_value…</tool_call:opensource></tool_calls:opensource>`
+   - **DeepSeek DSML** (fullwidth `｜`):  
+     `<｜DSML｜tool_calls…><｜DSML｜invoke name="…"><｜DSML｜parameter name="k">v</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>`
+
+   Bare or alias names (`search_searxng`, `web_search`) are rewritten to an
+   enabled `server__tool` id by `McpHub::resolve_tool_name` when the match is
+   unique (or when only one tool is enabled).
+
+   **DeepSeek V4 / DSML history:** after dispatch, tool turns are re-fed as
+   `<tool_result>…</tool_result>` user content and prior assistant calls are
+   replayed as DSML (not Hermes JSON). Replaying the generic form left the
+   model unable to continue and the web UI showed `(empty)`.
 3. For each call, `mcp.dispatch_sync(name, args)`:
    - splits on the first `__` → `(server, tool)`,
    - checks `allow`/`deny` (deny wins; a non-empty `allow` not containing the tool denies it; otherwise permitted),

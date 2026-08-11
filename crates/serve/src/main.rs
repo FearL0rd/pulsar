@@ -41,6 +41,10 @@ const FAVICON_SVG: &str = include_str!("../webui/favicon.svg");
 #[cfg(target_os = "linux")]
 mod mcp;
 
+/// Multi-format tool-call parsers (generic JSON, Hy3 opensource, DeepSeek DSML).
+/// Always compiled so unit tests run on any OS.
+mod tool_calls;
+
 /// Sanity bound only - NOT a capability limit. The reachable ceiling is
 /// the checkpoint's own context_length (what the model was trained for)
 /// narrowed by ctx_fit (what this machine's VRAM holds). A fixed number
@@ -98,6 +102,22 @@ fn run() -> engine::Result {
     let mut prefix_file: Option<String> = None;
     let mut webui_mcp_proxy = false;
     let mut mcp_config: Option<String> = None;
+    // Jinja chat encoding is **opt-in only** (`--jinja-chat` / PULSAR_JINJA_CHAT).
+    // ChatMarkers stay the default so carefully-tuned families do not regress.
+    // With Jinja on, resolution is GGUF embed → cache → HF → llama.cpp catalog
+    // (network blocked only by PULSAR_OFFLINE).
+    let mut jinja_chat = match std::env::var("PULSAR_JINJA_CHAT") {
+        Ok(v) if v == "0"
+            || v.is_empty()
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off") =>
+        {
+            false
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    let env_offline = std::env::var_os("PULSAR_OFFLINE").is_some();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut need = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -111,6 +131,7 @@ fn run() -> engine::Result {
             // ./mcp.json next to the server cwd.
             "--webui-mcp-proxy" => webui_mcp_proxy = true,
             "--mcp-config" => mcp_config = Some(need("--mcp-config")?),
+            "--jinja-chat" => jinja_chat = true,
             other => return Err(format!("unknown arg {other}").into()),
         }
     }
@@ -126,7 +147,85 @@ fn run() -> engine::Result {
         let (_, g) = engine::parse_header(std::path::Path::new(&model_path))?;
         tokenizer::Tokenizer::from_gguf(&g)?
     };
-    let markers = tokenizer::ChatMarkers::resolve(&tok)?;
+    // Resolve a chat template only when Jinja is requested. Default ChatMarkers
+    // path never touches the network. With --jinja-chat: embed → cache → HF →
+    // llama.cpp catalog (unless PULSAR_OFFLINE).
+    let chat_template = if jinja_chat {
+        let mut opts = tokenizer::ChatTemplateOptions::default();
+        opts.offline = env_offline;
+        match tokenizer::get_chat_template_from_gguf(
+            &model.gguf,
+            Some(std::path::Path::new(&model_path)),
+            None,
+            &opts,
+        ) {
+            Ok(r) => {
+                eprintln!(
+                    "pulsar-serve: chat template from {} ({} bytes{})",
+                    r.source,
+                    r.template.len(),
+                    r.model_id
+                        .as_ref()
+                        .map(|id| format!(", model_id={id}"))
+                        .unwrap_or_default()
+                );
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!(
+                    "pulsar-serve: chat template not resolved ({e}){}",
+                    if env_offline {
+                        " (PULSAR_OFFLINE: embed or local cache only)"
+                    } else {
+                        ""
+                    }
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let markers = match tokenizer::ChatMarkers::resolve(&tok) {
+        Ok(m) => m,
+        Err(e) => {
+            // Last resort: if the operator opted into Jinja and we have a
+            // template, serve with stops-only markers. Never auto-enable Jinja
+            // without --jinja-chat.
+            if jinja_chat {
+                if chat_template.is_some() {
+                    eprintln!(
+                        "pulsar-serve: ChatMarkers unresolved ({e}); Jinja encoding with fallback markers"
+                    );
+                    tokenizer::ChatMarkers::jinja_fallback(&tok)?
+                } else {
+                    return Err(format!(
+                        "ChatMarkers unresolved ({e}) and no Jinja template available \
+                         (embed tokenizer.chat_template, warm the cache, or allow network)"
+                    )
+                    .into());
+                }
+            } else {
+                return Err(format!(
+                    "ChatMarkers unresolved ({e}); pass --jinja-chat if this model needs its HF/GGUF template"
+                )
+                .into());
+            }
+        }
+    };
+    let mut jinja_chat = jinja_chat;
+    if jinja_chat {
+        if chat_template.is_some() {
+            eprintln!("pulsar-serve: using Jinja chat template for /v1/chat/completions");
+        } else {
+            eprintln!(
+                "pulsar-serve: --jinja-chat set but no template available; ChatMarkers encoding"
+            );
+            jinja_chat = false;
+        }
+    } else {
+        eprintln!("pulsar-serve: ChatMarkers encoding (pass --jinja-chat to use GGUF/HF Jinja templates)");
+    }
     // What the CHECKPOINT supports. Clients size their context control from
     // this; whether a given value fits is a separate, per-machine question
     // answered by ctx_fit.
@@ -672,6 +771,8 @@ fn run() -> engine::Result {
                     &model,
                     &tok,
                     &markers,
+                    chat_template.as_ref(),
+                    jinja_chat,
                     &mut st,
                     &model_name,
                     default_temp,
@@ -1151,6 +1252,163 @@ fn respond_bytes(
     Ok(())
 }
 
+/// content arrives as a plain string OR an array of typed blocks
+/// (Claude Code / Anthropic-translated clients send
+/// [{type:"text", text:...}, ...]); a string-only read silently
+/// dropped the whole system prompt for those clients
+#[cfg(target_os = "linux")]
+fn message_text_of(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .map(|b| {
+                if let Some(t) = b["text"].as_str() {
+                    t.to_string()
+                } else if b["type"].as_str() == Some("tool_result") {
+                    message_text_of(&b["content"])
+                } else {
+                    String::new()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Pick Jinja or ChatMarkers encoding for a message list.
+#[cfg(target_os = "linux")]
+fn encode_messages_auto(
+    tok: &tokenizer::Tokenizer,
+    m: &tokenizer::ChatMarkers,
+    chat_template: Option<&tokenizer::ResolvedChatTemplate>,
+    jinja_chat: bool,
+    messages: &[serde_json::Value],
+    tools: Option<&Vec<serde_json::Value>>,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> Vec<u32> {
+    if jinja_chat {
+        if let Some(tmpl) = chat_template {
+            match encode_messages_jinja(
+                tok,
+                tmpl,
+                messages,
+                tools,
+                enable_thinking,
+                reasoning_effort,
+            ) {
+                Ok(ids) => return ids,
+                Err(e) => {
+                    eprintln!(
+                        "pulsar-serve: jinja chat template apply failed ({e}); falling back to ChatMarkers"
+                    );
+                }
+            }
+        }
+    }
+    encode_messages(tok, m, messages, tools)
+}
+
+/// Encode OpenAI messages via a resolved Jinja chat template, then
+/// tokenize with special-token recognition.
+#[cfg(target_os = "linux")]
+fn encode_messages_jinja(
+    tok: &tokenizer::Tokenizer,
+    template: &tokenizer::ResolvedChatTemplate,
+    messages: &[serde_json::Value],
+    tools: Option<&Vec<serde_json::Value>>,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> Result<Vec<u32>, String> {
+    // DeepSeek V4's embedded template speaks DSML; replaying Hermes-style
+    // <tool_call> JSON + id= tool_result leaves the model unable to continue
+    // after MCP dispatch → empty final content in the web UI.
+    let dsml = tool_calls::is_dsml_template(&template.template);
+    let mut chat_msgs: Vec<tokenizer::ChatMessage> = Vec::new();
+    for msg in messages {
+        let role = msg["role"].as_str().unwrap_or("user").to_string();
+        let mut content = message_text_of(&msg["content"]);
+        if role == "assistant" {
+            if let Some(calls) = msg["tool_calls"].as_array() {
+                let pairs: Vec<(String, String)> = calls
+                    .iter()
+                    .filter_map(|c| {
+                        let f = &c["function"];
+                        let name = f["name"].as_str()?.to_string();
+                        let args = f["arguments"].as_str().unwrap_or("{}").to_string();
+                        Some((name, args))
+                    })
+                    .collect();
+                if !pairs.is_empty() {
+                    if dsml {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&tool_calls::format_dsml_tool_calls(&pairs));
+                    } else {
+                        content.push_str(&tool_calls::format_generic_tool_calls(&pairs));
+                    }
+                }
+            }
+        }
+        if role == "tool" {
+            let body = if dsml {
+                tool_calls::format_dsml_tool_result(&content)
+            } else {
+                let id = msg["tool_call_id"].as_str().unwrap_or("");
+                tool_calls::format_generic_tool_result(id, &content)
+            };
+            // DeepSeek V4 examples feed tool results as a user turn.
+            chat_msgs.push(tokenizer::ChatMessage {
+                role: "user".into(),
+                content: body,
+            });
+            continue;
+        }
+        chat_msgs.push(tokenizer::ChatMessage { role, content });
+    }
+
+    let tools_json = tools.map(|t| {
+        let schemas: Vec<&serde_json::Value> = t.iter().map(|f| &f["function"]).collect();
+        serde_json::json!(schemas)
+    });
+
+    let mut extra = serde_json::Map::new();
+    if let Some(b) = enable_thinking {
+        extra.insert("enable_thinking".into(), serde_json::Value::Bool(b));
+    }
+    if let Some(e) = reasoning_effort {
+        extra.insert(
+            "reasoning_effort".into(),
+            serde_json::Value::String(e.into()),
+        );
+    }
+    let extra_v = if extra.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(extra))
+    };
+
+    let bos = tok.bos_id.and_then(|id| tok.token_str(id));
+    let eos = tok.eos_id.and_then(|id| tok.token_str(id));
+    let rendered = tokenizer::apply_chat_template_ex(
+        &template.template,
+        &chat_msgs,
+        true,
+        bos,
+        eos,
+        tools_json.as_ref(),
+        extra_v.as_ref(),
+    )
+    .map_err(|e| e.to_string())?;
+    if std::env::var_os("PULSAR_DEBUG_CHAT").is_some() {
+        eprintln!("pulsar-serve: jinja prompt:\n{rendered}");
+    }
+    Ok(tok.encode_with_specials(&rendered))
+}
+
 /// Encode OpenAI messages as a Hy3 context: bos, system text, then per
 /// turn user/assistant markers; past assistant turns carry empty think
 /// tags and a trailing eos, exactly like the model's chat template.
@@ -1161,29 +1419,7 @@ fn encode_messages(
     messages: &[serde_json::Value],
     tools: Option<&Vec<serde_json::Value>>,
 ) -> Vec<u32> {
-    // content arrives as a plain string OR an array of typed blocks
-    // (Claude Code / Anthropic-translated clients send
-    // [{type:"text", text:...}, ...]); a string-only read silently
-    // dropped the whole system prompt for those clients
-    fn text_of(content: &serde_json::Value) -> String {
-        match content {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Array(blocks) => blocks
-                .iter()
-                .map(|b| {
-                    if let Some(t) = b["text"].as_str() {
-                        t.to_string()
-                    } else if b["type"].as_str() == Some("tool_result") {
-                        text_of(&b["content"])
-                    } else {
-                        String::new()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-            _ => String::new(),
-        }
-    }
+    let text_of = message_text_of;
     // Tool contract: schemas in the system context, calls as
     // <tool_call>{"name":...,"arguments":{...}}</tool_call> - the
     // template-agnostic convention most instruct models follow.
@@ -1234,25 +1470,43 @@ fn encode_messages(
                 ids.extend(m.render_user(tok, &content));
             }
             "assistant" => {
-                // replay past tool calls in the same syntax the model emits
+                // replay past tool calls in the dialect this family emits
                 if let Some(calls) = msg["tool_calls"].as_array() {
-                    for c in calls {
-                        let f = &c["function"];
-                        content.push_str(&format!(
-                            "\n<tool_call>\n{{\"name\": {}, \"arguments\": {}}}\n</tool_call>",
-                            f["name"],
-                            f["arguments"].as_str().unwrap_or("{}")
-                        ));
+                    let pairs: Vec<(String, String)> = calls
+                        .iter()
+                        .filter_map(|c| {
+                            let f = &c["function"];
+                            Some((
+                                f["name"].as_str()?.to_string(),
+                                f["arguments"].as_str().unwrap_or("{}").to_string(),
+                            ))
+                        })
+                        .collect();
+                    if !pairs.is_empty() {
+                        // DeepSeek markers in vocab → DSML replay
+                        let dsml = tok.find_token("<｜User｜>").is_some()
+                            || tok.find_token("<｜DSML｜tool_calls>").is_some();
+                        if dsml {
+                            if !content.is_empty() {
+                                content.push('\n');
+                            }
+                            content.push_str(&tool_calls::format_dsml_tool_calls(&pairs));
+                        } else {
+                            content.push_str(&tool_calls::format_generic_tool_calls(&pairs));
+                        }
                     }
                 }
                 ids.extend(m.render_assistant_history(tok, &content));
             }
             "tool" => {
                 let id = msg["tool_call_id"].as_str().unwrap_or("");
-                ids.extend(m.render_user(
-                    tok,
-                    &format!("<tool_result id=\"{id}\">\n{content}\n</tool_result>"),
-                ));
+                let dsml = tok.find_token("<｜User｜>").is_some();
+                let body = if dsml {
+                    tool_calls::format_dsml_tool_result(&content)
+                } else {
+                    tool_calls::format_generic_tool_result(id, &content)
+                };
+                ids.extend(m.render_user(tok, &body));
             }
             _ => {}
         }
@@ -1321,36 +1575,7 @@ fn split_harmony(s: &str) -> (String, String) {
 }
 
 fn extract_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
-    let mut clean = String::new();
-    let mut calls = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("<tool_call>") {
-        let (before, after) = rest.split_at(start);
-        clean.push_str(before);
-        let body = &after["<tool_call>".len()..];
-        let Some(end) = body.find("</tool_call>") else {
-            clean.push_str(after);
-            rest = "";
-            break;
-        };
-        let block = body[..end].trim();
-        match serde_json::from_str::<serde_json::Value>(block) {
-            Ok(v) if v["name"].is_string() => {
-                let args = if v["arguments"].is_null() {
-                    "{}".to_string()
-                } else {
-                    v["arguments"].to_string()
-                };
-                calls.push((v["name"].as_str().unwrap_or("").to_string(), args));
-            }
-            _ => {
-                clean.push_str(&after[..("<tool_call>".len() + end + "</tool_call>".len())]);
-            }
-        }
-        rest = &body[end + "</tool_call>".len()..];
-    }
-    clean.push_str(rest);
-    (clean.trim_end().to_string(), calls)
+    tool_calls::extract_tool_calls(text)
 }
 
 #[cfg(target_os = "linux")]
@@ -1390,6 +1615,7 @@ fn prefix_common(
     Ok(common)
 }
 
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)] // one call site; the request fields do not want a struct
 fn handle_chat(
     stream: &mut std::net::TcpStream,
@@ -1397,6 +1623,8 @@ fn handle_chat(
     model: &engine::Model,
     tok: &tokenizer::Tokenizer,
     markers: &tokenizer::ChatMarkers,
+    chat_template: Option<&tokenizer::ResolvedChatTemplate>,
+    jinja_chat: bool,
     st: &mut engine::State,
     model_name: &str,
     default_temp: f32,
@@ -1414,7 +1642,14 @@ fn handle_chat(
     let top_p = req["top_p"].as_f64().map(|v| v as f32).unwrap_or(1.0);
     let min_p = req["min_p"].as_f64().map(|v| v as f32).unwrap_or(0.0);
     let seed = req["seed"].as_u64().unwrap_or(42);
-    let streaming = req["stream"].as_bool().unwrap_or(false);
+    // MCP agentic loop is non-stream only. Force that when tools are enabled
+    // so DSML/Hy3 tool markup is never streamed into the chat bubble before
+    // extract_tool_calls can strip it.
+    let want_stream = req["stream"].as_bool().unwrap_or(false);
+    let streaming = want_stream
+        && !mcp
+            .map(|m| m.has_enabled_tools())
+            .unwrap_or(false);
 
     // Per-request reasoning control, accepting both conventions clients
     // actually send: OpenAI's top-level `reasoning_effort` and the
@@ -1436,6 +1671,16 @@ fn handle_chat(
     if let Some(b) = req["chat_template_kwargs"]["enable_thinking"].as_bool() {
         req_markers.set_think(b);
     }
+    // Jinja templates carry their own defaults when the client omits the
+    // kwarg. Laguna's official template defaults enable_thinking=true and
+    // opens with `<assistant><think>` — align markers so stream/non-stream
+    // split treats the reply as open-think (otherwise `</think>` leaks into
+    // content: e.g. `NAT</think>NAT`). Web UI omits the field when the
+    // thinking checkbox is on ("let checkpoint decide").
+    let enable_thinking = req["chat_template_kwargs"]["enable_thinking"].as_bool();
+    if jinja_chat && enable_thinking.is_none() && req_markers.is_laguna() {
+        req_markers.set_think(true);
+    }
     let markers = &req_markers;
 
     // Merge client-supplied tools with any enabled MCP tools (namespaced
@@ -1449,7 +1694,29 @@ fn handle_chat(
         }
     }
     let tools = if tools_vec.is_empty() { None } else { Some(tools_vec) };
-    let prompt = encode_messages(tok, markers, messages, tools.as_ref());
+    // When Jinja + Laguna and client omitted the kwarg, pass true so apply
+    // matches opens_thinking / stream split (template default is true).
+    let enable_thinking = enable_thinking.or_else(|| {
+        if jinja_chat && markers.is_laguna() {
+            Some(true)
+        } else {
+            None
+        }
+    });
+    let reasoning_effort = req["reasoning_effort"].as_str().map(|s| s.to_string());
+    let encode = |msgs: &[serde_json::Value]| {
+        encode_messages_auto(
+            tok,
+            markers,
+            chat_template,
+            jinja_chat,
+            msgs,
+            tools.as_ref(),
+            enable_thinking,
+            reasoning_effort.as_deref(),
+        )
+    };
+    let prompt = encode(messages);
     if std::env::var_os("PULSAR_DEBUG_IDS").is_some() {
         eprintln!("pulsar-serve: prompt ids {prompt:?}");
     }
@@ -1671,9 +1938,9 @@ fn handle_chat(
                         send_err.set(true);
                     }
                 }
-                const MARK: &[u8] = b"<tool_call>";
-                if let Some(p) = bytes.windows(MARK.len()).position(|w| w == MARK) {
+                if let Some(p) = tool_calls::find_tool_open(&bytes) {
                     // stream the text before the call, then go silent
+                    // (covers generic JSON, Hy3 opensource, DeepSeek DSML)
                     bytes.truncate(p);
                     tool_phase.set(true);
                 }
@@ -1682,13 +1949,9 @@ fn handle_chat(
                     Err(e) => e.valid_up_to(),
                 };
                 if !tool_phase.get() {
-                    // hold back ONLY a tail that is itself a prefix of the
-                    // <tool_call> marker, so ordinary text streams immediately
-                    // instead of always lagging (and stalling) 10 bytes behind
-                    let hold = (1..MARK.len().min(bytes.len() + 1))
-                        .rev()
-                        .find(|&k| bytes.ends_with(&MARK[..k]))
-                        .unwrap_or(0);
+                    // hold back ONLY a tail that is itself a prefix of a
+                    // tool-open marker, so ordinary text streams immediately
+                    let hold = tool_calls::tool_open_holdback(&bytes);
                     valid = valid.min(bytes.len() - hold);
                 }
                 if valid > 0 && !send_err.get() {
@@ -1768,8 +2031,9 @@ fn handle_chat(
         let mut prompt_len = prompt.len();
         let mut last_finish = "stop";
         let mut prev_calls: Vec<(String, String)> = Vec::new();
+        let mut empty_nudge_used = false;
         for turn in 0..MAX_TURNS {
-            let tp = encode_messages(tok, markers, &msgs, tools.as_ref());
+            let tp = encode(&msgs);
             if tp.len() as u32 + 2 >= st.ctx() {
                 eprintln!(
                     "pulsar-serve: {id}: context exceeded after tool turn {turn} ({} tokens)",
@@ -1811,6 +2075,25 @@ fn handle_chat(
             }
             let full = String::from_utf8_lossy(&out).into_owned();
             let (c, this_calls) = extract_tool_calls(&full);
+            if !this_calls.is_empty() {
+                eprintln!(
+                    "pulsar-serve: {id}: extracted {} tool call(s): {}",
+                    this_calls.len(),
+                    this_calls
+                        .iter()
+                        .map(|(n, _)| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            } else if full.contains("DSML")
+                || full.contains("tool_calls:opensource")
+                || full.contains("<tool_call>")
+            {
+                eprintln!(
+                    "pulsar-serve: {id}: tool-like markup present but parse yielded 0 calls ({} bytes)",
+                    full.len()
+                );
+            }
             let (r, c2) = if markers.opens_thinking() {
                 split_open_think(&c)
             } else {
@@ -1820,6 +2103,20 @@ fn handle_chat(
             reasoning = r;
             calls = this_calls;
             if calls.is_empty() {
+                // DeepSeek often ends a tool-only turn with empty clean text;
+                // after MCP results it may EOS without a final answer if the
+                // history dialect was wrong, or still need one nudge.
+                if clean.trim().is_empty() && turn > 0 && !empty_nudge_used {
+                    empty_nudge_used = true;
+                    eprintln!(
+                        "pulsar-serve: {id}: empty final after tools (turn {turn}); nudging once"
+                    );
+                    msgs.push(serde_json::json!({
+                        "role": "user",
+                        "content": "Based on the tool results above, give a concise final answer now. Do not call tools again.",
+                    }));
+                    continue;
+                }
                 last_finish = "stop";
                 break;
             }
@@ -1867,6 +2164,30 @@ fn handle_chat(
             }
             last_finish = "tool_calls";
             prev_calls = calls.to_vec();
+        }
+        // Never leave the web UI with (empty) after a successful tool loop:
+        // prefer reasoning text, else surface the last tool payload.
+        if clean.trim().is_empty() {
+            if !reasoning.trim().is_empty() {
+                clean = std::mem::take(&mut reasoning);
+            } else {
+                let tool_texts: Vec<String> = msgs
+                    .iter()
+                    .rev()
+                    .filter(|m| m["role"].as_str() == Some("tool"))
+                    .filter_map(|m| m["content"].as_str().map(str::to_owned))
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                if !tool_texts.is_empty() {
+                    eprintln!(
+                        "pulsar-serve: {id}: final content still empty; returning last tool result(s)"
+                    );
+                    clean = tool_texts.join("\n\n");
+                }
+            }
         }
         let mut message = serde_json::json!({"role": "assistant", "content": clean});
         if !reasoning.is_empty() {
