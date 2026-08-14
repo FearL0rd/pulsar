@@ -1574,20 +1574,37 @@ __device__ static float dev_dot_q5_K_q8_K_block(const block_q5_K *x, const block
     return d * (float)isum - dmin * (float)msum;
 }
 
-/* iq4_xs non-linear codebook (ggml kvalues_iq4nl). __constant__ like every
- * other codebook here: the whole warp indexes it with the same address
- * pattern, which the constant cache broadcasts in one shot where a global
- * load goes through L1 per thread. */
-__device__ __constant__ static const int8_t kd_iq4nl[16] = {
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+/* iq4_xs/iq4_nl non-linear codebook (ggml kvalues_iq4nl) lives as PRMT
+ * immediates inside iq4nl_lut4 below - see the note there for why a
+ * __constant__ table is the wrong home for divergent per-lane indices. */
 
 /* Resolve four 4-bit codebook indices (one per byte of `nib4`, already
- * masked) into four int8 weights packed as one int, ready for __dp4a. */
+ * masked) into four int8 weights packed as one int, ready for __dp4a.
+ * REGISTER lookup, not kd_iq4nl: constant memory broadcasts only when
+ * the warp reads ONE address, and here every lane carries different
+ * nibbles, so the constant cache serialized up to 32 replays per load -
+ * measured 67.6 GB/s vs 401 for q4_K on the same matvec shape. The 16
+ * codebook bytes pack into four immediates; two PRMT selects (entries
+ * 0-7 and 8-15) and a per-byte mask on nibble bit 3 pick between them.
+ * PRMT selector nibbles must stay 0-7: bit 3 flips PRMT into MSB
+ * replication mode, hence the 0x07070707 mask. */
 __device__ __forceinline__ static int iq4nl_lut4(uint32_t nib4) {
-    return (int)(((uint32_t)(uint8_t)kd_iq4nl[(nib4      ) & 0xfu])
-               | ((uint32_t)(uint8_t)kd_iq4nl[(nib4 >>  8) & 0xfu] << 8)
-               | ((uint32_t)(uint8_t)kd_iq4nl[(nib4 >> 16) & 0xfu] << 16)
-               | ((uint32_t)(uint8_t)kd_iq4nl[(nib4 >> 24) & 0xfu] << 24));
+    /* kvalues_iq4nl bytes, little-endian words: [0..3] [4..7] [8..11] [12..15] */
+    const uint32_t t0 = 0xBFAD9881u, t1 = 0xF6EADDCFu;
+    const uint32_t t2 = 0x26190D01u, t3 = 0x71594535u;
+    /* PRMT reads its four selector nibbles from bits [15:0] CONTIGUOUSLY
+     * (result byte i <- s[4i+3 : 4i]), so the per-byte indices compress
+     * into the low half first; bit 3 of each stays clear (>= 8 would flip
+     * PRMT into MSB-replication mode), the 8-15 half rides the second
+     * table pair instead. */
+    const uint32_t s = (nib4 & 0x7u)
+        | ((nib4 >> 4) & 0x70u)
+        | ((nib4 >> 8) & 0x700u)
+        | ((nib4 >> 12) & 0x7000u);
+    const uint32_t lo = __byte_perm(t0, t1, s);
+    const uint32_t hi = __byte_perm(t2, t3, s);
+    const uint32_t m = __vcmpeq4(nib4 & 0x08080808u, 0u); /* 0xFF where idx < 8 */
+    return (int)((lo & m) | (hi & ~m));
 }
 
 __device__ static float dev_dot_iq4_xs_q8_K_block(const block_iq4_xs *x, const block_q8_K *y) {

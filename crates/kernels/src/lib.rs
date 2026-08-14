@@ -1456,6 +1456,49 @@ mod tests {
         assert!(super::gqa_selftest());
     }
 
+    /// Effective bandwidth of matmul_kq per quant on a dense-27B FFN
+    /// shape - a probe, not a correctness test (weights are pseudorandom
+    /// bytes; every wdot path is branchless so timing is data-blind).
+    /// cargo test --release -p kernels kq_bandwidth -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf probe, requires a CUDA device"]
+    fn kq_bandwidth_probe() {
+        use super::*;
+        let rows = 17408u32;
+        let in_dim = 5120u32;
+        let blocks = (in_dim / 256) as usize;
+        for &(q, name, bpb) in &[
+            (QUANT_Q4_K, "q4_K", 144usize),
+            (QUANT_Q5_K, "q5_K", 176),
+            (QUANT_Q6_K, "q6_K", 210),
+            (QUANT_IQ4_XS, "iq4_xs", 136),
+        ] {
+            let rb = blocks * bpb;
+            let wbytes = rows as usize * rb;
+            let mut w = DeviceBuf::alloc(wbytes).unwrap();
+            let host: Vec<u8> = (0..wbytes).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
+            w.write(0, &host).unwrap();
+            let x: Vec<f32> = (0..in_dim as usize).map(|i| ((i * 37) % 97) as f32 * 0.01 - 0.5).collect();
+            let mut xf = DeviceBuf::alloc(in_dim as usize * 4).unwrap();
+            xf.write(0, as_bytes(&x)).unwrap();
+            let mut xq = DeviceBuf::alloc(blocks * Q8_K_BLOCK_BYTES).unwrap();
+            quantize_q8_k(&mut xq, &xf, in_dim, 1).unwrap();
+            let mut out = DeviceBuf::alloc(rows as usize * 4).unwrap();
+            for _ in 0..3 {
+                matmul_kq(&mut out, &w, &xq, in_dim, rows, 1, rb as u64, q).unwrap();
+            }
+            sync().unwrap();
+            let iters = 200;
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                matmul_kq(&mut out, &w, &xq, in_dim, rows, 1, rb as u64, q).unwrap();
+            }
+            sync().unwrap();
+            let dt = t0.elapsed().as_secs_f64() / iters as f64;
+            eprintln!("kq {name}: {:6.1} GB/s ({:.0} us, {}MB)", wbytes as f64 / dt / 1e9, dt * 1e6, wbytes >> 20);
+        }
+    }
+
     #[test]
     #[ignore = "requires a CUDA device"]
     fn q8_0_matmul_matches_cpu_reference() {
