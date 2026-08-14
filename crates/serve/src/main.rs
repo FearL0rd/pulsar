@@ -1362,14 +1362,41 @@ fn encode_messages_jinja(
     enable_thinking: Option<bool>,
     reasoning_effort: Option<&str>,
 ) -> Result<Vec<u32>, String> {
-    // DeepSeek V4's embedded template speaks DSML; replaying Hermes-style
-    // <tool_call> JSON + id= tool_result leaves the model unable to continue
-    // after MCP dispatch → empty final content in the web UI.
+    // DeepSeek V4 speaks DSML; Poolside Laguna speaks arg_key/arg_value XML.
+    // Replaying the wrong dialect leaves the model stuck after MCP dispatch.
     let dsml = tool_calls::is_dsml_template(&template.template);
+    let poolside = tool_calls::is_poolside_template(&template.template);
+    // Official Laguna Jinja only says "you may call functions" — soft enough
+    // that the model answers standings/news from stale weights. Prepend the
+    // same MUST-call policy ChatMarkers uses so MCP actually fires.
+    let poolside_force = if poolside && tools.is_some_and(|t| !t.is_empty()) {
+        Some(
+            "You MUST call a tool before answering whenever the question is about \
+anything that can change over time (standings, rankings, news, weather, prices, \
+current events, recent releases, live status) OR any specific external fact you \
+are not 100% certain of. Do not ask for permission. Tool calls use this format:\n\
+<tool_call>function_name<arg_key>arg_name</arg_key><arg_value>arg_value</arg_value></tool_call>\n\
+After tool results arrive in <tool_response>, base your answer only on them.",
+        )
+    } else {
+        None
+    };
     let mut chat_msgs: Vec<tokenizer::ChatMessage> = Vec::new();
+    let mut poolside_force_applied = poolside_force.is_none();
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("user").to_string();
         let mut content = message_text_of(&msg["content"]);
+        if role == "system" {
+            if let Some(force) = poolside_force {
+                if !poolside_force_applied {
+                    if !content.is_empty() {
+                        content.push_str("\n\n");
+                    }
+                    content.push_str(force);
+                    poolside_force_applied = true;
+                }
+            }
+        }
         if role == "assistant" {
             if let Some(calls) = msg["tool_calls"].as_array() {
                 let pairs: Vec<(String, String)> = calls
@@ -1382,11 +1409,13 @@ fn encode_messages_jinja(
                     })
                     .collect();
                 if !pairs.is_empty() {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
                     if dsml {
-                        if !content.is_empty() {
-                            content.push('\n');
-                        }
                         content.push_str(&tool_calls::format_dsml_tool_calls(&pairs));
+                    } else if poolside {
+                        content.push_str(&tool_calls::format_poolside_tool_calls(&pairs));
                     } else {
                         content.push_str(&tool_calls::format_generic_tool_calls(&pairs));
                     }
@@ -1394,20 +1423,41 @@ fn encode_messages_jinja(
             }
         }
         if role == "tool" {
-            let body = if dsml {
-                tool_calls::format_dsml_tool_result(&content)
+            if poolside && !dsml {
+                // Laguna Jinja: role=tool → <tool_response>{{ content }}</tool_response>
+                chat_msgs.push(tokenizer::ChatMessage {
+                    role: "tool".into(),
+                    content,
+                });
             } else {
-                let id = msg["tool_call_id"].as_str().unwrap_or("");
-                tool_calls::format_generic_tool_result(id, &content)
-            };
-            // DeepSeek V4 examples feed tool results as a user turn.
-            chat_msgs.push(tokenizer::ChatMessage {
-                role: "user".into(),
-                content: body,
-            });
+                let body = if dsml {
+                    tool_calls::format_dsml_tool_result(&content)
+                } else {
+                    let id = msg["tool_call_id"].as_str().unwrap_or("");
+                    tool_calls::format_generic_tool_result(id, &content)
+                };
+                // DeepSeek V4 examples feed tool results as a user turn.
+                chat_msgs.push(tokenizer::ChatMessage {
+                    role: "user".into(),
+                    content: body,
+                });
+            }
             continue;
         }
         chat_msgs.push(tokenizer::ChatMessage { role, content });
+    }
+    // No client system turn: still inject the force policy as its own system
+    // message so Laguna's Jinja header picks it up before <available_tools>.
+    if !poolside_force_applied {
+        if let Some(force) = poolside_force {
+            chat_msgs.insert(
+                0,
+                tokenizer::ChatMessage {
+                    role: "system".into(),
+                    content: force.to_string(),
+                },
+            );
+        }
     }
 
     let tools_json = tools.map(|t| {
@@ -1460,15 +1510,38 @@ fn encode_messages(
     tools: Option<&Vec<serde_json::Value>>,
 ) -> Vec<u32> {
     let text_of = message_text_of;
-    // Tool contract: schemas in the system context, calls as
-    // <tool_call>{"name":...,"arguments":{...}}</tool_call> - the
-    // template-agnostic convention most instruct models follow.
+    // Tool contract in the system context. Most instruct models accept the
+    // Hermes JSON body under <tool_call>; Poolside Laguna is trained on
+    // arg_key/arg_value XML and (per their blog) overfits that harness —
+    // teaching Hermes JSON often means it never emits a tool call at all.
+    // Match the official Laguna chat_template tools block when markers say
+    // Laguna; keep the aggressive MUST-call preamble that works for DeepSeek.
     let tool_text = tools.filter(|t| !t.is_empty()).map(|t| {
         let schemas: Vec<&serde_json::Value> = t.iter().map(|f| &f["function"]).collect();
-        format!(
-            "\n\n# Tools\n\nYou are a tool-using assistant. You MUST call a tool before answering whenever the question is about anything that can change over time (standings, rankings, news, weather, prices, current events, recent releases, live status) OR any specific external fact you are not 100% certain of from the conversation — even if you believe you already know it, because your training data may be stale. Do not ask for permission and do not mention that tools are available. Only answer directly with no tool call when the question is pure reasoning, math, or about something already settled in the conversation. To call one, output exactly:\n<tool_call>\n{{\"name\": \"<tool name>\", \"arguments\": <json arguments>}}\n</tool_call>\nYou may make multiple distinct calls in one reply, but do NOT repeat a call whose result is already in a <tool_result> block above — read that block and use it. When tool results arrive, you MUST base your answer entirely on their content — do not answer from your own knowledge for anything the tools surfaced. After all needed results arrive, stop calling tools and give the final answer immediately.\nAvailable tools (JSON Schema):\n{}",
-            serde_json::to_string(&schemas).unwrap_or_default()
-        )
+        let schemas_json = serde_json::to_string(&schemas).unwrap_or_default();
+        let must_call = "You are a tool-using assistant. You MUST call a tool before answering whenever the question is about anything that can change over time (standings, rankings, news, weather, prices, current events, recent releases, live status) OR any specific external fact you are not 100% certain of from the conversation — even if you believe you already know it, because your training data may be stale. Do not ask for permission and do not mention that tools are available. Only answer directly with no tool call when the question is pure reasoning, math, or about something already settled in the conversation.";
+        let after = "You may make multiple distinct calls in one reply, but do NOT repeat a call whose result is already in a tool result block above — read that block and use it. When tool results arrive, you MUST base your answer entirely on their content — do not answer from your own knowledge for anything the tools surfaced. After all needed results arrive, stop calling tools and give the final answer immediately.";
+        if m.is_laguna() {
+            // Official Poolside form (blog + chat_template.jinja):
+            // <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
+            // Results come back as <tool_response>…</tool_response>.
+            format!(
+                "\n\n### Tools\n\n{must_call}\n\n\
+You may call functions to assist with the user query.\n\
+All available function signatures are listed below:\n\
+<available_tools>\n{schemas_json}\n</available_tools>\n\n\
+For each function call, output the function name and arguments within this XML format (no JSON body):\n\
+<tool_call>function_name<arg_key>arg_name</arg_key><arg_value>arg_value</arg_value></tool_call>\n\
+Example: <tool_call>SearchTool__search_searxng<arg_key>query</arg_key><arg_value>Max Verstappen 2026 F1 standings</arg_value></tool_call>\n\
+Tool results arrive as <tool_response>…</tool_response>. {after}"
+            )
+        } else {
+            format!(
+                "\n\n# Tools\n\n{must_call} To call one, output exactly:\n\
+<tool_call>\n{{\"name\": \"<tool name>\", \"arguments\": <json arguments>}}\n</tool_call>\n\
+{after}\nAvailable tools (JSON Schema):\n{schemas_json}"
+            )
+        }
     });
     let mut ids: Vec<u32> = m.prologue();
     ids.extend(m.prologue_effort(tok));
@@ -1523,7 +1596,7 @@ fn encode_messages(
                         })
                         .collect();
                     if !pairs.is_empty() {
-                        // DeepSeek markers in vocab → DSML replay
+                        // DeepSeek markers in vocab → DSML; Laguna → poolside XML
                         let dsml = tok.find_token("<｜User｜>").is_some()
                             || tok.find_token("<｜DSML｜tool_calls>").is_some();
                         if dsml {
@@ -1531,6 +1604,11 @@ fn encode_messages(
                                 content.push('\n');
                             }
                             content.push_str(&tool_calls::format_dsml_tool_calls(&pairs));
+                        } else if m.is_laguna() {
+                            if !content.is_empty() {
+                                content.push('\n');
+                            }
+                            content.push_str(&tool_calls::format_poolside_tool_calls(&pairs));
                         } else {
                             content.push_str(&tool_calls::format_generic_tool_calls(&pairs));
                         }
@@ -1543,6 +1621,8 @@ fn encode_messages(
                 let dsml = tok.find_token("<｜User｜>").is_some();
                 let body = if dsml {
                     tool_calls::format_dsml_tool_result(&content)
+                } else if m.is_laguna() {
+                    tool_calls::format_poolside_tool_result(&content)
                 } else {
                     tool_calls::format_generic_tool_result(id, &content)
                 };
@@ -2128,6 +2208,7 @@ fn handle_chat(
             } else if full.contains("DSML")
                 || full.contains("tool_calls:opensource")
                 || full.contains("<tool_call>")
+                || full.contains("<arg_key>")
             {
                 eprintln!(
                     "pulsar-serve: {id}: tool-like markup present but parse yielded 0 calls ({} bytes)",
