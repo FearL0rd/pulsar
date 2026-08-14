@@ -4970,13 +4970,15 @@ mod real {
             // Shared adaptive-default rule (see the None arm below for the
             // full rationale): big f32 KV on a streaming model silently
             // starves the expert cache, so above 2GB absolute AND a third
-            // of the KV card's free VRAM the default flips to fp8.
-            let kv_auto_fp8 = |total: usize| -> bool {
+            // of the KV card's free VRAM the default flips to a quantized
+            // cache (int8 for GQA, fp8 for the MLA latent - the only
+            // quantized latent format). The chosen codec logs itself.
+            let kv_auto_quant = |total: usize| -> bool {
                 let kv_dev = m.attn_dev.unwrap_or_else(kernels::get_device);
                 let free = kernels::mem_info(kv_dev).map(|(f, _)| f).unwrap_or(usize::MAX);
                 if total > (2usize << 30) && total > free / 3 {
                     eprintln!(
-                        "pulsar: KV auto: f32 KV at ctx {} would be {:.1}GiB of {:.1}GiB free -> defaulting to fp8 ({:.1}GiB); set PULSAR_KV=f32 to force exact f32 KV",
+                        "pulsar: KV auto: f32 KV at ctx {} would be {:.1}GiB of {:.1}GiB free -> quantizing to ~{:.1}GiB; set PULSAR_KV=f32 to force exact f32 KV",
                         ctx,
                         total as f64 / GIB,
                         free as f64 / GIB,
@@ -5003,10 +5005,16 @@ mod real {
                         // expert cache and prefill chunk 4; fp8 left 9.7GB
                         // and chunk 256). So when nothing was requested and
                         // the projection is both large and a big share of
-                        // the KV card's free VRAM, default to fp8. The 2GB
+                        // the KV card's free VRAM, quantize. The 2GB
                         // absolute floor keeps small-ctx runs (bench.sh 512,
                         // check.sh 256) on the bit-exact f32 path.
-                        if kv_auto_fp8(kv_f32_total()) => { (1, false) }
+                        //
+                        // int8, not fp8: identical stride (head_dim+4) and
+                        // scripts/kld-ab.sh scores it strictly better on
+                        // Laguna - median KLD 0.0068 vs 0.0081, top-1 94.0%
+                        // vs 92.9%. e4m3 spends 4 of its 8 bits on exponent
+                        // range the per-row scale already provides.
+                        if kv_auto_quant(kv_f32_total()) => { (3, false) }
                     _ => (0, false),
                 };
                 // Rotation writes head_dim-strided vectors into qrot, which is
@@ -5046,7 +5054,7 @@ mod real {
                     Some("fp8") => 1,
                     Some("fp16") | Some("f16") => 2,
                     None => {
-                        if kv_auto_fp8(kv_f32_total()) { 1 } else { 0 }
+                        if kv_auto_quant(kv_f32_total()) { 1 } else { 0 }
                     }
                     Some(v) if !v.is_empty() && v != "f32" => {
                         eprintln!(

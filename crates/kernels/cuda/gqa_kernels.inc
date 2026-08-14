@@ -744,9 +744,16 @@ __global__ static void gqa_kv_append_q8_0_kernel(
         float amax = fabsf(blk[tid]);
         red[tid] = amax;
         __syncthreads();
-        for (uint32_t st = 16u; st != 0; st >>= 1u)
+        /* braces matter: the barrier belongs INSIDE the reduction loop.
+         * Without it each step reads red[tid+st] before the previous step
+         * published it (and the compiler is free to keep red[tid] in a
+         * register across steps), so rmax comes out too small and every
+         * value in the block saturates at +-127. Cost measured by
+         * scripts/kld-ab.sh: median KLD 0.0336 -> 0.0068 on Laguna. */
+        for (uint32_t st = 16u; st != 0; st >>= 1u) {
             if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
-        __syncthreads();
+            __syncthreads();
+        }
         const float rmax = red[0];
         const float d = rmax / 127.0f;
         const float inv = rmax > 0.0f ? 127.0f / rmax : 0.0f;
@@ -756,6 +763,7 @@ __global__ static void gqa_kv_append_q8_0_kernel(
         if (qi > 127) qi = 127;
         if (qi < -128) qi = -128;
         bb[2u + tid] = (int8_t)qi;
+        __syncthreads(); /* red[] is reused by the next block */
     }
 }
 
@@ -794,9 +802,11 @@ __global__ static void gqa_kv_append_q4_0_kernel(
         float amax = fabsf(blk[tid]);
         red[tid] = amax;
         __syncthreads();
-        for (uint32_t st = 16u; st != 0; st >>= 1u)
+        /* barrier inside the loop - see the q8_0 kernel's note */
+        for (uint32_t st = 16u; st != 0; st >>= 1u) {
             if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
-        __syncthreads();
+            __syncthreads();
+        }
         const float rmax = red[0];
         /* q4_0: value = d*(q-8), q in [0,15]; symmetric around 0 via -8.
          * Map amax to the 8..15 swing (8.5 keeps midpoint resolution). */
@@ -810,6 +820,7 @@ __global__ static void gqa_kv_append_q4_0_kernel(
             if (q1 > 15) q1 = 15; if (q1 < 0) q1 = 0;
             bb[2u + tid] = (uint8_t)(q0 | (q1 << 4));
         }
+        __syncthreads(); /* red[] is reused by the next block */
     }
 }
 
