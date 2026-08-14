@@ -8,3 +8,4 @@ Cargo.lock
 CLAUDE.md
 .claude/
 AGENTS.md
+err*.log

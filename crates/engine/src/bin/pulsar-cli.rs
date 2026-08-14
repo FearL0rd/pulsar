@@ -401,14 +401,21 @@ fn run() -> engine::Result {
     // load the dflash draft BEFORE the model: the dense-split solver
     // fills cards to capacity from measured free VRAM, so the draft's
     // buffers must already be resident for the split to leave room
-    let mut dflash_draft = match std::env::var("PULSAR_DFLASH") {
-        Ok(p) => {
-            let d = engine::DraftModel::load(std::path::Path::new(&p))?;
+    let mut dflash_draft: Option<engine::DraftModel> = None;
+    let mut dspark_model: Option<engine::Model> = None;
+    if let Ok(p) = std::env::var("PULSAR_DFLASH") {
+        let path = std::path::Path::new(&p);
+        // deepseek4 DSpark drafts are full models (own experts + heads,
+        // scripts/convert-dspark-dsv4.py); dflash-draft ggufs load the
+        // lean qwen35 DraftModel
+        if engine::parse_header(path)?.1.architecture() == Some("deepseek4") {
+            dspark_model = Some(engine::Model::load(path)?);
+            eprintln!("pulsar: dspark draft model loaded ({p})");
+        } else {
+            dflash_draft = Some(engine::DraftModel::load(path)?);
             eprintln!("pulsar: dflash draft loaded ({p})");
-            Some(d)
         }
-        Err(_) => None,
-    };
+    }
     let model = engine::Model::load(std::path::Path::new(&model_path))?;
     let tok = {
         let (_, g) = engine::parse_header(std::path::Path::new(&model_path))?;
@@ -520,6 +527,59 @@ fn run() -> engine::Result {
         }
     }
 
+    // DSpark draft state FIRST, with hard-capped budgets (~2GB): the
+    // target's measuring budget solver then adapts around it, which is
+    // the only direction that works - target-first leaves the draft
+    // nothing once the census matures (measured: cudaMalloc fail), and
+    // an uncapped draft-first starves verify (239ms -> 518ms, a net
+    // loss; a 4-6 row verify costs 3x a draft round). PULSAR_BATCH=8
+    // caps draft staging (it only ever runs block_size rows).
+    // PULSAR_DSPARK_CACHE_GB and PULSAR_DSPARK_RESIDENT=1 raise the
+    // draft's share on boxes with VRAM to spare.
+    let mut dspark_state = match dspark_model.as_ref() {
+        Some(dm) => {
+            let cache_gb = std::env::var("PULSAR_DSPARK_CACHE_GB").unwrap_or_else(|_| "1".into());
+            let saved_cache = std::env::var("PULSAR_DEV_CACHE_GB").ok();
+            let saved_batch = std::env::var("PULSAR_BATCH").ok();
+            let saved_host = std::env::var("PULSAR_CACHE_GB").ok();
+            let saved_tiers = std::env::var("PULSAR_TIERS").ok();
+            std::env::set_var("PULSAR_DEV_CACHE_GB", cache_gb);
+            std::env::set_var("PULSAR_BATCH", "8");
+            // host LFU too: the auto sizing takes min(12GB, avail-6) and
+            // the draft is created first, so without a cap it pins the
+            // RAM the target's own host cache needs (measured: verify
+            // 239ms -> 338ms from host-cache starvation alone)
+            std::env::set_var("PULSAR_CACHE_GB", "2");
+            // no tiers for the draft: a tier RESERVES a spare card's
+            // whole free VRAM as its arena even when it places 97
+            // triples, and the target's tier pass then finds 1GiB free
+            // on both cards (measured; verify 328ms vs 90ms healthy).
+            // PULSAR_DSPARK_RESIDENT flips the priority for boxes with
+            // VRAM to spare.
+            if std::env::var_os("PULSAR_DSPARK_RESIDENT").is_none() {
+                std::env::set_var("PULSAR_TIERS", "off");
+            }
+            let dst = engine::State::new(dm, 512)?;
+            match saved_tiers {
+                Some(v) => std::env::set_var("PULSAR_TIERS", v),
+                None => std::env::remove_var("PULSAR_TIERS"),
+            }
+            match saved_cache {
+                Some(v) => std::env::set_var("PULSAR_DEV_CACHE_GB", v),
+                None => std::env::remove_var("PULSAR_DEV_CACHE_GB"),
+            }
+            match saved_batch {
+                Some(v) => std::env::set_var("PULSAR_BATCH", v),
+                None => std::env::remove_var("PULSAR_BATCH"),
+            }
+            match saved_host {
+                Some(v) => std::env::set_var("PULSAR_CACHE_GB", v),
+                None => std::env::remove_var("PULSAR_CACHE_GB"),
+            }
+            Some(dst)
+        }
+        None => None,
+    };
     let mut st = engine::State::new(&model, ctx)?;
 
     if teacher_force {
@@ -794,6 +854,47 @@ fn run() -> engine::Result {
             seq.len(),
             sum / decode_logits.len() as f64,
             if decode_argmax == fresh_argmax { "MATCH" } else { "FLIP" },
+        );
+        return Ok(());
+    }
+
+    // DSpark speculative decode (deepseek4 + the converted DSpark draft
+    // gguf): PULSAR_DFLASH=/path/to/dspark-draft.gguf, greedy one-shot
+    if let (Some(dm), Some(mut dst), None) =
+        (dspark_model.take(), dspark_state.take(), dump_logits.as_ref())
+    {
+        let mut generated: Vec<u32> = Vec::new();
+        let mut t_first: Option<std::time::Instant> = None;
+        let out = std::io::stdout();
+        engine::generate_dspark(
+            &model,
+            &mut st,
+            &dm,
+            &mut dst,
+            &prompt_ids,
+            0,
+            n_predict,
+            |t| tok.is_eog(t),
+            |t| {
+                t_first.get_or_insert_with(std::time::Instant::now);
+                generated.push(t);
+                use std::io::Write;
+                let mut o = out.lock();
+                o.write_all(&tok.decode(&[t])).ok();
+                o.flush().ok();
+            },
+        )?;
+        println!();
+        st.save_warm(&model)?;
+        let dt = t_first.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
+        eprintln!(
+            "pulsar: {} tokens in {:.2}s ({:.2} tok/s), dspark {}/{} drafts accepted ({:.0}%)\npulsar: ids {generated:?}",
+            generated.len(),
+            dt,
+            generated.len() as f32 / dt.max(1e-6),
+            st.mtp_accepted,
+            st.mtp_drafted,
+            100.0 * st.mtp_accepted as f64 / st.mtp_drafted.max(1) as f64
         );
         return Ok(());
     }

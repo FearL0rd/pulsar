@@ -842,7 +842,7 @@ impl DraftModel {
 /// Confidence cut threshold in logit space. PULSAR_DSPARK_CONF is the
 /// sigmoid probability (default 0.5: cut only slots the head thinks are
 /// more likely rejected than accepted); "off" disables the cut.
-fn dspark_conf_threshold() -> f32 {
+pub(super) fn dspark_conf_threshold() -> f32 {
     match std::env::var("PULSAR_DSPARK_CONF").ok().as_deref() {
         Some("off") => f32::NEG_INFINITY,
         Some(v) => v

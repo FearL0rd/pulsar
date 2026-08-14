@@ -470,7 +470,11 @@ Everything auto-configures; these override. Shared by `pulsar-cli` and
 | `PULSAR_MTP` | unset | `1` = MTP / nextn speculative decode when the GGUF has a nextn block (greedy) |
 | `PULSAR_MTP_DEPTH` | 3 | draft chain depth for MTP |
 | `PULSAR_NGRAM` | unset | draft-free n-gram speculation depth (greedy; disables some serve prefix-cache paths) |
-| `PULSAR_DFLASH` | unset | path to DFlash draft GGUF (CLI speculative path) |
+| `PULSAR_DFLASH` | unset | path to draft GGUF (CLI speculative path): DFlash for qwen35, converted DSpark for deepseek4 |
+| `PULSAR_DSPARK_DEPTH` | 3 | dsv4 DSpark: tokens drafted per round (1..block_size; deeper measured slower) |
+| `PULSAR_DSPARK_CONF` | 0.5 | dsv4 DSpark: confidence prefix-cut probability; `off` disables the cut |
+| `PULSAR_DSPARK_CACHE_GB` | 1 | dsv4 DSpark: draft state's VRAM expert cache |
+| `PULSAR_DSPARK_RESIDENT` | unset | set = tier the draft's WHOLE expert set (~9.6GiB; needs spare VRAM, see README) |
 | `PULSAR_GRAPHS` | on | `0` = disable CUDA graphs where supported (e.g. Qwen3.5) |
 
 #### Chat templates (serve + CLI chat)
@@ -646,6 +650,25 @@ falls behind again: the round's remaining fixed costs (a ~95ms verify
 floor of per-layer launches and router readbacks, a draft whose cost
 grows with the feature window) need acceptance ~7+ to amortize, and
 measured acceptance is 4.3 on math, less on prose.
+
+Same story, next family: DSpark speculative decoding for DeepSeek V4
+Flash, from the official draft (`scripts/convert-dspark-dsv4.py`
+rewrites unsloth's `dflash` gguf into a 3-layer `deepseek4` model the
+normal loader takes; the five DSpark head tensors - fc, main norm,
+markov bigram pair, confidence - load beside it). The draft is
+stateless by construction: every round recomputes its 128-row window
+K from the target's captured hidden means, so there is no draft cache
+and nothing to roll back. Verify is one batched multi-row target
+forward; recurrent-lane checkpoints restore and replay only on partial
+accepts. Output is byte-identical to plain greedy, acceptance is
+70-79% per drafted token, and on the reference box it is opt-in
+experimental for the same honest reason as DFlash: 8.3-8.8 tok/s
+against 11.3 sequential. Expert-streaming decode is bandwidth-bound,
+and speculative rows multiply routed-expert traffic instead of
+amortizing it - verify rows do not share experts. The regime flips
+only when the draft's own experts are VRAM-resident, which costs
+9.6GiB this box cannot spare next to a 90GB target
+(`PULSAR_DSPARK_RESIDENT=1` claims it anyway on boxes that can).
 MCP (Model Context Protocol) tool-use in pulsar-serve, opt-in via
 `--webui-mcp-proxy`: the server connects to configured MCP servers
 (rmcp 3.0.1; stdio + streamable-http), exposes their tools to the model
@@ -670,6 +693,10 @@ Not yet:
 - deepseek4 perf pass: batched prefill (prompts currently process
   sequentially), resident tiers + cross-layer prefetch for the dsv4
   resolve, fewer host syncs on the hyper-connection gates
+- DSpark, remaining: per-row recurrent-lane snapshots inside verify
+  (kills the replay forward on partial accepts, the DFlash fast-
+  rollback move), and a measured `PULSAR_DSPARK_RESIDENT` run on a
+  box with 10GB+ spare VRAM, where the math says it wins
 - tensor-core unpackers for the remaining expert formats (iq2_xs,
   iq3_xxs, q4_K, q5_1, q2_K, q3_K, the harness takes one ~40-line
   unpacker per format)

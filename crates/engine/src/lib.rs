@@ -34,6 +34,7 @@ mod real {
     mod dsv4;
     mod k3;
     mod qwen35;
+    pub use dsv4::generate_dspark;
     pub use qwen35::{generate_dflash, DraftModel};
 
     use std::fs::File;
@@ -1034,6 +1035,9 @@ mod real {
         ones_hc: Option<DeviceBuf>,
         /// deepseek4 output-head HC merge
         dsv4_out: Option<Dsv4OutW>,
+        /// DSpark draft heads (fc / main_norm / markov / confidence):
+        /// present only on a converted draft gguf, None on targets
+        dspark: Option<dsv4::DsparkW>,
     }
 
     /// deepseek4 output_hc_*: collapse the final HC streams before
@@ -3927,6 +3931,9 @@ mod real {
             } else {
                 (None, None)
             };
+            // DSpark draft heads: only a converted draft gguf carries
+            // fc.weight, so every target model skips this in one probe
+            let dspark = if dsv4_arch { dsv4::load_dspark(&file, &gguf)? } else { None };
             // the split/attn placement loops leave whatever device they
             // touched last current; restore the primary so post-load
             // allocations (draft models, probes) land on the fast card
@@ -3991,6 +3998,7 @@ mod real {
                 compress_ratios,
                 ones_hc,
                 dsv4_out,
+                dspark,
             })
         }
     }
@@ -4030,9 +4038,18 @@ mod real {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let mut census: std::collections::HashMap<u64, u64> =
-            read_census(&m.path).into_iter().map(|(off, _, count)| (off, count)).collect();
-        if census.is_empty() {
+        // PULSAR_DSPARK_RESIDENT=1: tier a DSpark draft's WHOLE expert
+        // set (uniform heat, no census). Only worth it with ~10GB of
+        // VRAM to spare: on substrate it evicted the target's tiers and
+        // verify went 239ms -> 518ms, a measured net loss. Default is
+        // the census ranking, same as any model.
+        let all = m.dspark.is_some() && std::env::var_os("PULSAR_DSPARK_RESIDENT").is_some();
+        let mut census: std::collections::HashMap<u64, u64> = if all {
+            Default::default()
+        } else {
+            read_census(&m.path).into_iter().map(|(off, _, count)| (off, count)).collect()
+        };
+        if census.is_empty() && !all {
             // first run: rank tiers from the built-in hotlist seed too
             // (same fallback load_warm uses for the caches)
             if std::env::var_os("PULSAR_NO_HOTLIST").is_none() {
@@ -4042,10 +4059,10 @@ mod real {
                     census = heat.into_iter().map(|(off, (count, _len))| (off, count)).collect();
                 }
             }
-        }
-        if census.is_empty() {
-            eprintln!("pulsar: no warm census yet - expert tiers idle until the next run");
-            return Ok(Vec::new());
+            if census.is_empty() {
+                eprintln!("pulsar: no warm census yet - expert tiers idle until the next run");
+                return Ok(Vec::new());
+            }
         }
         // rank whole triples by summed slab heat. Inkling's sink bank
         // ranks BELOW every routed triple despite its every-token heat:
@@ -4062,7 +4079,11 @@ mod real {
             for e in 0..s.n_expert as u64 {
                 let slabs = [gate_exps, up_exps, down_exps]
                     .map(|t| (t.abs_offset + e * t.expert_bytes, t.expert_bytes));
-                let heat: u64 = slabs.iter().filter_map(|(off, _)| census.get(off)).sum();
+                let heat: u64 = if all {
+                    1
+                } else {
+                    slabs.iter().filter_map(|(off, _)| census.get(off)).sum()
+                };
                 if heat > 0 {
                     triples.push((heat, slabs));
                 }
@@ -4084,6 +4105,9 @@ mod real {
         if triples.is_empty() {
             // fully-resident model (DenseKq): a tier would just grab the
             // free VRAM its own layers need
+            if std::env::var_os("PULSAR_TIER_LOG").is_some() {
+                eprintln!("pulsar: tier skip: no census-hot triples (primary {primary}, candidates {candidates:?})");
+            }
             return Ok(Vec::new());
         }
 
@@ -4094,6 +4118,9 @@ mod real {
             let Ok((free, _)) = kernels::mem_info(d) else { continue };
             let reserve: usize = 1 << 30; // scratch + CUDA context
             if free <= reserve + (1 << 30) {
+                if std::env::var_os("PULSAR_TIER_LOG").is_some() {
+                    eprintln!("pulsar: tier skip: device {d} only {:.1}GiB free", free as f64 / GIB);
+                }
                 continue; // not worth a tier
             }
             let t0 = std::time::Instant::now();

@@ -10,7 +10,7 @@
 //! machines. ponytail: no tiers/prefetch/batched prefill yet - fold
 //! dsv4 into the shared MoE resolve when the perf pass starts.
 
-use super::{Attn, Ffn, LayerW, Model, Result, Shape, State, SLAB_SLACK};
+use super::{Attn, Dsv4W, Ffn, LayerW, Model, Result, Shape, State, SLAB_SLACK};
 use kernels::DeviceBuf;
 
 /// Packed byte width of one quantized latent row for the given kvq codec.
@@ -961,9 +961,26 @@ impl Model {
             .into());
         }
 
-        // Output head over the LAST r tokens' streams. The kernels below
-        // all batch already; only this tail was pinned to a single row,
-        // which is what blocked speculative verify on dsv4.
+        self.dsv4_output_head(st, rt, last_t, r)?;
+        // Leave the last token's streams at row 0 for the next step.
+        // hc_next is free again here (the control projection read it), and
+        // the streams are only consumed by the head, so this lands after
+        // the logits rather than disturbing them.
+        let hc_row = (s.n_hc * s.n_embd) as usize * 4;
+        kernels::copy_d2d(&mut rt.hc_next, 0, &rt.hc_cur, (r - 1) * hc_row, hc_row)?;
+        std::mem::swap(&mut rt.hc_cur, &mut rt.hc_next);
+        kernels::sync()?;
+        Ok(Some(st.logits.read_f32(r * s.n_vocab as usize)?))
+    }
+
+    /// Output head over the LAST `r` of `last_t` stream rows: gather,
+    /// sigmoid hc_head gates (NOT Sinkhorn), output_norm, lm head. The
+    /// kernels all batch; only this tail was pinned to a single row,
+    /// which is what blocked speculative verify on dsv4. Leaves the r
+    /// mixed PRE-norm rows in st.last_row (the DSpark confidence head
+    /// reads them) and r logit rows in st.logits.
+    fn dsv4_output_head(&self, st: &mut State, rt: &mut Dsv4Rt, last_t: usize, r: usize) -> Result {
+        let s = self.shape;
         let out = self.dsv4_out.as_ref().ok_or("dsv4 output head missing")?;
         let ones = self.ones_hc.as_ref().ok_or("ones_hc missing")?;
         let hc_row = (s.n_hc * s.n_embd) as usize * 4;
@@ -999,14 +1016,7 @@ impl Model {
         )?;
         kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, r as u32, s.rms_eps)?;
         self.head_logits(st, r as u32)?;
-        // Leave the last token's streams at row 0 for the next step.
-        // hc_next is free again here (the control projection read it), and
-        // the streams are only consumed above, so this lands after the
-        // logits rather than disturbing them.
-        kernels::copy_d2d(&mut rt.hc_next, 0, &rt.hc_cur, (r - 1) * hc_row, hc_row)?;
-        std::mem::swap(&mut rt.hc_cur, &mut rt.hc_next);
-        kernels::sync()?;
-        Ok(Some(st.logits.read_f32(r * s.n_vocab as usize)?))
+        Ok(())
     }
 
     /// Scatter the mean of the hyper-connection streams for `t` tokens
@@ -1307,7 +1317,16 @@ impl Model {
         kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &rt.low, (s.n_out_group as usize * rank) as u32, s.n_embd, t)?;
         self.dsv4_hc_post(rt, &st.attn_out, false, t)?;
 
-        // ---- ffn half: ONE router readback + ONE MoE union per chunk
+        self.dsv4_ffn_half(st, rt, il, l, w, tokens, pos0, t)
+    }
+
+    /// ffn half shared by the target layers and the DSpark draft block:
+    /// hc_pre -> ffn_norm -> ONE router readback -> shared expert ->
+    /// ONE MoE union -> hc_post. `il`/`pos0` only feed the L0 probe.
+    #[allow(clippy::too_many_arguments)]
+    fn dsv4_ffn_half(&self, st: &mut State, rt: &mut Dsv4Rt, il: usize, l: &LayerW, w: &Dsv4W, tokens: &[u32], pos0: u32, t: u32) -> Result {
+        let s = self.shape;
+        let eps = s.rms_eps;
         self.dsv4_hc_pre(st, rt, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base, true, t)?;
         kernels::rms_norm(&mut st.normed, &st.cur, &l.ffn_norm, s.n_embd, t, eps)?;
         let Ffn::Moe { gate_inp, shexp, gate_exps, up_exps, down_exps, .. } = &l.ffn else {
@@ -1694,6 +1713,368 @@ impl Model {
 }
 
 /* ---- prefix persistence (serve --prefix-file) --------------------------- */
+
+/* ---- DSpark speculative decode ----------------------------------------- */
+/* The draft is a full 3-layer deepseek4 Model (scripts/convert-dspark-
+ * dsv4.py rewrites the unsloth `dflash` gguf); these are the five head
+ * tensors it carries beyond a plain stack, plus the block metadata.
+ * Reference: DeepSeek inference/model.py DSparkBlock (fetched 2026-08-14).
+ */
+
+/// DSpark head weights riding on a converted draft gguf.
+pub(super) struct DsparkW {
+    /// q8_0 [n_capture*n_embd -> n_embd] context-feature projection
+    /// (reference main_proj)
+    fc: DeviceBuf,
+    /// f32 [n_embd] rms weight over fc's output (gguf enc.output_norm,
+    /// reference main_norm)
+    main_norm: DeviceBuf,
+    /// q8_0 [n_vocab x rank] markov bigram embedding / vocab projection
+    w1: DeviceBuf,
+    w2: DeviceBuf,
+    rank: u32,
+    /// host f32 [n_embd + rank] acceptance-confidence projection (the
+    /// draft gguf ships no bias tensor for it)
+    conf_w: Vec<f32>,
+    block_size: usize,
+    noise_id: u32,
+    target_layers: Vec<usize>,
+}
+
+/// Load the DSpark heads when the gguf carries them (draft ggufs only;
+/// every target model returns None from the one-tensor probe).
+pub(super) fn load_dspark(file: &super::VFile, g: &gguf::Gguf) -> Result<Option<DsparkW>> {
+    if g.tensor("fc.weight").is_none() {
+        return Ok(None);
+    }
+    let rank = g
+        .tensor("markov_w1.weight")
+        .ok_or("dspark draft: fc.weight without markov_w1.weight")?
+        .dims[0] as u32;
+    let block_size = g
+        .arch_meta("block_size")
+        .and_then(gguf::Value::as_u64)
+        .ok_or("dspark draft missing deepseek4.block_size")? as usize;
+    let noise_id = g
+        .metadata
+        .get("tokenizer.ggml.mask_token_id")
+        .and_then(gguf::Value::as_u64)
+        .ok_or("dspark draft missing tokenizer.ggml.mask_token_id")? as u32;
+    let target_layers: Vec<usize> = match g.arch_meta("target_layers") {
+        Some(gguf::Value::Array(a)) => {
+            a.iter().filter_map(gguf::Value::as_u64).map(|v| v as usize).collect()
+        }
+        _ => return Err("dspark draft missing deepseek4.target_layers".into()),
+    };
+    if block_size == 0 || block_size > T_MAX || target_layers.is_empty() {
+        return Err(format!("dspark draft: block_size {block_size} / {} target layers", target_layers.len()).into());
+    }
+    let conf_w = super::read_f16_as_f32(file, g, "conf_proj.weight")?;
+    eprintln!(
+        "pulsar: dspark draft heads loaded (block {block_size}, markov rank {rank}, targets {target_layers:?})"
+    );
+    Ok(Some(DsparkW {
+        fc: super::upload(file, g, "fc.weight")?,
+        main_norm: super::upload(file, g, "enc.output_norm.weight")?,
+        w1: super::upload(file, g, "markov_w1.weight")?,
+        w2: super::upload(file, g, "markov_w2.weight")?,
+        rank,
+        conf_w,
+        block_size,
+        noise_id,
+        target_layers,
+    }))
+}
+
+/// Round scratch for the DSpark draft forward, sized once per generate
+/// call. The window K is recomputed from the capture ring every round,
+/// so the draft is stateless: no draft cache, nothing to roll back.
+struct DraftScratch {
+    feat_in: DeviceBuf, // [n_swa][n_capture*n_embd] ring gather
+    main_x: DeviceBuf,  // [n_swa][n_embd] fc-projected context
+    kcat: DeviceBuf,    // [n_swa+block][head_dim] window+block K(=V) rows
+    state: DeviceBuf,   // [rank] markov w1[prev]
+    scratch: DeviceBuf, // per-block argmax winners
+    out_id: DeviceBuf,  // 4B argmax result
+}
+
+fn argmax(row: &[f32]) -> u32 {
+    let mut bi = 0usize;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &v) in row.iter().enumerate() {
+        if v > bv {
+            bv = v;
+            bi = i;
+        }
+    }
+    bi as u32
+}
+
+impl Model {
+    /// One DSpark draft round (self = the DRAFT model). Blocks of
+    /// `block_size` rows are drafted from the target's captured hidden
+    /// window; returns [last_tok, d1..dk] with k <= depth (the
+    /// confidence head may cut the tail short).
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_block(&self, dst: &mut State, sc: &mut DraftScratch, ring: &DeviceBuf, n_capture: usize, committed: u32, last_tok: u32, depth: usize) -> Result<Vec<u32>> {
+        let mut rt = dst.dsv4.take().ok_or("draft dsv4 state missing")?;
+        let r = self.dspark_block_inner(dst, &mut rt, sc, ring, n_capture, committed, last_tok, depth);
+        dst.dsv4 = Some(rt);
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_block_inner(&self, dst: &mut State, rt: &mut Dsv4Rt, sc: &mut DraftScratch, ring: &DeviceBuf, n_capture: usize, committed: u32, last_tok: u32, depth: usize) -> Result<Vec<u32>> {
+        let s = self.shape;
+        let dsp = self.dspark.as_ref().ok_or("dspark heads missing")?;
+        let bs = dsp.block_size;
+        let eps = s.rms_eps;
+        let w_eff = (committed as usize).min(s.n_swa as usize);
+        let start = committed - w_eff as u32;
+
+        // 1. window features -> main_x rows, in position order. Rope is
+        // absolute and the attention set is permutation-invariant, so
+        // the gather order only has to be consistent with the rope call.
+        kernels::qwen35_ring_gather(
+            &mut sc.feat_in, ring,
+            (start as usize % super::qwen35::RING_CAP) as u32,
+            super::qwen35::RING_CAP as u32,
+            w_eff as u32, n_capture as u32 * s.n_embd,
+        )?;
+        kernels::matmul_q8_0(&mut sc.main_x, &dsp.fc, &sc.feat_in, n_capture as u32 * s.n_embd, s.n_embd, w_eff as u32)?;
+        kernels::rms_norm_inplace(&mut sc.main_x, &dsp.main_norm, s.n_embd, w_eff as u32, eps)?;
+
+        // 2. noise block [last_tok, NOISE x bs-1], embedded with the
+        // (borrowed) target table, expanded to n_hc identical streams
+        let mut ids = vec![dsp.noise_id as i32; bs];
+        ids[0] = last_tok as i32;
+        dst.tok.write(0, kernels::as_bytes(&ids))?;
+        kernels::embed_q8_0(&mut dst.cur, &self.token_embd, &dst.tok, s.n_embd, s.n_vocab, bs as u32)?;
+        let row = s.n_embd as usize * 4;
+        for i in 0..bs {
+            for h in 0..s.n_hc as usize {
+                kernels::copy_d2d(&mut rt.hc_cur, (i * s.n_hc as usize + h) * row, &dst.cur, i * row, row)?;
+            }
+        }
+
+        let rope = rope_cfg(&s, 0);
+        let q_dim = s.n_head * s.head_dim;
+        let total_k = w_eff as u32 + bs as u32;
+        let toks: Vec<u32> = ids.iter().map(|&x| x as u32).collect();
+        for (il, l) in self.layers.iter().enumerate() {
+            let Attn::Dsv4(w) = &l.attn else {
+                return Err("dspark draft layer without Dsv4 attn weights".into());
+            };
+            // attention half: mirrors eval_dsv4_layer's projections, but
+            // the kv set is the recomputed window + the block itself
+            self.dsv4_hc_pre(dst, rt, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base, false, bs as u32)?;
+            kernels::rms_norm(&mut dst.normed, &dst.cur, &l.attn_norm, s.n_embd, bs as u32, eps)?;
+            kernels::matmul_q8_0(&mut dst.q_rank, &w.q_a, &dst.normed, s.n_embd, s.n_lora_q, bs as u32)?;
+            kernels::rms_norm(&mut dst.q_rank_norm, &dst.q_rank, &w.q_a_norm, s.n_lora_q, bs as u32, eps)?;
+            kernels::matmul_q8_0(&mut dst.q, &w.q_b, &dst.q_rank_norm, s.n_lora_q, q_dim, bs as u32)?;
+            kernels::gqa_head_rms_norm(&mut dst.q, None, bs as u32 * s.n_head, s.head_dim, eps)?;
+            kernels::dsv4_rope_tail(&mut dst.q, bs as u32, s.n_head, s.head_dim, s.rot_dim, committed, &rope, false)?;
+            // K(=V): window rows from the projected context (reference
+            // main_kv, per-layer wkv), block rows from the normed block.
+            // Positions start..committed+bs are contiguous, so norm /
+            // rope / fp8 QAT sim run once over the whole set. The
+            // reference caches these rows in bf16; we keep f32 (the
+            // drift only nudges acceptance, and verify catches it).
+            kernels::matmul_q8_0(&mut sc.kcat, &w.kv, &sc.main_x, s.n_embd, s.head_dim, w_eff as u32)?;
+            kernels::matmul_q8_0_off(&mut sc.kcat, w_eff * s.head_dim as usize * 4, &w.kv, 0, &dst.normed, 0, s.n_embd, s.head_dim, bs as u32)?;
+            kernels::rms_norm_inplace(&mut sc.kcat, &w.kv_a_norm, s.head_dim, total_k, eps)?;
+            kernels::dsv4_rope_tail(&mut sc.kcat, total_k, 1, s.head_dim, s.rot_dim, start, &rope, false)?;
+            kernels::dsv4_fp8_sim(&mut sc.kcat, total_k, s.head_dim, s.rot_dim)?;
+            // non-causal: every block row sees the full window AND the
+            // whole block (reference get_dspark_topk_idxs), which is
+            // exactly "all n_raw rows visible" to the sink-aware kernel
+            for i in 0..bs {
+                kernels::dsv4_attention_at(
+                    &mut dst.heads, i * q_dim as usize * 4,
+                    &dst.q, i * q_dim as usize * 4,
+                    &sc.kcat, total_k, None, 0, None,
+                    &w.sinks, s.n_head, s.head_dim,
+                    1.0 / (s.head_dim as f32).sqrt(),
+                    0, 0, None,
+                )?;
+            }
+            kernels::dsv4_rope_tail(&mut dst.heads, bs as u32, s.n_head, s.head_dim, s.rot_dim, committed, &rope, true)?;
+            let rank = 1024usize;
+            kernels::matmul_q8_0_banked(&mut rt.low, &w.out_a, &dst.heads, q_dim / s.n_out_group, rank as u32, s.n_out_group, bs as u32)?;
+            kernels::matmul_q8_0(&mut dst.attn_out, &l.attn_output, &rt.low, (s.n_out_group as usize * rank) as u32, s.n_embd, bs as u32)?;
+            self.dsv4_hc_post(rt, &dst.attn_out, false, bs as u32)?;
+            self.dsv4_ffn_half(dst, rt, il, l, w, &toks, committed, bs as u32)?;
+        }
+        // head: the draft's own sigmoid hc_head gates + output_norm +
+        // the borrowed target lm head
+        self.dsv4_output_head(dst, rt, bs, bs)?;
+
+        // markov-biased greedy, sequenced on the previous pick: logits
+        // row i predicts the token AFTER slot i (reference forward_head)
+        let v = s.n_vocab as usize;
+        let mut out = vec![last_tok];
+        let mut states_host: Vec<Vec<f32>> = Vec::with_capacity(depth);
+        for i in 0..depth {
+            let prev = [*out.last().unwrap() as i32];
+            dst.tok.write(0, kernels::as_bytes(&prev))?;
+            kernels::embed_q8_0(&mut sc.state, &dsp.w1, &dst.tok, dsp.rank, s.n_vocab, 1)?;
+            let t = kernels::dspark_markov_argmax(
+                &dst.logits, i * v, &dsp.w2, &sc.state,
+                s.n_vocab, dsp.rank, &mut sc.scratch, &mut sc.out_id,
+            )?;
+            states_host.push(sc.state.read_f32(dsp.rank as usize)?);
+            out.push(t);
+        }
+        // confidence prefix cut: slot i pairs pre-norm x row i with the
+        // markov embed that PRODUCED out[i+1]; the verify then runs only
+        // the surviving rows
+        let thr = super::qwen35::dspark_conf_threshold();
+        if thr > f32::NEG_INFINITY {
+            let ne = s.n_embd as usize;
+            let x_host = dst.last_row.read_f32(bs * ne)?;
+            let mut keep = 1usize;
+            for i in 0..depth {
+                let xrow = &x_host[i * ne..(i + 1) * ne];
+                let mut acc = 0.0f32; // conf_proj ships no bias
+                for (a, b) in dsp.conf_w[..ne].iter().zip(xrow) {
+                    acc += a * b;
+                }
+                for (a, b) in dsp.conf_w[ne..].iter().zip(&states_host[i]) {
+                    acc += a * b;
+                }
+                if acc < thr {
+                    break;
+                }
+                keep += 1;
+            }
+            out.truncate(keep);
+        }
+        Ok(out)
+    }
+}
+
+/// DSpark speculative generation for deepseek4 (greedy): draft a block
+/// from the target's captured hidden window, verify in one batched
+/// target forward (ONE MoE union), accept the matching prefix, restore
+/// the recurrent lanes and replay the accepted tokens. KV/comp rows are
+/// positional and rewritten, so a full accept skips the rollback.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_dspark(
+    target: &Model,
+    tst: &mut State,
+    draft: &Model,
+    dst: &mut State,
+    prompt: &[u32],
+    pos0: u32,
+    max_tokens: usize,
+    stop: impl Fn(u32) -> bool,
+    mut on_token: impl FnMut(u32),
+) -> Result<u32> {
+    let s = target.shape;
+    let v = s.n_vocab as usize;
+    let dsp = draft.dspark.as_ref().ok_or("draft gguf carries no DSpark heads (fc.weight)")?;
+    if draft.shape.n_embd != s.n_embd || draft.shape.n_vocab != s.n_vocab {
+        return Err("dspark draft/target shape mismatch".into());
+    }
+    let depth = std::env::var("PULSAR_DSPARK_DEPTH")
+        .ok()
+        .and_then(|x| x.parse::<usize>().ok())
+        .unwrap_or(3)
+        .clamp(1, dsp.block_size);
+    let n_capture = dsp.target_layers.len();
+    // arm the capture ring BEFORE prefill
+    {
+        let rt = tst.dsv4.as_mut().ok_or("dsv4 state missing")?;
+        rt.enable_dflash(target, dsp.target_layers.clone())?;
+    }
+    let ds = draft.shape;
+    let f32s = |n: usize| DeviceBuf::alloc(n * 4);
+    let mut sc = DraftScratch {
+        feat_in: f32s(ds.n_swa as usize * n_capture * ds.n_embd as usize)?,
+        main_x: f32s(ds.n_swa as usize * ds.n_embd as usize)?,
+        kcat: f32s((ds.n_swa as usize + dsp.block_size) * ds.head_dim as usize)?,
+        state: f32s(dsp.rank as usize)?,
+        scratch: DeviceBuf::alloc(128 * 8)?,
+        out_id: DeviceBuf::alloc(4)?,
+    };
+    let logits = target.forward_rows(tst, prompt, pos0, 1)?.ok_or("no prefill logits")?;
+    let mut last_tok = argmax(&logits);
+    let mut committed = pos0 + prompt.len() as u32;
+    let mut emitted = 0usize;
+    let debug = std::env::var_os("PULSAR_DFLASH_DEBUG").is_some();
+
+    while emitted < max_tokens {
+        if committed + dsp.block_size as u32 + 1 >= tst.ctx {
+            break;
+        }
+        // 1. draft (confidence may cut the block short: nrows <= depth+1)
+        let t0 = std::time::Instant::now();
+        let draft_tok = {
+            let rt = tst.dsv4.as_ref().ok_or("dsv4 state missing")?;
+            let ring = &rt.dflash.as_ref().ok_or("dspark capture not armed")?.ring;
+            draft.dspark_block(dst, &mut sc, ring, n_capture, committed, last_tok, depth)?
+        };
+        let nrows = draft_tok.len();
+        tst.mtp_drafted += (nrows - 1) as u64;
+        let t_draft = t0.elapsed();
+        // 2. lane snapshot + batched verify
+        let t0 = std::time::Instant::now();
+        let ck = tst.dsv4.as_ref().ok_or("dsv4 state missing")?.ckpt()?;
+        let all = target
+            .forward_rows(tst, &draft_tok, committed, nrows as u32)?
+            .ok_or("no verify logits")?;
+        let t_verify = t0.elapsed();
+        let target_tok: Vec<u32> =
+            (0..nrows).map(|i| argmax(&all[i * v..(i + 1) * v])).collect();
+        if debug {
+            eprintln!("dspark round @{committed}:\n  draft  {draft_tok:?}\n  target {target_tok:?}");
+        }
+        // 3. accept the matching prefix (row i predicts the token after
+        //    draft_tok[i]; draft_tok[0] = last_tok is always accepted)
+        let mut accept_n = 1usize;
+        while accept_n < nrows && draft_tok[accept_n] == target_tok[accept_n - 1] {
+            accept_n += 1;
+        }
+        tst.mtp_accepted += (accept_n - 1) as u64;
+        // 4. rejected rows advanced the compressor/indexer lanes:
+        //    restore and replay the accepted prefix. A full accept means
+        //    the lanes saw exactly the accepted tokens - skip both.
+        let t0 = std::time::Instant::now();
+        if accept_n < nrows {
+            tst.dsv4.as_mut().ok_or("dsv4 state missing")?.ckpt_restore(&ck)?;
+            target.forward_rows(tst, &draft_tok[..accept_n], committed, 0)?;
+        }
+        let t_replay = t0.elapsed();
+        if debug {
+            eprintln!(
+                "dspark timing: draft {:.0}ms verify {:.0}ms replay({accept_n}) {:.0}ms",
+                t_draft.as_secs_f64() * 1e3,
+                t_verify.as_secs_f64() * 1e3,
+                t_replay.as_secs_f64() * 1e3
+            );
+        }
+        // 5. emit (stop tokens are forwarded into state but not emitted)
+        let mut hit_stop = false;
+        for &tokv in &draft_tok[..accept_n] {
+            if stop(tokv) {
+                hit_stop = true;
+                break;
+            }
+            on_token(tokv);
+            emitted += 1;
+            if emitted >= max_tokens {
+                hit_stop = true;
+                break;
+            }
+        }
+        committed += accept_n as u32;
+        last_tok = target_tok[accept_n - 1];
+        if hit_stop {
+            break;
+        }
+    }
+    Ok(committed)
+}
 
 fn put_buf(out: &mut Vec<u8>, b: &DeviceBuf, bytes: usize) -> Result {
     let mut host = vec![0u8; bytes];
