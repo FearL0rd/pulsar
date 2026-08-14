@@ -47,6 +47,9 @@ diagnostics:
   --dump-logits PATH   write logits (see scripts/kld-ab.sh)
   --decode-consistency N
                        compare incremental decode against a fresh prefill
+  --rows-consistency N
+                       check multi-row (speculative verify) logits against
+                       single-token steps at the same positions
 
 environment:
   PULSAR_KV=f32|int8|fp8|fp16|q8_0|q4_0|turbo8|turbo4
@@ -327,6 +330,7 @@ fn run() -> engine::Result {
     let mut dump_logits = None;
     let mut teacher_force = false;
     let mut decode_consistency = None;
+    let mut rows_consistency = None;
     let mut chat = false;
     let mut system = None;
     let mut temp = None;
@@ -366,6 +370,7 @@ fn run() -> engine::Result {
             "--dump-logits" => dump_logits = Some(need("--dump-logits")?),
             "--teacher-force" => teacher_force = true,
             "--decode-consistency" => decode_consistency = Some(need("--decode-consistency")?.parse::<usize>()?),
+            "--rows-consistency" => rows_consistency = Some(need("--rows-consistency")?.parse::<usize>()?),
             "--chat" => chat = true,
             "--system" => system = Some(need("--system")?),
             "--temp" => temp = Some(need("--temp")?.parse::<f32>()?),
@@ -549,6 +554,89 @@ fn run() -> engine::Result {
                 .collect();
             println!("{{\"pos\":{},\"after\":{},\"top\":[{}]}}", i, id, entries.join(","));
         }
+        return Ok(());
+    }
+
+    if let Some(r) = rows_consistency {
+        // Multi-row logits must be (a) identical to the single-row path on
+        // the row they share, and (b) actually distinct positions. A tail
+        // that returned the last row R times would pass (a) alone, so both
+        // halves are load-bearing.
+        if r < 2 || r > prompt_ids.len() {
+            return Err(format!("--rows-consistency needs 2..={} rows", prompt_ids.len()).into());
+        }
+        let all = model
+            .forward_rows(&mut st, &prompt_ids, 0, r as u32)?
+            .ok_or("no logits")?;
+        let nv = all.len() / r;
+
+        // (a) same batching, one row: the shared row must be bit-exact
+        drop(st);
+        let mut st1 = engine::State::new(&model, ctx)?;
+        let one = model
+            .forward_rows(&mut st1, &prompt_ids, 0, 1)?
+            .ok_or("no logits")?;
+        let shared = all[(r - 1) * nv..].iter().zip(&one).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+
+        // (b) each row against a single-token step at that position. The
+        // batched and single-token matmul kernels accumulate in different
+        // orders, so this one is a tolerance check, not bit-exactness.
+        drop(st1);
+        let mut st2 = engine::State::new(&model, ctx)?;
+        let mut per_pos: Vec<Vec<f32>> = Vec::new();
+        for (i, &id) in prompt_ids.iter().enumerate() {
+            let l = model.forward_rows(&mut st2, &[id], i as u32, 1)?.ok_or("no logits")?;
+            if i + r >= prompt_ids.len() {
+                per_pos.push(l);
+            }
+        }
+        // Bit-exactness is NOT the bar here: head_logits dispatches its
+        // matmul by row count, so rows=1 and rows=R accumulate in
+        // different orders. Every family drifts (Laguna, whose multi-row
+        // path ships, drifts more than dsv4). What must hold is that each
+        // row is its OWN position, and that any argmax flip is a near-tie
+        // the drift can explain rather than a wrong row.
+        println!("rows-consistency r={r} over {} tokens:", prompt_ids.len());
+        println!("  shared row (rows=1 vs rows={r}): max |dlogit| {shared:.6}");
+        let mut worst = 0f32;
+        let mut bad = 0;
+        for j in 0..r {
+            let row = &all[j * nv..(j + 1) * nv];
+            let ref_row = &per_pos[j];
+            let d = row.iter().zip(ref_row).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            let (ra, pa) = (engine::argmax(row), engine::argmax(ref_row));
+            worst = worst.max(d);
+            // top1-top2 on the reference row: a flip inside this gap is
+            // the drift reordering a tie, a flip outside it is a bug
+            let gap = {
+                let (mut t1, mut t2) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                for &v in ref_row {
+                    if v > t1 {
+                        t2 = t1;
+                        t1 = v;
+                    } else if v > t2 {
+                        t2 = v;
+                    }
+                }
+                t1 - t2
+            };
+            let verdict = if ra == pa {
+                "match"
+            } else if gap <= d {
+                "flip within drift"
+            } else {
+                bad += 1;
+                "FLIP OUTSIDE DRIFT"
+            };
+            println!(
+                "  row {j} (pos {}): max |dlogit| {d:.4}, gap {gap:.4}, argmax {ra} vs {pa} ({verdict})",
+                prompt_ids.len() - r + j,
+            );
+        }
+        println!(
+            "  worst |dlogit| {worst:.4} -> {}",
+            if bad == 0 { "PASS" } else { "FAIL" }
+        );
         return Ok(());
     }
 

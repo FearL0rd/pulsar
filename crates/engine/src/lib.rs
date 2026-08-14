@@ -4190,6 +4190,10 @@ mod real {
     pub struct State {
         ctx: u32,
         max_batch: u32,
+        /// Trailing logit rows last_row/logits were sized for. A forward
+        /// that returns more rows than this writes past both buffers, and
+        /// the corruption is silent, so every multi-row path checks it.
+        spec_rows: u32,
         tok: DeviceBuf,
         last_row: DeviceBuf,
         cur: DeviceBuf,
@@ -5219,8 +5223,12 @@ mod real {
             // on 4327 tokens. Cost tracks tokens, not chunks, in that regime.
             let spec_rows = (m.mtp_depth + 1)
                 .max(2)
-                // qwen35 DFlash verify reads logits for a whole 16-row block
-                .max(if s.family == Family::Qwen35 { 16 } else { 0 })
+                // qwen35 DFlash verify reads logits for a whole 16-row
+                // block; dsv4 verify is capped by its T_MAX sub-batch, so
+                // 16 covers it too. Costs rows*n_vocab*4 of logit buffer
+                // (8MB at deepseek4's 129k vocab), which is noise next to
+                // the expert cache it sits beside.
+                .max(if matches!(s.family, Family::Qwen35 | Family::Dsv4) { 16 } else { 0 })
                 .max(
                     std::env::var("PULSAR_NGRAM")
                         .ok()
@@ -5531,6 +5539,7 @@ mod real {
             let mut st = State {
                 ctx,
                 max_batch: mb,
+                spec_rows,
                 tok: DeviceBuf::alloc(mb as usize * 4)?,
                 // spec verify reads depth+1 trailing rows (MTP or n-gram)
                 last_row: f32s((spec_rows) * s.n_embd)?,
@@ -5871,6 +5880,18 @@ mod real {
             rows: u32,
         ) -> Result<Option<Vec<f32>>> {
             let s = self.shape;
+            // last_row/logits are sized for spec_rows. Past that a forward
+            // writes off the end of both; on the batched path that surfaced
+            // as a raw assert inside copy_d2d, and on paths without a copy
+            // it would just corrupt. One check here covers every family.
+            if rows > st.spec_rows {
+                return Err(format!(
+                    "{rows} logit rows requested but State was sized for {} \
+                     (raise with PULSAR_NGRAM, or a draft/MTP head)",
+                    st.spec_rows
+                )
+                .into());
+            }
             // Exhaustive on purpose. A family whose state advances token by
             // token cannot take the batched path below: the batch would be
             // computed against the wrong history and the logits would be

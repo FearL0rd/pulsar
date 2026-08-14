@@ -805,13 +805,11 @@ fn indexer_allowed(q: &mut [f32], weights: &[f32], idx_cache: &[f32], n_comp: us
     }
 
 impl Model {
-    /// V4 forward: sequential single-token steps (rows = 0 or 1).
+    /// V4 forward. Returns logits for the last `rows` positions, which
+    /// must all sit in the final T_MAX sub-batch.
     pub(super) fn forward_dsv4(&self, st: &mut State, tokens: &[u32], pos0: u32, rows: u32) -> Result<Option<Vec<f32>>> {
         if tokens.is_empty() {
             return Err("empty batch".into());
-        }
-        if rows > 1 {
-            return Err("dsv4: multi-row logits (speculative paths) not supported yet".into());
         }
         if pos0 + tokens.len() as u32 > st.ctx {
             return Err("position exceeds context".into());
@@ -875,26 +873,63 @@ impl Model {
         if rows == 0 {
             return Ok(None);
         }
+        let r = rows as usize;
+        // Only the last sub-batch's hyper-connection streams still exist:
+        // hc_cur is rebuilt from the embeddings at the top of each one.
+        if r > last_t {
+            return Err(format!(
+                "dsv4: {r} logit rows requested but the last sub-batch held {last_t} tokens \
+                 (T_MAX {T_MAX}); the earlier streams are gone"
+            )
+            .into());
+        }
 
-        // output head over the LAST token's streams
+        // Output head over the LAST r tokens' streams. The kernels below
+        // all batch already; only this tail was pinned to a single row,
+        // which is what blocked speculative verify on dsv4.
         let out = self.dsv4_out.as_ref().ok_or("dsv4 output head missing")?;
         let ones = self.ones_hc.as_ref().ok_or("ones_hc missing")?;
         let hc_row = (s.n_hc * s.n_embd) as usize * 4;
-        kernels::copy_d2d(&mut rt.hc_next, 0, &rt.hc_cur, (last_t - 1) * hc_row, hc_row)?;
+        let n_hc = s.n_hc as usize;
+        // Gather the trailing r stream rows FIRST, then run the control
+        // projection over exactly those r. Normalizing over all last_t
+        // rows instead would be the same math but a different batch size,
+        // and matmul_f32 dispatches by batch size with its own
+        // accumulation order: measured 1.09 max |dlogit| against the
+        // single-row path on the row they share. At r = 1 this is the
+        // original copy/swap sequence verbatim.
+        let first = last_t - r;
+        kernels::copy_d2d(&mut rt.hc_next, 0, &rt.hc_cur, first * hc_row, r * hc_row)?;
         std::mem::swap(&mut rt.hc_cur, &mut rt.hc_next);
-        kernels::rms_norm(&mut rt.hc_next, &rt.hc_cur, ones, s.n_hc * s.n_embd, 1, s.rms_eps)?;
-        kernels::matmul_f32(&mut rt.mix, &out.fn_w, &rt.hc_next, s.n_hc * s.n_embd, s.n_hc, 1)?;
-        let pre = rt.mix.read_f32(s.n_hc as usize)?;
-        let w: Vec<f32> = pre
-            .iter()
-            .zip(&out.base)
-            .map(|(&p, &b)| sigmoid(p * out.scale + b) + s.hc_eps)
-            .collect();
-        kernels::dsv4_hc_mix(&mut st.last_row, &rt.hc_cur, None, &w, None, s.n_embd, s.n_hc, 1)?;
-        kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, 1, s.rms_eps)?;
-        self.head_logits(st, 1)?;
+        kernels::rms_norm(&mut rt.hc_next, &rt.hc_cur, ones, s.n_hc * s.n_embd, r as u32, s.rms_eps)?;
+        kernels::matmul_f32(&mut rt.mix, &out.fn_w, &rt.hc_next, s.n_hc * s.n_embd, s.n_hc, r as u32)?;
+        let pre = rt.mix.read_f32(r * n_hc)?;
+
+        // Per-token gates into the layer coef buffer (dead after the last
+        // layer, already sized for T_MAX). hc_mix_dev is token-major with
+        // one coef row per token, so the whole tail is one launch.
+        let stride = 6 * n_hc;
+        let mut coefs = vec![0f32; r * stride];
+        for j in 0..r {
+            for (c, &b) in out.base.iter().enumerate() {
+                coefs[j * stride + c] = sigmoid(pre[j * n_hc + c] * out.scale + b) + s.hc_eps;
+            }
+        }
+        rt.coef_attn.write(0, kernels::as_bytes(&coefs))?;
+        kernels::dsv4_hc_mix_dev(
+            &mut st.last_row, &rt.hc_cur, None, &rt.coef_attn, 0, -1,
+            s.n_embd, s.n_hc, 1, r as u32,
+        )?;
+        kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, r as u32, s.rms_eps)?;
+        self.head_logits(st, r as u32)?;
+        // Leave the last token's streams at row 0 for the next step.
+        // hc_next is free again here (the control projection read it), and
+        // the streams are only consumed above, so this lands after the
+        // logits rather than disturbing them.
+        kernels::copy_d2d(&mut rt.hc_next, 0, &rt.hc_cur, (r - 1) * hc_row, hc_row)?;
+        std::mem::swap(&mut rt.hc_cur, &mut rt.hc_next);
         kernels::sync()?;
-        Ok(Some(st.logits.read_f32(s.n_vocab as usize)?))
+        Ok(Some(st.logits.read_f32(r * s.n_vocab as usize)?))
     }
 
     /// hc_pre: flat-norm the streams, project the control vector, run
