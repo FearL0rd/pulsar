@@ -34,7 +34,7 @@ fn matw(out: &mut DeviceBuf, w: &MatW, x: &DeviceBuf, xq: &DeviceBuf, in_dim: u3
 const T_MAX: usize = 16;
 /// DFlash feature-ring capacity = the draft context window (lucebox
 /// defaults to 2048; v1 keeps the fc cost down with 256).
-const RING_CAP: usize = 256;
+pub(super) const RING_CAP: usize = 256;
 
 fn argmax(row: &[f32]) -> u32 {
     let mut best = 0usize;

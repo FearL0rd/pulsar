@@ -612,6 +612,30 @@ pub(super) struct LayerRt {
     pub n_idx_comp: u32,
 }
 
+/// Rolling window of captured hidden states for the DSpark draft.
+///
+/// The reference (`inference/config.json`) captures
+/// `dspark_target_layer_ids = [40, 41, 42]`, the OUTPUTS of the last three
+/// layers. The gguf writes those as `target_layers = [41, 42, 43]`, the
+/// same points in the "residual entering layer il" convention pulsar and
+/// HF `hidden_states` both use. So the first two are read entering layers
+/// 41 and 42, and the third is the final residual after layer 42, which no
+/// layer entry can supply: it is the model's own hc reduction, the vector
+/// the output head mixes before `output_norm`.
+///
+/// Layout matches what the draft's `fc` expects: one row per position
+/// holding the three hidden states concatenated, so `fc` [3*n_embd ->
+/// n_embd] consumes a row directly.
+pub(super) struct Dsv4Dflash {
+    /// [RING_CAP][n_capture * n_embd], indexed by absolute position % cap
+    pub ring: DeviceBuf,
+    /// capture points in "entering layer il" terms, ascending
+    pub layer_ids: Vec<usize>,
+    /// slot of the post-final-layer capture (layer_ids entry == n_layer),
+    /// None when the draft does not ask for it
+    pub tail_slot: Option<usize>,
+}
+
 /// deepseek4 runtime: HC stream buffers + per-layer compressor state.
 pub(super) struct Dsv4Rt {
     /// 4 residual streams [n_hc][n_embd]
@@ -630,6 +654,8 @@ pub(super) struct Dsv4Rt {
     coef_attn: DeviceBuf,
     coef_ffn: DeviceBuf,
     layers: Vec<LayerRt>,
+    /// DSpark feature capture, armed by enable_dflash before prefill
+    pub(super) dflash: Option<Dsv4Dflash>,
 }
 
 impl Dsv4Rt {
@@ -676,7 +702,36 @@ impl Dsv4Rt {
             coef_attn: DeviceBuf::alloc(T_MAX * 6 * s.n_hc as usize * 4)?,
             coef_ffn: DeviceBuf::alloc(T_MAX * 6 * s.n_hc as usize * 4)?,
             layers,
+            dflash: None,
         })
+    }
+
+    /// Arm DSpark feature capture. Must happen BEFORE prefill: the ring is
+    /// filled as positions stream past, and nothing recomputes it.
+    /// `layer_ids` are gguf `target_layers`, i.e. "entering layer il"; an
+    /// entry equal to n_layer means the final residual after the last
+    /// layer.
+    pub(super) fn enable_dflash(&mut self, m: &Model, layer_ids: Vec<usize>) -> Result {
+        if self.dflash.is_some() {
+            return Ok(());
+        }
+        let s = m.shape;
+        let n_layer = s.n_exec_layer as usize;
+        if layer_ids.iter().any(|&il| il > n_layer) {
+            return Err(format!(
+                "dspark draft wants hidden state {:?} but the target has {n_layer} layers",
+                layer_ids.iter().max()
+            )
+            .into());
+        }
+        let tail_slot = layer_ids.iter().position(|&il| il == n_layer);
+        let feat_w = layer_ids.len() * s.n_embd as usize;
+        self.dflash = Some(Dsv4Dflash {
+            ring: DeviceBuf::alloc(super::qwen35::RING_CAP * feat_w * 4)?,
+            layer_ids,
+            tail_slot,
+        });
+        Ok(())
     }
 
     fn reset(&mut self) -> Result {
@@ -866,6 +921,45 @@ impl Model {
                 for (il, l) in self.layers.iter().enumerate() {
                     self.eval_dsv4_layer(st, rt, il, l, sub, pos, t as u32)?;
                 }
+                // DSpark tail capture: the last target hidden is the
+                // residual AFTER the final layer, so no layer entry
+                // produces it. It is the model's own hc reduction, the
+                // vector the output head mixes before output_norm, and the
+                // draft needs it at EVERY position rather than only the
+                // rows that return logits, so it cannot ride that head.
+                let tail = rt
+                    .dflash
+                    .as_ref()
+                    .and_then(|df| df.tail_slot.map(|sl| (sl, df.layer_ids.len())));
+                if let Some((slot, n_cap)) = tail {
+                    let out = self.dsv4_out.as_ref().ok_or("dsv4 output head missing")?;
+                    let ones = self.ones_hc.as_ref().ok_or("ones_hc missing")?;
+                    let n_hc = s.n_hc as usize;
+                    let tt = t as u32;
+                    kernels::rms_norm(&mut rt.hc_next, &rt.hc_cur, ones, s.n_hc * s.n_embd, tt, s.rms_eps)?;
+                    kernels::matmul_f32(&mut rt.mix, &out.fn_w, &rt.hc_next, s.n_hc * s.n_embd, s.n_hc, tt)?;
+                    let pre = rt.mix.read_f32(t * n_hc)?;
+                    // coef_ffn, not coef_attn: the output head reuses
+                    // coef_attn further down and both are dead here
+                    let stride = 6 * n_hc;
+                    let mut coefs = vec![0f32; t * stride];
+                    for j in 0..t {
+                        for (c, &b) in out.base.iter().enumerate() {
+                            coefs[j * stride + c] =
+                                sigmoid(pre[j * n_hc + c] * out.scale + b) + s.hc_eps;
+                        }
+                    }
+                    rt.coef_ffn.write(0, kernels::as_bytes(&coefs))?;
+                    kernels::dsv4_hc_mix_dev(
+                        &mut st.cur, &rt.hc_cur, None, &rt.coef_ffn, 0, -1,
+                        s.n_embd, s.n_hc, 1, tt,
+                    )?;
+                    let df = rt.dflash.as_mut().ok_or("dflash vanished")?;
+                    kernels::qwen35_ring_scatter(
+                        &mut df.ring, &st.cur, pos, super::qwen35::RING_CAP as u32,
+                        tt, s.n_embd, (n_cap as u32) * s.n_embd, slot as u32 * s.n_embd,
+                    )?;
+                }
                 pos += t as u32;
                 last_t = t;
             }
@@ -973,6 +1067,18 @@ impl Model {
 
         // ---- attention half (matmuls/norms/rope batched)
         self.dsv4_hc_pre(st, rt, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base, false, t)?;
+        // DSpark capture: hc_pre has just reduced the streams into st.cur,
+        // which IS the residual entering this layer (HF hidden_states[il]).
+        // Positions land in the ring modulo RING_CAP as they stream past.
+        if let Some(df) = &mut rt.dflash {
+            if let Some(slot) = df.layer_ids.iter().position(|&x| x == il) {
+                let stride = (df.layer_ids.len() as u32) * s.n_embd;
+                kernels::qwen35_ring_scatter(
+                    &mut df.ring, &st.cur, pos0, super::qwen35::RING_CAP as u32,
+                    t, s.n_embd, stride, slot as u32 * s.n_embd,
+                )?;
+            }
+        }
         kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, t, eps)?;
         kernels::matmul_q8_0(&mut st.q_rank, &w.q_a, &st.normed, s.n_embd, s.n_lora_q, t)?;
         kernels::rms_norm(&mut st.q_rank_norm, &st.q_rank, &w.q_a_norm, s.n_lora_q, t, eps)?;

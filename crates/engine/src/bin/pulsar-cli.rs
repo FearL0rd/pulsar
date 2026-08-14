@@ -50,6 +50,9 @@ diagnostics:
   --rows-consistency N
                        check multi-row (speculative verify) logits against
                        single-token steps at the same positions
+  --dspark-capture A,B,C
+                       check the DSpark hidden-state ring for those
+                       target_layers (dsv4 only)
 
 environment:
   PULSAR_KV=f32|int8|fp8|fp16|q8_0|q4_0|turbo8|turbo4
@@ -331,6 +334,7 @@ fn run() -> engine::Result {
     let mut teacher_force = false;
     let mut decode_consistency = None;
     let mut rows_consistency = None;
+    let mut dspark_capture: Option<String> = None;
     let mut chat = false;
     let mut system = None;
     let mut temp = None;
@@ -371,6 +375,7 @@ fn run() -> engine::Result {
             "--teacher-force" => teacher_force = true,
             "--decode-consistency" => decode_consistency = Some(need("--decode-consistency")?.parse::<usize>()?),
             "--rows-consistency" => rows_consistency = Some(need("--rows-consistency")?.parse::<usize>()?),
+            "--dspark-capture" => dspark_capture = Some(need("--dspark-capture")?),
             "--chat" => chat = true,
             "--system" => system = Some(need("--system")?),
             "--temp" => temp = Some(need("--temp")?.parse::<f32>()?),
@@ -554,6 +559,97 @@ fn run() -> engine::Result {
                 .collect();
             println!("{{\"pos\":{},\"after\":{},\"top\":[{}]}}", i, id, entries.join(","));
         }
+        return Ok(());
+    }
+
+    if let Some(spec) = dspark_capture {
+        // Check the DSpark feature ring the draft will read. The failure
+        // modes here are all silent: a slot never written reads as zeros,
+        // a mis-indexed slot duplicates its neighbour, and a mis-indexed
+        // POSITION still looks like a plausible hidden state. So check for
+        // all three rather than eyeballing magnitudes.
+        let layer_ids: Vec<usize> = spec
+            .split(',')
+            .map(|x| x.trim().parse::<usize>())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| format!("--dspark-capture wants a layer list like 41,42,43: {e}"))?;
+        let n_cap = layer_ids.len();
+        let n_embd = model.shape.n_embd as usize;
+        st.enable_dspark_capture(&model, layer_ids.clone())?;
+        model.forward_rows(&mut st, &prompt_ids, 0, 1)?;
+
+        let last = prompt_ids.len() as u32 - 1;
+        println!("dspark capture: layers {layer_ids:?}, {n_cap} x {n_embd} per position");
+        let mut bad = 0;
+        let row = st.dspark_feature_row(&model, last)?;
+        for (i, id) in layer_ids.iter().enumerate() {
+            let slot = &row[i * n_embd..(i + 1) * n_embd];
+            let nz = slot.iter().filter(|v| **v != 0.0).count();
+            let finite = slot.iter().all(|v| v.is_finite());
+            let rms = (slot.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()
+                / n_embd as f64)
+                .sqrt();
+            if nz == 0 || !finite {
+                bad += 1;
+            }
+            println!(
+                "  hidden[{id}] @pos {last}: rms {rms:.4}, {nz}/{n_embd} nonzero{}",
+                if finite { "" } else { ", NOT FINITE" }
+            );
+        }
+        // slots must differ from each other: equal slots mean one capture
+        // point overwrote another
+        for i in 0..n_cap {
+            for j in i + 1..n_cap {
+                let (a, b) = (&row[i * n_embd..(i + 1) * n_embd], &row[j * n_embd..(j + 1) * n_embd]);
+                if a == b {
+                    println!("  slots {i} and {j} are IDENTICAL (capture points collided)");
+                    bad += 1;
+                }
+            }
+        }
+        // and positions must differ from each other
+        if prompt_ids.len() >= 2 {
+            let prev = st.dspark_feature_row(&model, last - 1)?;
+            if prev == row {
+                println!("  positions {} and {last} are IDENTICAL (position indexing wrong)", last - 1);
+                bad += 1;
+            }
+        }
+        // re-running must reproduce the ring exactly
+        drop(st);
+        let mut st2 = engine::State::new(&model, ctx)?;
+        st2.enable_dspark_capture(&model, layer_ids)?;
+        model.forward_rows(&mut st2, &prompt_ids, 0, 1)?;
+        let again = st2.dspark_feature_row(&model, last)?;
+        // Not a bit-exactness check: with the expert tier active, summing
+        // per-card partials reorders float adds, so two runs of the same
+        // prompt differ slightly by design (PULSAR_TIERS=off restores
+        // exact, and the ring does reproduce bit-for-bit there). What
+        // would be a real bug is a capture that drifts on the order of the
+        // signal itself.
+        // Cosine, not max |d|. Two runs can pick DIFFERENT experts: the
+        // tier reorders float adds, a router logit crosses a neighbour,
+        // and top-6-of-256 selects a different set. That is a genuinely
+        // different hidden state, not a rounding error, so an absolute
+        // bound rejects healthy runs. Direction is what has to hold, and
+        // it must hold exactly (cos 1.0) under PULSAR_TIERS=off.
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (a, b) in row.iter().zip(&again) {
+            dot += (*a as f64) * (*b as f64);
+            na += (*a as f64) * (*a as f64);
+            nb += (*b as f64) * (*b as f64);
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+        if cos < 0.99 {
+            println!("  repeat cosine {cos:.6} is too low to be routing jitter");
+            bad += 1;
+        }
+        println!(
+            "  repeat run: cosine {cos:.6}{}\ndspark capture: {}",
+            if again == row { " (bit-exact)" } else { " (expert routing jitter)" },
+            if bad == 0 { "PASS" } else { "FAIL" }
+        );
         return Ok(());
     }
 

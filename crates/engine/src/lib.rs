@@ -4403,6 +4403,24 @@ mod real {
             self.max_batch
         }
 
+        /// Arm DSpark hidden-state capture for a dsv4 target. Must be
+        /// called before prefill; the ring fills as positions stream past.
+        pub fn enable_dspark_capture(&mut self, m: &Model, layer_ids: Vec<usize>) -> Result {
+            let rt = self.dsv4.as_mut().ok_or("dspark capture: not a dsv4 model")?;
+            rt.enable_dflash(m, layer_ids)
+        }
+
+        /// One captured feature row: the target hidden states for `pos`,
+        /// concatenated in `layer_ids` order. This is exactly the row the
+        /// draft's `fc` consumes.
+        pub fn dspark_feature_row(&self, m: &Model, pos: u32) -> Result<Vec<f32>> {
+            let rt = self.dsv4.as_ref().ok_or("dspark capture: not a dsv4 model")?;
+            let df = rt.dflash.as_ref().ok_or("dspark capture not enabled")?;
+            let feat_w = df.layer_ids.len() * m.shape.n_embd as usize;
+            let slot = pos as usize % qwen35::RING_CAP;
+            Ok(df.ring.read_f32_at(slot * feat_w, feat_w)?)
+        }
+
         /// Take a recurrent checkpoint at `pos` when the interval since
         /// the last one has passed (no-op for pure-KV families). GDN
         /// states are ~150MB per snapshot so qwen35 spaces them wide.
