@@ -534,6 +534,30 @@ A background thread additionally **prefetches the next layer's experts**,
 predicted by running the next layer's router on the current layer's
 input.
 
+### Spreading a model across several SSDs
+
+Each shard of a split gguf is opened as its own fd and the fetcher routes
+every read to the right one, so a multi-shard model can live on several
+drives and be read from all of them at once. Shard discovery expands
+`-00001-of-000NN` inside one directory, but those entries may be
+symlinks:
+
+```sh
+mkdir -p /models/v4 && cd /models/v4
+ln -s /mnt/fast0/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf .
+ln -s /mnt/fast1/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00002-of-00003.gguf .
+ln -s /mnt/fast2/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00003-of-00003.gguf .
+pulsar-serve -m /models/v4/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf
+```
+
+That buys capacity, and read parallelism across drives for free. It is
+worth measuring before buying disks for *bandwidth*, though: on a PCIe
+5.0 x4 drive `fetch-bench` sustains ~10.7 GB/s of real expert slabs and
+is flat from queue depth 4 to 128, while decode only pulls 1.4-2.1 GB/s
+off the disk because the resident tier and host cache absorb most of the
+lookups. Streaming decode is usually latency- and compute-bound well
+before a single modern NVMe runs out of bandwidth.
+
 The MoE kernels never consult global state: every launch receives
 explicit per-(token, slot) device pointers for gate/up/down, and a NULL
 slot means "not mine", which is what makes per-card partial execution
