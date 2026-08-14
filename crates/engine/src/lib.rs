@@ -13,6 +13,15 @@
 //! always receive explicit per-slot device pointers, wherever the bytes
 //! ended up.
 
+/// Build identity for --version. The git sha is what a bug report needs;
+/// the crate version alone never moves.
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("PULSAR_GIT_SHA"),
+    ")"
+);
+
 #[cfg(target_os = "linux")]
 mod real {
     /// Bytes per GiB. Memory sizes are reported in GiB everywhere so a
@@ -2586,16 +2595,27 @@ mod real {
     /// f16 tensor -> host f32 (deepseek4 ships router/HC/compressor
     /// weights as f16; small ones convert to f32 for matmul_f32). F32
     /// tensors pass through (unsloth UD-* ships the same aux weights f32).
+    /// BF16 is the same two bytes with the other exponent bias, so it gets
+    /// its own decode rather than being read as f16 - unsloth UD-Q8_K_XL
+    /// ships blk.N.indexer.proj.weight that way (issue #21).
     fn read_f16_as_f32(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<f32>> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
         let n = t.n_elements() as usize;
         match t.ty {
-            TensorType::F16 => {
+            TensorType::F16 | TensorType::BF16 => {
                 let mut buf = vec![0u8; n * 2];
                 file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                let bf16 = t.ty == TensorType::BF16;
                 Ok(buf
                     .chunks_exact(2)
-                    .map(|c| requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .map(|c| {
+                        let bits = u16::from_le_bytes([c[0], c[1]]);
+                        if bf16 {
+                            quant::bf16_to_f32(bits)
+                        } else {
+                            requant::f16_to_f32(bits)
+                        }
+                    })
                     .collect())
             }
             TensorType::F32 => {
@@ -2606,7 +2626,7 @@ mod real {
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect())
             }
-            other => Err(format!("{name}: expected f16/f32, got {other:?}").into()),
+            other => Err(format!("{name}: expected f16/bf16/f32, got {other:?}").into()),
         }
     }
 

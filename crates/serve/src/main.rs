@@ -92,6 +92,36 @@ fn kv_format() -> String {
 }
 
 #[cfg(target_os = "linux")]
+const HELP: &str = "\
+pulsar-serve: OpenAI-compatible server for the pulsar engine.
+
+usage: pulsar-serve -m MODEL.gguf [options]
+
+  -m PATH              model gguf (first shard of a split set)
+  --host ADDR          bind address (default 127.0.0.1)
+  --port N             port (default 11435)
+  --ctx N              context length (default 8192)
+  --prefix-file PATH   warm the KV cache from a saved prefix
+  --jinja-chat         encode with the GGUF/HF Jinja chat template instead
+                       of the built-in markers (network blocked by
+                       PULSAR_OFFLINE)
+  --webui-mcp-proxy    enable the MCP proxy for the built-in web UI
+  --mcp-config PATH    MCP server config (default ./mcp.json)
+
+endpoints: web UI at /, OpenAI API at /v1 (chat/completions, models)
+
+environment:
+  PULSAR_KV=f32|int8|fp8|fp16|q8_0|q4_0|turbo8|turbo4
+                       KV cache format (default: f32, auto-quantizes when
+                       a big context would starve the expert cache)
+  PULSAR_MTP=1         enable the gguf's nextn head, when it has one
+  PULSAR_DFLASH=PATH   dflash/dspark draft gguf for speculative decode
+  PULSAR_OFFLINE=1     never touch the network
+
+  -V, --version        print version and git sha
+  -h, --help           this text
+";
+
 fn run() -> engine::Result {
     use std::io::{BufRead, BufReader, Read, Write};
 
@@ -132,7 +162,15 @@ fn run() -> engine::Result {
             "--webui-mcp-proxy" => webui_mcp_proxy = true,
             "--mcp-config" => mcp_config = Some(need("--mcp-config")?),
             "--jinja-chat" => jinja_chat = true,
-            other => return Err(format!("unknown arg {other}").into()),
+            "-V" | "--version" => {
+                println!("pulsar-serve {}", engine::VERSION);
+                return Ok(());
+            }
+            "-h" | "--help" => {
+                print!("{HELP}");
+                return Ok(());
+            }
+            other => return Err(format!("unknown arg {other}, try --help").into()),
         }
     }
     let model_path = model_path.ok_or("missing -m MODEL.gguf")?;

@@ -21,6 +21,47 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+const HELP: &str = "\
+pulsar-cli: generation and diagnostics for the pulsar engine.
+
+usage: pulsar-cli -m MODEL.gguf [-p TEXT | -f FILE | --tokens IDS] [options]
+
+  -m PATH              model gguf (first shard of a split set)
+  -p TEXT              prompt text (BOS prepended unless --no-bos)
+  -f, --prompt-file P  read the prompt from a file (long prompts)
+  --tokens A,B,C       feed exact token ids instead of text
+  -n N                 tokens to generate (default 16)
+  --ctx N              context length (default 2048)
+  --bos / --no-bos     force BOS on/off (default: the gguf's add_bos)
+
+  --chat               interactive multi-turn loop, KV retained per turn
+  --system TEXT        system prompt for --chat
+  --jinja-chat         encode with the Jinja chat template instead of the
+                       built-in markers (network blocked by PULSAR_OFFLINE)
+  --temp F, --top-p F, --min-p F, --seed N
+                       sampling (defaults from general.sampling.* metadata)
+
+diagnostics:
+  --teacher-force      per-position top-5 along the given tokens; with
+                       --dump-logits writes full logit rows instead
+  --dump-logits PATH   write logits (see scripts/kld-ab.sh)
+  --decode-consistency N
+                       compare incremental decode against a fresh prefill
+
+environment:
+  PULSAR_KV=f32|int8|fp8|fp16|q8_0|q4_0|turbo8|turbo4
+                       KV cache format (default: f32, auto-quantizes when
+                       a big context would starve the expert cache)
+  PULSAR_MTP=1         enable the gguf's nextn head, when it has one
+  PULSAR_DFLASH=PATH   dflash/dspark draft gguf for speculative decode
+  PULSAR_PROFILE=1     per-stage timing report
+  PULSAR_OFFLINE=1     never touch the network
+
+  -V, --version        print version and git sha
+  -h, --help           this text
+";
+
+#[cfg(target_os = "linux")]
 fn main() {
     if let Err(e) = run() {
         eprintln!("pulsar-cli: {e}");
@@ -332,7 +373,15 @@ fn run() -> engine::Result {
             "--min-p" => min_p = need("--min-p")?.parse::<f32>()?,
             "--seed" => seed = need("--seed")?.parse::<u64>()?,
             "--jinja-chat" => jinja_chat = true,
-            other => return Err(format!("unknown arg {other}").into()),
+            "-V" | "--version" => {
+                println!("pulsar-cli {}", engine::VERSION);
+                return Ok(());
+            }
+            "-h" | "--help" => {
+                print!("{HELP}");
+                return Ok(());
+            }
+            other => return Err(format!("unknown arg {other}, try --help").into()),
         }
     }
     let model_path = model_path.ok_or("missing -m MODEL.gguf")?;
