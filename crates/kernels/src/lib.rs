@@ -335,6 +335,45 @@ mod real {
         n
     }
 
+    /// Measured VRAM bandwidth of `dev` in GB/s: a 64MB on-card D2D copy
+    /// (reads + writes VRAM, so ~2x the copy rate; reported as copy rate
+    /// x2). H2D probes measure the PCIe LINK, which is the wrong axis
+    /// for placing dense-resident weights - those are read from the
+    /// card's own VRAM every token. Measured, not derived: the
+    /// memoryClockRate attribute is deprecated and reads 0 on Blackwell,
+    /// which silently tied a 448GB/s card with a 288GB/s one. Restores
+    /// the current device; returns 0.0 on any probe failure so a broken
+    /// card ranks last instead of erroring placement.
+    pub fn vram_bandwidth(dev: i32) -> f64 {
+        const MB64: usize = 64 << 20;
+        const D2D_KIND: i32 = 3;
+        let cur = get_device();
+        if set_device(dev).is_err() {
+            return 0.0;
+        }
+        let mut a = std::ptr::null_mut();
+        let mut b = std::ptr::null_mut();
+        let mut best = 0f64;
+        if unsafe { cudaMalloc(&mut a, MB64) } == 0 {
+            if unsafe { cudaMalloc(&mut b, MB64) } == 0 {
+                // one warmup, then best of 3 timed synchronous copies
+                unsafe { cudaMemcpy(b, a, MB64, D2D_KIND) };
+                for _ in 0..3 {
+                    let t = std::time::Instant::now();
+                    if unsafe { cudaMemcpy(b, a, MB64, D2D_KIND) } == 0
+                        && unsafe { cudaDeviceSynchronize() } == 0
+                    {
+                        best = best.max(2.0 * MB64 as f64 / 1e9 / t.elapsed().as_secs_f64());
+                    }
+                }
+                unsafe { cudaFree(b) };
+            }
+            unsafe { cudaFree(a) };
+        }
+        let _ = set_device(cur);
+        best
+    }
+
     /// Measured H2D bandwidth to `dev` in GB/s (pinned 64MB, best of 3).
     /// Labels lie - a Gen5 card can train at Gen1, an x8 slot can run x1 -
     /// so role assignment trusts measurements only. Restores the device.

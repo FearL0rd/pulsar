@@ -2986,9 +2986,22 @@ mod real {
                 && kernels::device_count() > 1
                 && std::env::var("PULSAR_SPLIT").ok().as_deref() != Some("off")
             {
+                // Fastest VRAM wins, free bytes only break ties: the
+                // second card serves resident weights from its own VRAM
+                // every token, and picking by free space sent half of
+                // Qwen3.8-27B to the 288GB/s 4060 Ti over a 69MiB free
+                // difference while a 448GB/s 5060 Ti sat empty.
                 let second = (0..kernels::device_count())
                     .filter(|&d| d != primary)
-                    .max_by_key(|&d| kernels::mem_info(d).map(|(f, _)| f).unwrap_or(0))
+                    .max_by(|&a, &b| {
+                        kernels::vram_bandwidth(a)
+                            .partial_cmp(&kernels::vram_bandwidth(b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| {
+                                let free = |d| kernels::mem_info(d).map(|(f, _)| f).unwrap_or(0);
+                                free(a).cmp(&free(b))
+                            })
+                    })
                     .unwrap();
                 // VRAM bytes, not file bytes: MatW/DenseKq tensors upload
                 // raw K-quant; the rest of the K-quants (and the embedding
