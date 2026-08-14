@@ -464,6 +464,30 @@ fn run() -> engine::Result {
     let mut st = engine::State::new(&model, ctx)?;
 
     if teacher_force {
+        // With --dump-logits: full-distribution rows for the KV-quant KLD
+        // A/B (scripts/kld-ab.sh). Format: u32 LE n_vocab, then one
+        // n_vocab f32 LE row per position.
+        if let Some(path) = dump_logits.as_ref() {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+            let mut n_vocab = 0usize;
+            for (i, &id) in prompt_ids.iter().enumerate() {
+                let l = model.forward_token(&mut st, id, i as u32, true)?.unwrap();
+                if i == 0 {
+                    n_vocab = l.len();
+                    f.write_all(&(n_vocab as u32).to_le_bytes())?;
+                }
+                for v in &l {
+                    f.write_all(&v.to_le_bytes())?;
+                }
+            }
+            f.flush()?;
+            eprintln!(
+                "pulsar: wrote {} x {n_vocab} logit rows to {path}",
+                prompt_ids.len()
+            );
+            return Ok(());
+        }
         // Per-position top-5 (id, logit) along the given token sequence,
         // one JSON line per position, for cross-engine agreement checks.
         for (i, &id) in prompt_ids.iter().enumerate() {
