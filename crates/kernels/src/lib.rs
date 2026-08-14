@@ -733,23 +733,28 @@ mod real {
         }
 
         /// Async D2H of `bytes` from `src` into the pinned stage, on the
-        /// CURRENT (source) device's null stream, event behind it.
+        /// CURRENT (source) device's per-thread default stream (the
+        /// stream the kernels launch on, and the only stream CUDA graph
+        /// capture may record - the legacy null stream is capture-
+        /// illegal), event behind it.
         pub fn send(&self, src: &DeviceBuf, bytes: usize) -> Result {
             assert!(bytes <= self.pin.bytes() && bytes <= src.bytes());
             check_rt(
-                unsafe { cudaMemcpyAsync(self.pin.host, src.ptr(), bytes, D2H, std::ptr::null_mut()) },
+                unsafe { cudaMemcpyAsync(self.pin.host, src.ptr(), bytes, D2H, STREAM_PER_THREAD) },
                 "tplink d2h",
             )?;
-            check_rt(unsafe { cudaEventRecord(self.ev, std::ptr::null_mut()) }, "tplink record")
+            check_rt(unsafe { cudaEventRecord(self.ev, STREAM_PER_THREAD) }, "tplink record")
         }
 
-        /// Gate the CURRENT (consumer) device's null stream on the last
-        /// send, then async H2D from the pinned stage into `dst`.
+        /// Gate the CURRENT (consumer) device's per-thread default stream
+        /// on the last send, then async H2D from the pinned stage into
+        /// `dst`. During graph capture this wait is the edge that JOINS
+        /// the consumer device's stream into the capture DAG.
         pub fn recv(&self, dst: &mut DeviceBuf, bytes: usize) -> Result {
             assert!(bytes <= self.pin.bytes() && bytes <= dst.bytes());
-            check_rt(unsafe { cudaStreamWaitEvent(std::ptr::null_mut(), self.ev, 0) }, "tplink wait")?;
+            check_rt(unsafe { cudaStreamWaitEvent(STREAM_PER_THREAD, self.ev, 0) }, "tplink wait")?;
             check_rt(
-                unsafe { cudaMemcpyAsync(dst.ptr_mut(), self.pin.host, bytes, H2D, std::ptr::null_mut()) },
+                unsafe { cudaMemcpyAsync(dst.ptr_mut(), self.pin.host, bytes, H2D, STREAM_PER_THREAD) },
                 "tplink h2d",
             )
         }

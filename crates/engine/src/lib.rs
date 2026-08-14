@@ -2606,6 +2606,7 @@ mod real {
     struct TpLayerW {
         ffn: Option<TpFfnW>,
         gdn: Option<Qwen35Gdn>,
+        attn: Option<Qwen35Attn>,
     }
     pub(crate) struct TpW {
         pub(crate) dev: i32,
@@ -2879,6 +2880,10 @@ mod real {
         pub(crate) fn tp_gdn(&self, il: usize) -> Option<&Qwen35Gdn> {
             self.tp.as_ref()?.layers.get(il)?.as_ref()?.gdn.as_ref()
         }
+        /// Card-B attention head shard for exec layer `il` (PULSAR_TP).
+        pub(crate) fn tp_attn(&self, il: usize) -> Option<&Qwen35Attn> {
+            self.tp.as_ref()?.layers.get(il)?.as_ref()?.attn.as_ref()
+        }
         pub fn load(path: &Path) -> Result<Model> {
             let (shards, gguf) = parse_header(path)?;
             let file = VFile::open(&shards)?;
@@ -3116,6 +3121,12 @@ mod real {
                 && shape.ssm_v_heads.is_multiple_of(2)
                 && shape.ssm_k_heads.is_multiple_of(2)
                 && (shape.ssm_k_heads * shape.ssm_state).is_multiple_of(512)
+                && shape.n_head.is_multiple_of(2)
+                && shape.n_head_kv.is_multiple_of(2)
+                && (shape.n_head / 2 * shape.head_dim).is_multiple_of(256)
+                // turbo KV rotates K/Q through a primary-resident Pi that
+                // the B-side attention half has no copy of
+                && !std::env::var("PULSAR_KV").ok().is_some_and(|v| v.starts_with("turbo"))
             {
                 let dev_b = (0..kernels::device_count())
                     .filter(|&d| d != primary)
@@ -3135,6 +3146,7 @@ mod real {
             };
             let tp_ffn_stash: std::cell::RefCell<Option<TpFfnW>> = std::cell::RefCell::new(None);
             let tp_gdn_stash: std::cell::RefCell<Option<Qwen35Gdn>> = std::cell::RefCell::new(None);
+            let tp_attn_stash: std::cell::RefCell<Option<Qwen35Attn>> = std::cell::RefCell::new(None);
             let mut layer_dev = vec![primary; shape.n_exec_layer as usize];
             if qwen35_dense
                 && tp_cfg.is_none()
@@ -3854,7 +3866,34 @@ mod real {
                         // every-4th interval
                         let is_attn = gguf.tensor(&t("attn_q.weight")).is_some();
                         Attn::Qwen35(Box::new(Qwen35W {
-                            attn: if is_attn {
+                            attn: if !is_attn {
+                                None
+                            } else if let Some((dev_b, _)) = tp_cfg.filter(|_| il < shape.n_exec_layer) {
+                                // TP head split: q|gate rows are per-head
+                                // [q hd | gate hd], heads outer, so head
+                                // ranges are contiguous row ranges; the
+                                // output projection input follows A's
+                                // head concat, so matw_col_half aligns.
+                                let hd = shape.head_dim as u64;
+                                let nh = shape.n_head as u64;
+                                let nkv = shape.n_head_kv as u64;
+                                let mk = |q0: u64, q1: u64, k0: u64, k1: u64, second: bool| -> Result<Qwen35Attn> {
+                                    Ok(Qwen35Attn {
+                                        wq: matw_row_ranges(&file, &gguf, &t("attn_q.weight"), &[(q0 * 2 * hd, q1 * 2 * hd)])?,
+                                        wk: matw_row_ranges(&file, &gguf, &t("attn_k.weight"), &[(k0 * hd, k1 * hd)])?,
+                                        wv: matw_row_ranges(&file, &gguf, &t("attn_v.weight"), &[(k0 * hd, k1 * hd)])?,
+                                        out: matw_col_half(&file, &gguf, &t("attn_output.weight"), second)?,
+                                        q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
+                                        k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
+                                    })
+                                };
+                                let a_half = mk(0, nh / 2, 0, nkv / 2, false)?;
+                                let cur_dev = kernels::get_device();
+                                kernels::set_device(dev_b)?;
+                                *tp_attn_stash.borrow_mut() = Some(mk(nh / 2, nh, nkv / 2, nkv, true)?);
+                                kernels::set_device(cur_dev)?;
+                                Some(a_half)
+                            } else {
                                 Some(Qwen35Attn {
                                     wq: MatW::load(&file, &gguf, &t("attn_q.weight"))?,
                                     wk: MatW::load(&file, &gguf, &t("attn_k.weight"))?,
@@ -3863,8 +3902,6 @@ mod real {
                                     q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
                                     k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
                                 })
-                            } else {
-                                None
                             },
                             gdn: if is_attn {
                                 None
@@ -4082,10 +4119,12 @@ mod real {
                 kernels::set_device(layer_dev[il as usize])?;
                 layers.push(load_layer(il, &mut attn_vram_budget, &mut no_budget)?);
                 if tp_cfg.is_some() {
-                    let (f, g2) = (tp_ffn_stash.borrow_mut().take(), tp_gdn_stash.borrow_mut().take());
-                    tp_layers.push(match (f, g2) {
-                        (None, None) => None,
-                        (f, g2) => Some(TpLayerW { ffn: f, gdn: g2 }),
+                    let f = tp_ffn_stash.borrow_mut().take();
+                    let g2 = tp_gdn_stash.borrow_mut().take();
+                    let at = tp_attn_stash.borrow_mut().take();
+                    tp_layers.push(match (f, g2, at) {
+                        (None, None, None) => None,
+                        (f, g2, at) => Some(TpLayerW { ffn: f, gdn: g2, attn: at }),
                     });
                 }
             }
@@ -4549,6 +4588,9 @@ mod real {
         sel_dev: i32,
         kcache: Vec<DeviceBuf>,
         vcache: Vec<DeviceBuf>,
+        /// Card-B kv-head cache halves per attn layer (PULSAR_TP); empty
+        /// without TP. Positional like kcache, so ckpt rewind needs no copy.
+        tp_kcache: Vec<Option<(DeviceBuf, DeviceBuf)>>,
         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
         /// 5=q4_0. All lossy formats opt-in via PULSAR_KV=<fmt>; the
@@ -5645,7 +5687,21 @@ mod real {
                 kcache.push(k);
                 vcache.push(v);
             }
-            if dense_split {
+            // TP attention halves: card B's kv-head caches, same codec
+            // and stride math as A's
+            let mut tp_kcache: Vec<Option<(DeviceBuf, DeviceBuf)>> = Vec::new();
+            if let Some(tp) = &m.tp {
+                kernels::set_device(tp.dev)?;
+                for il in 0..s.n_exec_layer as usize {
+                    tp_kcache.push(if m.tp_attn(il).is_some() {
+                        let b = (s.n_head_kv as usize / 2) * ctx as usize * kv_row(s.head_dim as usize);
+                        Some((DeviceBuf::alloc(b)?, DeviceBuf::alloc(b)?))
+                    } else {
+                        None
+                    });
+                }
+            }
+            if dense_split || m.tp.is_some() {
                 kernels::set_device(primary)?;
             } else if attn_split {
                 kernels::set_device(m.attn_dev.unwrap_or(primary))?;
@@ -5911,6 +5967,7 @@ mod real {
                 )?,
                 kcache,
                 vcache,
+                tp_kcache,
                 kvq,
                 kv_devs,
                 kvq_lat,

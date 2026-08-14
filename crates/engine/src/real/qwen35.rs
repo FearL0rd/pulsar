@@ -269,6 +269,14 @@ struct TpBank {
     gdn_o: DeviceBuf,
     gdn_tmp: DeviceBuf,
     states: Vec<Option<GdnState>>,
+    /// attention half (phase 3b): B's fused q|gate, split q/gate, k/v,
+    /// and gated heads over its 12 q / 2 kv heads
+    aqf: DeviceBuf,
+    aq: DeviceBuf,
+    agate: DeviceBuf,
+    ak: DeviceBuf,
+    av: DeviceBuf,
+    aheads: DeviceBuf,
     /// A->B activation handoff and B->A partial return. Reusing xq and
     /// recv across layers is race-free: each link's event forms a
     /// cross-stream back-edge every layer (A's next xq overwrite sits
@@ -403,6 +411,12 @@ impl Qwen35Rt {
                     gdn_o: f32s(T_MAX * vdh)?,
                     gdn_tmp: f32s(T_MAX * vdh)?,
                     states: bstates,
+                    aqf: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
+                    aq: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
+                    agate: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
+                    ak: f32s(T_MAX * (s.n_head_kv / 2 * s.head_dim) as usize)?,
+                    av: f32s(T_MAX * (s.n_head_kv / 2 * s.head_dim) as usize)?,
+                    aheads: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
                     lx,
                     lo: kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?,
                 };
@@ -1084,12 +1098,11 @@ impl Model {
         let dflash_on = rt.dflash.is_some();
         let graphable = |il: usize| {
             let l = &self.layers[il];
-            // no graphs under FFN tensor parallel: the TP branch hops
-            // devices and bounces through host memory, both illegal
-            // inside stream capture (measured cost of graphs-off on the
-            // 27B: ~0.7 tok/s of 21)
+            // TP spans capture too (phase 4): TpLink runs on the
+            // per-thread default streams and the event edges join card
+            // B's stream into the capture DAG, so the whole dual-card
+            // GDN+FFN chain replays as one multi-device graph
             !dflash_on
-                && self.tp.is_none()
                 && matches!(&l.attn, Attn::Qwen35(w) if w.gdn.is_some())
                 && matches!(l.ffn, Ffn::DenseKq { .. })
         };
@@ -1120,7 +1133,24 @@ impl Model {
                         if let Some(e) = inner {
                             return Err(e);
                         }
-                        e.insert(g?);
+                        match g {
+                            Ok(g) => {
+                                e.insert(g);
+                            }
+                            Err(err) => {
+                                // a capture refusal (driver/topology
+                                // specifics, e.g. cross-device nodes) is
+                                // a lost optimization, not an error: run
+                                // plain from here on
+                                eprintln!("pulsar: graph capture failed ({err}); running without graphs");
+                                rt.graphs_on = false;
+                                for j in lo2..hi2 {
+                                    self.eval_qwen35_layer(st, rt, j, &self.layers[j], pos, t)?;
+                                }
+                                il = end;
+                                continue;
+                            }
+                        }
                     }
                     graphs[&key].launch()?;
                     il = end;
@@ -1296,8 +1326,73 @@ impl Model {
             matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, value_dim, s.n_embd, t)?;
             }
         } else if let Some(attn) = &w.attn {
-            // ---- sigmoid-gated full attention (partial neox rope)
             let hd = s.head_dim;
+            if let (Some(bw), Some(tb)) = (self.tp_attn(il), rt.tpb.as_mut()) {
+                // ---- attention tensor parallel: 12/12 q heads, 2/2 kv
+                // heads, each card owns its heads' KV cache; the output
+                // projection is row-parallel so B returns a full-width
+                // partial. GQA grouping survives the split (6 q per kv
+                // head on both cards). Same TpLink pipeline, zero host
+                // syncs. Turbo KV is gated off at load under TP.
+                let nh2 = s.n_head / 2;
+                let nkv2 = s.n_head_kv / 2;
+                kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
+                tb.lx.send(&st.normed, (t * s.n_embd) as usize * 4)?;
+                kernels::set_device(tb.dev)?;
+                tb.lx.recv(&mut tb.normed, (t * s.n_embd) as usize * 4)?;
+                if matches!(bw.wq, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, t)?;
+                }
+                matw(&mut tb.aqf, &bw.wq, &tb.normed, &tb.xq, s.n_embd, 2 * nh2 * hd, t)?;
+                kernels::qwen35_split_gate(&mut tb.aq, &mut tb.agate, &tb.aqf, t * nh2, hd)?;
+                matw(&mut tb.ak, &bw.wk, &tb.normed, &tb.xq, s.n_embd, nkv2 * hd, t)?;
+                matw(&mut tb.av, &bw.wv, &tb.normed, &tb.xq, s.n_embd, nkv2 * hd, t)?;
+                kernels::gqa_head_rms_norm(&mut tb.aq, Some(&bw.q_norm), t * nh2, hd, eps)?;
+                kernels::gqa_head_rms_norm(&mut tb.ak, Some(&bw.k_norm), t * nkv2, hd, eps)?;
+                kernels::gqa_rope(&mut tb.aq, t, nh2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                kernels::gqa_rope(&mut tb.ak, t, nkv2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                let (bk, bv) = st.tp_kcache[il].as_mut().ok_or("tp attn cache missing")?;
+                kernels::gqa_kv_append(bk, &tb.ak, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                kernels::gqa_kv_append(bv, &tb.av, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                kernels::gqa_attention_rel(
+                    &mut tb.aheads, &tb.aq, bk, bv,
+                    t, nh2, nkv2, hd, st.ctx, pos,
+                    1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
+                    None,
+                )?;
+                kernels::qwen35_sigmoid_gate(&mut tb.aheads, &tb.agate, t * nh2 * hd)?;
+                if matches!(bw.out, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut tb.midq, &tb.aheads, nh2 * hd, t)?;
+                }
+                matw(&mut tb.out, &bw.out, &tb.aheads, &tb.midq, nh2 * hd, s.n_embd, t)?;
+                tb.lo.send(&tb.out, (t * s.n_embd) as usize * 4)?;
+                kernels::set_device(kernels::primary_device())?;
+                // A's heads, overlapping with B's chain
+                matw(&mut rt.qfull, &attn.wq, &st.normed, &st.xq, s.n_embd, 2 * nh2 * hd, t)?;
+                kernels::qwen35_split_gate(&mut st.q, &mut rt.gate, &rt.qfull, t * nh2, hd)?;
+                matw(&mut st.k, &attn.wk, &st.normed, &st.xq, s.n_embd, nkv2 * hd, t)?;
+                matw(&mut st.v, &attn.wv, &st.normed, &st.xq, s.n_embd, nkv2 * hd, t)?;
+                kernels::gqa_head_rms_norm(&mut st.q, Some(&attn.q_norm), t * nh2, hd, eps)?;
+                kernels::gqa_head_rms_norm(&mut st.k, Some(&attn.k_norm), t * nkv2, hd, eps)?;
+                kernels::gqa_rope(&mut st.q, t, nh2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                kernels::gqa_rope(&mut st.k, t, nkv2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                kernels::gqa_kv_append(&mut st.kcache[il], &st.k, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                kernels::gqa_kv_append(&mut st.vcache[il], &st.v, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                kernels::gqa_attention_rel(
+                    &mut st.heads, &st.q, &st.kcache[il], &st.vcache[il],
+                    t, nh2, nkv2, hd, st.ctx, pos,
+                    1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
+                    None,
+                )?;
+                kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.gate, t * nh2 * hd)?;
+                if matches!(attn.out, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut st.midq, &st.heads, nh2 * hd, t)?;
+                }
+                matw(&mut st.attn_out, &attn.out, &st.heads, &st.midq, nh2 * hd, s.n_embd, t)?;
+                tb.lo.recv(&mut tb.recv, (t * s.n_embd) as usize * 4)?;
+                kernels::add_assign(&mut st.attn_out, &tb.recv, t * s.n_embd)?;
+            } else {
+            // ---- sigmoid-gated full attention (partial neox rope)
             if matches!(attn.wq, MatW::Kq(_)) {
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
             }
@@ -1344,6 +1439,7 @@ impl Model {
                 kernels::quantize_q8_k(&mut st.midq, &st.heads, s.n_head * hd, t)?;
             }
             matw(&mut st.attn_out, &attn.out, &st.heads, &st.midq, s.n_head * hd, s.n_embd, t)?;
+            }
         } else {
             return Err("qwen35 layer with neither attn nor gdn".into());
         }
