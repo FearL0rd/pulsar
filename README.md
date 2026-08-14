@@ -470,6 +470,7 @@ Everything auto-configures; these override. Shared by `pulsar-cli` and
 | `PULSAR_MTP` | unset | `1` = MTP / nextn speculative decode when the GGUF has a nextn block (greedy) |
 | `PULSAR_MTP_DEPTH` | 3 | draft chain depth for MTP |
 | `PULSAR_NGRAM` | unset | draft-free n-gram speculation depth (greedy; disables some serve prefix-cache paths) |
+| `PULSAR_TP` | unset | `1` = tensor parallel across the two fastest cards (dense qwen35): FFN + GDN + attention head-sharded, multi-device CUDA graphs. Pin devices with `CUDA_DEVICE_ORDER=PCI_BUS_ID PULSAR_GPU=0` |
 | `PULSAR_DFLASH` | unset | path to draft GGUF (CLI speculative path): DFlash for qwen35, converted DSpark for deepseek4 |
 | `PULSAR_DSPARK_DEPTH` | 3 | dsv4 DSpark: tokens drafted per round (1..block_size; deeper measured slower) |
 | `PULSAR_DSPARK_CONF` | 0.5 | dsv4 DSpark: confidence prefix-cut probability; `off` disables the cut |
