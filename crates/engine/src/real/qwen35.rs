@@ -254,6 +254,13 @@ struct TpBank {
     midq: DeviceBuf,
     out: DeviceBuf,
     recv: DeviceBuf,
+    /// A->B activation handoff and B->A partial return. Reusing xq and
+    /// recv across layers is race-free: each link's event forms a
+    /// cross-stream back-edge every layer (A's next xq overwrite sits
+    /// behind the add that gated on lo; B's next recv overwrite gates
+    /// on lx behind A's next quantize).
+    lx: kernels::TpLink,
+    lo: kernels::TpLink,
 }
 
 /// qwen35 runtime: GDN states + scratch sized for T_MAX-token chunks.
@@ -331,6 +338,12 @@ impl Qwen35Rt {
                 };
                 let half = tp.half as usize;
                 let recv = f32s(T_MAX * s.n_embd as usize)?; // on the primary
+                // an event records only on its OWN device's streams: lx
+                // records on A (the activation send), lo on B (the
+                // partial return), so each is created with that device
+                // current
+                let q8kb = T_MAX * q8k(s.n_embd as usize);
+                let lx = kernels::TpLink::new(q8kb)?;
                 kernels::set_device(tp.dev)?;
                 let b = TpBank {
                     dev: tp.dev,
@@ -341,6 +354,8 @@ impl Qwen35Rt {
                     midq: DeviceBuf::alloc(T_MAX * q8k(half))?,
                     out: f32s(T_MAX * s.n_embd as usize)?,
                     recv,
+                    lx,
+                    lo: kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?,
                 };
                 kernels::set_device(primary)?;
                 Some(b)
@@ -1227,38 +1242,36 @@ impl Model {
                 .as_ref()
                 .and_then(|tp| tp.layers.get(il).and_then(|o| o.as_ref()).map(|w| (tp.half, w)));
             if let (Some((half, bw)), Some(tb)) = (tp, rt.tpb.as_mut()) {
-                // FFN tensor parallel: ship the quantized activation to
-                // card B, launch B's half chain, launch A's half chain
-                // (separate devices, async launches, so they overlap),
-                // then pull B's partial down output back and add. The
-                // bounce copies are latency-bound (~6KB a row); the win
-                // is both cards reading their FFN half of every layer
-                // at their own VRAM speed simultaneously.
+                // FFN tensor parallel, fully async: the quantized
+                // activation peer-copies to card B on A's stream, B's
+                // stream gates on the handoff event and runs its half,
+                // A's half launches behind it on A's stream, and B's
+                // partial down output peer-copies back behind B's chain
+                // for the gated add on A. ZERO host syncs: the v1 bounce
+                // (sync read/write through pageable host) cost ~6ms of a
+                // 38ms token across 64 layers.
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
                 let xb = t as usize
                     * (s.n_embd as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
                     * kernels::Q8_K_BLOCK_BYTES;
-                // raw q8_K bytes ride the f32 readback (292 = 4 * 73)
-                let xh = st.xq.read_f32(xb / 4)?;
+                let primary = kernels::primary_device();
+                tb.lx.send(&st.xq, xb)?;
                 kernels::set_device(tb.dev)?;
-                tb.xq.write(0, kernels::as_bytes(&xh))?;
+                tb.lx.recv(&mut tb.xq, xb)?;
                 kernels::matmul_kq(&mut tb.gate, &bw.gate.w, &tb.xq, s.n_embd, half, t, bw.gate.row_bytes, bw.gate.quant)?;
                 kernels::matmul_kq(&mut tb.up, &bw.up.w, &tb.xq, s.n_embd, half, t, bw.up.row_bytes, bw.up.quant)?;
                 kernels::swiglu(&mut tb.mid, &tb.gate, &tb.up, t * half, 0.0, 1.0, 0)?;
                 kernels::quantize_q8_k(&mut tb.midq, &tb.mid, half, t)?;
                 kernels::matmul_kq(&mut tb.out, &bw.down.w, &tb.midq, half, s.n_embd, t, bw.down.row_bytes, bw.down.quant)?;
-                kernels::set_device(kernels::primary_device())?;
-                // A's half runs while B's chain is in flight
+                tb.lo.send(&tb.out, t as usize * s.n_embd as usize * 4)?;
+                kernels::set_device(primary)?;
+                // A's half runs while B's chain + copies are in flight
                 kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, half, t, gate.row_bytes, gate.quant)?;
                 kernels::matmul_kq(&mut st.up_act, &up.w, &st.xq, s.n_embd, half, t, up.row_bytes, up.quant)?;
                 kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * half, 0.0, 1.0, 0)?;
                 kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, half, t)?;
                 kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, half, s.n_embd, t, down.row_bytes, down.quant)?;
-                // B's partial: the read syncs B's stream only
-                kernels::set_device(tb.dev)?;
-                let ph = tb.out.read_f32(t as usize * s.n_embd as usize)?;
-                kernels::set_device(kernels::primary_device())?;
-                tb.recv.write(0, kernels::as_bytes(&ph))?;
+                tb.lo.recv(&mut tb.recv, t as usize * s.n_embd as usize * 4)?;
                 kernels::add_assign(&mut st.ffn_out, &tb.recv, t * s.n_embd)?;
                 kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
                 if prof {

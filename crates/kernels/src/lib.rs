@@ -696,10 +696,69 @@ mod real {
     extern "C" {
         fn cudaStreamCreateWithFlags(s: *mut *mut c_void, flags: u32) -> i32;
         fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32, stream: *mut c_void) -> i32;
+        fn cudaMemcpyPeerAsync(dst: *mut c_void, dst_dev: i32, src: *const c_void, src_dev: i32, bytes: usize, stream: *mut c_void) -> i32;
         fn cudaEventCreateWithFlags(e: *mut *mut c_void, flags: u32) -> i32;
         fn cudaEventRecord(e: *mut c_void, stream: *mut c_void) -> i32;
         fn cudaEventQuery(e: *mut c_void) -> i32;
+        fn cudaEventDestroy(e: *mut c_void) -> i32;
         fn cudaStreamWaitEvent(stream: *mut c_void, e: *mut c_void, flags: u32) -> i32;
+    }
+
+    /// Cross-device handoff for tensor parallel: an async D2H into a
+    /// PINNED staging buffer on the source device's null stream, an
+    /// event, and an async H2D on the consumer device's null stream
+    /// gated on that event. No host syncs anywhere, both DMA engines,
+    /// fully known behavior. NOT cudaMemcpyPeerAsync: without P2P
+    /// access (GeForce) the driver stages peer copies with implicit
+    /// synchronization on BOTH devices - measured 26.4 -> 18.8 tok/s,
+    /// worse than v1's plain sync bounces.
+    ///
+    /// Create with the SOURCE device current (the event records there).
+    /// Host-call order per use: `send` on the source device, then
+    /// `recv` on the consumer BEFORE the same link's next `send`.
+    pub struct TpLink {
+        ev: *mut c_void,
+        pin: DeviceBuf,
+    }
+
+    unsafe impl Send for TpLink {}
+
+    impl TpLink {
+        pub fn new(bytes: usize) -> Result<TpLink> {
+            ensure_device();
+            const DISABLE_TIMING: u32 = 2;
+            let mut ev = std::ptr::null_mut();
+            check_rt(unsafe { cudaEventCreateWithFlags(&mut ev, DISABLE_TIMING) }, "tplink event")?;
+            Ok(TpLink { ev, pin: DeviceBuf::alloc_pinned(bytes)? })
+        }
+
+        /// Async D2H of `bytes` from `src` into the pinned stage, on the
+        /// CURRENT (source) device's null stream, event behind it.
+        pub fn send(&self, src: &DeviceBuf, bytes: usize) -> Result {
+            assert!(bytes <= self.pin.bytes() && bytes <= src.bytes());
+            check_rt(
+                unsafe { cudaMemcpyAsync(self.pin.host, src.ptr(), bytes, D2H, std::ptr::null_mut()) },
+                "tplink d2h",
+            )?;
+            check_rt(unsafe { cudaEventRecord(self.ev, std::ptr::null_mut()) }, "tplink record")
+        }
+
+        /// Gate the CURRENT (consumer) device's null stream on the last
+        /// send, then async H2D from the pinned stage into `dst`.
+        pub fn recv(&self, dst: &mut DeviceBuf, bytes: usize) -> Result {
+            assert!(bytes <= self.pin.bytes() && bytes <= dst.bytes());
+            check_rt(unsafe { cudaStreamWaitEvent(std::ptr::null_mut(), self.ev, 0) }, "tplink wait")?;
+            check_rt(
+                unsafe { cudaMemcpyAsync(dst.ptr_mut(), self.pin.host, bytes, H2D, std::ptr::null_mut()) },
+                "tplink h2d",
+            )
+        }
+    }
+
+    impl Drop for TpLink {
+        fn drop(&mut self) {
+            unsafe { cudaEventDestroy(self.ev) };
+        }
     }
 
     /// A side stream + event for best-effort background H2D staging.
