@@ -254,6 +254,21 @@ struct TpBank {
     midq: DeviceBuf,
     out: DeviceBuf,
     recv: DeviceBuf,
+    /// GDN half (phase 3): B receives the layer-normed residual, derives
+    /// its own quantized copy, and runs a complete half-GDN over its
+    /// heads with its own recurrent states
+    normed: DeviceBuf,
+    qkv: DeviceBuf,
+    conv_out: DeviceBuf,
+    z: DeviceBuf,
+    gq: DeviceBuf,
+    gk: DeviceBuf,
+    gv: DeviceBuf,
+    g: DeviceBuf,
+    beta: DeviceBuf,
+    gdn_o: DeviceBuf,
+    gdn_tmp: DeviceBuf,
+    states: Vec<Option<GdnState>>,
     /// A->B activation handoff and B->A partial return. Reusing xq and
     /// recv across layers is race-free: each link's event forms a
     /// cross-stream back-edge every layer (A's next xq overwrite sits
@@ -337,14 +352,36 @@ impl Qwen35Rt {
                     n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
                 };
                 let half = tp.half as usize;
+                let (kdh, vdh) = (key_dim / 2, value_dim / 2);
+                let cdh = 2 * kdh + vdh;
+                let vh = s.ssm_v_heads as usize / 2;
                 let recv = f32s(T_MAX * s.n_embd as usize)?; // on the primary
                 // an event records only on its OWN device's streams: lx
-                // records on A (the activation send), lo on B (the
-                // partial return), so each is created with that device
+                // records on A (the activation sends: q8_K rows for the
+                // FFN, f32 normed for the GDN half), lo on B (the
+                // partial returns), so each is created with that device
                 // current
-                let q8kb = T_MAX * q8k(s.n_embd as usize);
-                let lx = kernels::TpLink::new(q8kb)?;
+                let lx = kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?;
                 kernels::set_device(tp.dev)?;
+                let mut bstates = Vec::with_capacity(s.n_exec_layer as usize);
+                for il in 0..s.n_exec_layer as usize {
+                    if m.tp_gdn(il).is_some() {
+                        let sbytes = vh * s.ssm_state as usize * s.ssm_state as usize * 4;
+                        let cbytes = (s.ssm_conv_k as usize - 1) * cdh * 4;
+                        let mut st2 = GdnState {
+                            s: DeviceBuf::alloc(sbytes)?,
+                            conv: DeviceBuf::alloc(cbytes)?,
+                            dev: tp.dev,
+                            snap_s: None,
+                            snap_conv: None,
+                        };
+                        kernels::zero(&mut st2.s, sbytes)?;
+                        kernels::zero(&mut st2.conv, cbytes)?;
+                        bstates.push(Some(st2));
+                    } else {
+                        bstates.push(None);
+                    }
+                }
                 let b = TpBank {
                     dev: tp.dev,
                     xq: DeviceBuf::alloc(T_MAX * q8k(s.n_embd as usize))?,
@@ -354,6 +391,18 @@ impl Qwen35Rt {
                     midq: DeviceBuf::alloc(T_MAX * q8k(half))?,
                     out: f32s(T_MAX * s.n_embd as usize)?,
                     recv,
+                    normed: f32s(T_MAX * s.n_embd as usize)?,
+                    qkv: f32s(T_MAX * cdh)?,
+                    conv_out: f32s(T_MAX * cdh)?,
+                    z: f32s(T_MAX * vdh)?,
+                    gq: f32s(T_MAX * kdh)?,
+                    gk: f32s(T_MAX * kdh)?,
+                    gv: f32s(T_MAX * vdh)?,
+                    g: f32s(T_MAX * vh)?,
+                    beta: f32s(T_MAX * vh)?,
+                    gdn_o: f32s(T_MAX * vdh)?,
+                    gdn_tmp: f32s(T_MAX * vdh)?,
+                    states: bstates,
                     lx,
                     lo: kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?,
                 };
@@ -390,7 +439,8 @@ impl Qwen35Rt {
     /// beside their state, so the copies never cross cards).
     pub(super) fn gdn_snapshot(&mut self) -> Result {
         let primary = kernels::get_device();
-        for gs in self.states.iter_mut().flatten() {
+        let tpb_states = self.tpb.iter_mut().flat_map(|b| b.states.iter_mut());
+        for gs in self.states.iter_mut().chain(tpb_states).flatten() {
             kernels::set_device(gs.dev)?;
             if gs.snap_s.is_none() {
                 gs.snap_s = Some(DeviceBuf::alloc(gs.s.bytes())?);
@@ -408,7 +458,8 @@ impl Qwen35Rt {
     /// Restore the last gdn_snapshot (partial MTP acceptance).
     pub(super) fn gdn_restore(&mut self) -> Result {
         let primary = kernels::get_device();
-        for gs in self.states.iter_mut().flatten() {
+        let tpb_states = self.tpb.iter_mut().flat_map(|b| b.states.iter_mut());
+        for gs in self.states.iter_mut().chain(tpb_states).flatten() {
             let (Some(ss), Some(sc)) = (&gs.snap_s, &gs.snap_conv) else {
                 return Err("gdn_restore without a snapshot".into());
             };
@@ -427,7 +478,8 @@ impl Qwen35Rt {
     pub(super) fn ckpt(&self) -> Result<Vec<Option<(DeviceBuf, DeviceBuf)>>> {
         let primary = kernels::get_device();
         let mut out = Vec::with_capacity(self.states.len());
-        for gs in &self.states {
+        let tpb_states = self.tpb.iter().flat_map(|b| b.states.iter());
+        for gs in self.states.iter().chain(tpb_states) {
             out.push(match gs {
                 Some(g) => {
                     kernels::set_device(g.dev)?;
@@ -446,7 +498,8 @@ impl Qwen35Rt {
 
     pub(super) fn ckpt_restore(&mut self, ck: &[Option<(DeviceBuf, DeviceBuf)>]) -> Result {
         let primary = kernels::get_device();
-        for (gs, c) in self.states.iter_mut().zip(ck) {
+        let tpb_states = self.tpb.iter_mut().flat_map(|b| b.states.iter_mut());
+        for (gs, c) in self.states.iter_mut().chain(tpb_states).zip(ck) {
             if let (Some(g), Some((s2, c2))) = (gs, c) {
                 kernels::set_device(g.dev)?;
                 kernels::copy_d2d(&mut g.s, 0, s2, 0, s2.bytes())?;
@@ -459,7 +512,8 @@ impl Qwen35Rt {
 
     fn reset(&mut self) -> Result {
         let primary = kernels::get_device();
-        for st in self.states.iter_mut().flatten() {
+        let tpb_states = self.tpb.iter_mut().flat_map(|b| b.states.iter_mut());
+        for st in self.states.iter_mut().chain(tpb_states).flatten() {
             kernels::set_device(st.dev)?;
             let (sb, cb) = (st.s.bytes(), st.conv.bytes());
             kernels::zero(&mut st.s, sb)?;
@@ -472,6 +526,11 @@ impl Qwen35Rt {
     fn enable_dflash(&mut self, m: &Model, layer_ids: Vec<usize>) -> Result {
         if self.dflash.is_some() {
             return Ok(());
+        }
+        if m.tp.is_some() {
+            // the fast-rollback stash and capture ring assume full-width
+            // qkv rows on one card
+            return Err("PULSAR_DFLASH with PULSAR_TP is not supported yet".into());
         }
         let s = m.shape;
         let feat_w = layer_ids.len() * s.n_embd as usize;
@@ -1121,6 +1180,71 @@ impl Model {
         }
 
         if let Some(gdn) = &w.gdn {
+            if let (Some(bw), Some(tb)) = (self.tp_gdn(il), rt.tpb.as_mut()) {
+                // ---- GDN tensor parallel: ship the normed residual to
+                // card B, which quantizes its own copy and runs a full
+                // half-GDN over its heads (delta-rule state is head-
+                // local); ssm_out is row-parallel so B returns a full-
+                // width partial that adds into A's. Same TpLink pipeline
+                // as the FFN: zero host syncs.
+                let vh = s.ssm_v_heads / 2;
+                let kh = s.ssm_k_heads / 2;
+                let kdh = kh * s.ssm_state;
+                let vdh = vh * s.ssm_state;
+                let cdh = 2 * kdh + vdh;
+                kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
+                tb.lx.send(&st.normed, (t * s.n_embd) as usize * 4)?;
+                kernels::set_device(tb.dev)?;
+                tb.lx.recv(&mut tb.normed, (t * s.n_embd) as usize * 4)?;
+                if matches!(bw.wqkv, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, t)?;
+                }
+                matw(&mut tb.qkv, &bw.wqkv, &tb.normed, &tb.xq, s.n_embd, cdh, t)?;
+                matw(&mut tb.z, &bw.wz, &tb.normed, &tb.xq, s.n_embd, vdh, t)?;
+                kernels::matmul_f32(&mut tb.g, &bw.alpha_w, &tb.normed, s.n_embd, vh, t)?;
+                kernels::matmul_f32(&mut tb.beta, &bw.beta_w, &tb.normed, s.n_embd, vh, t)?;
+                kernels::qwen35_gdn_coeffs(&mut tb.g, &mut tb.beta, &bw.a, &bw.dt_bias, t, vh)?;
+                let bs = tb.states[il].as_mut().ok_or("tp gdn state missing")?;
+                kernels::qwen35_conv_batch(&mut tb.conv_out, &tb.qkv, &bw.conv, &mut bs.conv, cdh, s.ssm_conv_k, t)?;
+                kernels::qwen35_split_qkv(&mut tb.gq, &mut tb.gk, &mut tb.gv, &tb.conv_out, t, kdh, vdh)?;
+                kernels::qwen35_l2_norm(&mut tb.gq, t * kh, s.ssm_state, eps)?;
+                kernels::qwen35_l2_norm(&mut tb.gk, t * kh, s.ssm_state, eps)?;
+                kernels::qwen35_gdn_batch(
+                    &mut tb.gdn_o, &mut bs.s, &tb.gq, &tb.gk, &tb.gv, &tb.g, &tb.beta,
+                    vh, kh, s.ssm_state, t,
+                )?;
+                kernels::gqa_head_rms_norm(&mut tb.gdn_o, Some(&bw.ssm_norm), t * vh, s.ssm_state, eps)?;
+                kernels::swiglu(&mut tb.gdn_tmp, &tb.z, &tb.gdn_o, t * vdh, 0.0, 1.0, 0)?;
+                if matches!(bw.ssm_out, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut tb.midq, &tb.gdn_tmp, vdh, t)?;
+                }
+                matw(&mut tb.out, &bw.ssm_out, &tb.gdn_tmp, &tb.midq, vdh, s.n_embd, t)?;
+                tb.lo.send(&tb.out, (t * s.n_embd) as usize * 4)?;
+                kernels::set_device(kernels::primary_device())?;
+                // A's half, overlapping with B's chain
+                matw(&mut rt.qkv, &gdn.wqkv, &st.normed, &st.xq, s.n_embd, cdh, t)?;
+                matw(&mut rt.z, &gdn.wz, &st.normed, &st.xq, s.n_embd, vdh, t)?;
+                kernels::matmul_f32(&mut rt.g, &gdn.alpha_w, &st.normed, s.n_embd, vh, t)?;
+                kernels::matmul_f32(&mut rt.beta, &gdn.beta_w, &st.normed, s.n_embd, vh, t)?;
+                kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, vh)?;
+                let gs = rt.states[il].as_mut().ok_or("gdn state missing")?;
+                kernels::qwen35_conv_batch(&mut rt.conv_out, &rt.qkv, &gdn.conv, &mut gs.conv, cdh, s.ssm_conv_k, t)?;
+                kernels::qwen35_split_qkv(&mut rt.gq, &mut rt.gk, &mut rt.gv, &rt.conv_out, t, kdh, vdh)?;
+                kernels::qwen35_l2_norm(&mut rt.gq, t * kh, s.ssm_state, eps)?;
+                kernels::qwen35_l2_norm(&mut rt.gk, t * kh, s.ssm_state, eps)?;
+                kernels::qwen35_gdn_batch(
+                    &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.g, &rt.beta,
+                    vh, kh, s.ssm_state, t,
+                )?;
+                kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * vh, s.ssm_state, eps)?;
+                kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * vdh, 0.0, 1.0, 0)?;
+                if matches!(gdn.ssm_out, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, vdh, t)?;
+                }
+                matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, vdh, s.n_embd, t)?;
+                tb.lo.recv(&mut tb.recv, (t * s.n_embd) as usize * 4)?;
+                kernels::add_assign(&mut st.attn_out, &tb.recv, t * s.n_embd)?;
+            } else {
             // ---- Gated DeltaNet (recurrences loop inside the launches)
             if matches!(gdn.wqkv, MatW::Kq(_)) {
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
@@ -1170,6 +1294,7 @@ impl Model {
                 kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, value_dim, t)?;
             }
             matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, value_dim, s.n_embd, t)?;
+            }
         } else if let Some(attn) = &w.attn {
             // ---- sigmoid-gated full attention (partial neox rope)
             let hd = s.head_dim;
@@ -1237,10 +1362,13 @@ impl Model {
         }
         kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, t, eps)?;
         if let Ffn::DenseKq { gate, up, down } = &l.ffn {
-            let tp = self
-                .tp
-                .as_ref()
-                .and_then(|tp| tp.layers.get(il).and_then(|o| o.as_ref()).map(|w| (tp.half, w)));
+            let tp = self.tp.as_ref().and_then(|tp| {
+                tp.layers
+                    .get(il)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|w| w.ffn.as_ref())
+                    .map(|w| (tp.half, w))
+            });
             if let (Some((half, bw)), Some(tb)) = (tp, rt.tpb.as_mut()) {
                 // FFN tensor parallel, fully async: the quantized
                 // activation peer-copies to card B on A's stream, B's

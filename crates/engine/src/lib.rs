@@ -2601,11 +2601,17 @@ mod real {
         up: KqW,
         down: KqW,
     }
+    /// One layer's card-B shards: the FFN halves plus (phase 3) the GDN
+    /// head halves, which reuse the A-side struct shape verbatim.
+    struct TpLayerW {
+        ffn: Option<TpFfnW>,
+        gdn: Option<Qwen35Gdn>,
+    }
     pub(crate) struct TpW {
         pub(crate) dev: i32,
         /// per-card ffn width = n_ff_exp / 2
         pub(crate) half: u32,
-        layers: Vec<Option<TpFfnW>>,
+        layers: Vec<Option<TpLayerW>>,
     }
 
     /// Raw K-quant tensor bytes + per-row size (shared by the whole and
@@ -2618,6 +2624,58 @@ mod real {
         let mut buf = vec![0u8; bytes as usize];
         file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
         Ok((buf, t.ty.row_bytes(t.dims[0]).unwrap(), quant))
+    }
+
+    /// MatW built from ROW ranges of the tensor, on the CURRENT device
+    /// (TP head/column slices). Follows keep_native so the slice rides
+    /// the same kernel path the whole tensor would.
+    fn matw_row_ranges(file: &VFile, g: &Gguf, name: &str, ranges: &[(u64, u64)]) -> Result<MatW> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        if MatW::keep_native(t) {
+            let (bytes, rb, quant) = read_kq_bytes(file, g, name)?;
+            let mut sl = Vec::new();
+            for &(r0, r1) in ranges {
+                sl.extend_from_slice(&bytes[(r0 * rb) as usize..(r1 * rb) as usize]);
+            }
+            Ok(MatW::Kq(KqW { w: DeviceBuf::from_bytes(&sl)?, row_bytes: rb, quant }))
+        } else {
+            // q8_0 rows (raw q8_0 or the F16/BF16 requant): 34 B / 32 elems
+            let bytes = read_tensor_bytes(file, g, name)?;
+            let rb = t.dims[0] as usize / 32 * 34;
+            let mut sl = Vec::new();
+            for &(r0, r1) in ranges {
+                sl.extend_from_slice(&bytes[r0 as usize * rb..r1 as usize * rb]);
+            }
+            Ok(MatW::Q8(DeviceBuf::from_bytes(&sl)?))
+        }
+    }
+
+    /// MatW with each output row's INPUT half repacked contiguously (TP
+    /// row-parallel projections: ssm_out / attn_output / ffn_down). The
+    /// halves are quant-block aligned by the TP gate's dim checks.
+    fn matw_col_half(file: &VFile, g: &Gguf, name: &str, second: bool) -> Result<MatW> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        let native = MatW::keep_native(t);
+        let (bytes, rb, quant) = if native {
+            read_kq_bytes(file, g, name)?
+        } else {
+            let b = read_tensor_bytes(file, g, name)?;
+            let rb = t.dims[0] as u64 / 32 * 34;
+            (b, rb, 0)
+        };
+        let rb = rb as usize;
+        let hb = rb / 2;
+        let n = bytes.len() / rb;
+        let mut sl = Vec::with_capacity(n * hb);
+        for r in 0..n {
+            let row = &bytes[r * rb..(r + 1) * rb];
+            sl.extend_from_slice(if second { &row[hb..] } else { &row[..hb] });
+        }
+        if native {
+            Ok(MatW::Kq(KqW { w: DeviceBuf::from_bytes(&sl)?, row_bytes: hb as u64, quant }))
+        } else {
+            Ok(MatW::Q8(DeviceBuf::from_bytes(&sl)?))
+        }
     }
 
     /// K-quant tensor -> resident device bytes + the matmul_kq metadata.
@@ -2682,6 +2740,32 @@ mod real {
     /// Tensor -> device f32 regardless of source encoding. Small tensors
     /// whose consumers are matmul_f32 (qwen35 ssm_alpha/ssm_beta): dense
     /// 27B files K-quantize them where the 35B shipped f32.
+    /// Any small tensor -> host f32 (the decode half of upload_as_f32;
+    /// the TP loader slices these row-wise before upload).
+    fn read_any_f32(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<f32>> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        match t.ty {
+            TensorType::F32 | TensorType::F16 | TensorType::BF16 => read_f16_as_f32(file, g, name),
+            TensorType::Q4K => {
+                let n = t.n_elements() as usize;
+                let mut buf = vec![0u8; n / 256 * 144];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                Ok(quant::cpu_dot::dequant_q4_k(&buf, n))
+            }
+            TensorType::Q8_0 => {
+                let n = t.n_elements() as usize;
+                let bytes = t.byte_size().ok_or_else(|| meta_err(name))? as usize;
+                if !n.is_multiple_of(32) {
+                    return Err(format!("{name}: q8_0 width {n} not a multiple of 32").into());
+                }
+                let mut buf = vec![0u8; bytes];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                Ok(quant::cpu_dot::dequant_q8_0(&buf, n))
+            }
+            other => Err(format!("{name}: no f32 path for {other:?}").into()),
+        }
+    }
+
     fn upload_as_f32(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
         match t.ty {
@@ -2790,6 +2874,11 @@ mod real {
     }
 
     impl Model {
+        /// Card-B GDN head shard for exec layer `il` (PULSAR_TP); None
+        /// when TP is off or the layer is full attention.
+        pub(crate) fn tp_gdn(&self, il: usize) -> Option<&Qwen35Gdn> {
+            self.tp.as_ref()?.layers.get(il)?.as_ref()?.gdn.as_ref()
+        }
         pub fn load(path: &Path) -> Result<Model> {
             let (shards, gguf) = parse_header(path)?;
             let file = VFile::open(&shards)?;
@@ -3024,6 +3113,9 @@ mod real {
                 && kernels::device_count() > 1
                 && std::env::var("PULSAR_TP").ok().as_deref() == Some("1")
                 && shape.n_ff_exp.is_multiple_of(512)
+                && shape.ssm_v_heads.is_multiple_of(2)
+                && shape.ssm_k_heads.is_multiple_of(2)
+                && (shape.ssm_k_heads * shape.ssm_state).is_multiple_of(512)
             {
                 let dev_b = (0..kernels::device_count())
                     .filter(|&d| d != primary)
@@ -3041,7 +3133,8 @@ mod real {
             } else {
                 None
             };
-            let tp_stash: std::cell::RefCell<Option<TpFfnW>> = std::cell::RefCell::new(None);
+            let tp_ffn_stash: std::cell::RefCell<Option<TpFfnW>> = std::cell::RefCell::new(None);
+            let tp_gdn_stash: std::cell::RefCell<Option<Qwen35Gdn>> = std::cell::RefCell::new(None);
             let mut layer_dev = vec![primary; shape.n_exec_layer as usize];
             if qwen35_dense
                 && tp_cfg.is_none()
@@ -3416,7 +3509,7 @@ mod real {
                             down: kq(&da, dh as u64, dq)?,
                         };
                         kernels::set_device(dev_b)?;
-                        *tp_stash.borrow_mut() = Some(TpFfnW {
+                        *tp_ffn_stash.borrow_mut() = Some(TpFfnW {
                             gate: kq(&gb[gsplit..], grb, gq)?,
                             up: kq(&ub[usplit..], urb, uq)?,
                             down: kq(&dbb, dh as u64, dq)?,
@@ -3775,6 +3868,54 @@ mod real {
                             },
                             gdn: if is_attn {
                                 None
+                            } else if let Some((dev_b, _)) = tp_cfg.filter(|_| il < shape.n_exec_layer) {
+                                // TP head split: A keeps the first half of
+                                // the qk and v heads, B the second. The
+                                // delta-rule state is head-local, so each
+                                // card runs a complete half-GDN and only
+                                // ssm_out's partial output crosses. Fused
+                                // qkv row layout: [q key | k key | v value].
+                                let kd = (shape.ssm_k_heads * shape.ssm_state) as u64;
+                                let vd = (shape.ssm_v_heads * shape.ssm_state) as u64;
+                                let (kh, vh2) = (kd / 2, vd / 2);
+                                let vheads = shape.ssm_v_heads as u64;
+                                let ck = shape.ssm_conv_k as usize;
+                                let ne = shape.n_embd as usize;
+                                let mk = |ranges: &[(u64, u64)], vr: (u64, u64), hr: (u64, u64), second: bool| -> Result<Qwen35Gdn> {
+                                    let alpha = read_any_f32(&file, &gguf, &t("ssm_alpha.weight"))?;
+                                    let beta = read_any_f32(&file, &gguf, &t("ssm_beta.weight"))?;
+                                    let av = read_any_f32(&file, &gguf, &t("ssm_a"))?;
+                                    let dtv = read_any_f32(&file, &gguf, &t("ssm_dt.bias"))?;
+                                    let convv = read_any_f32(&file, &gguf, &t("ssm_conv1d.weight"))?;
+                                    let mut conv_sl: Vec<f32> = Vec::new();
+                                    for &(r0, r1) in ranges {
+                                        conv_sl.extend_from_slice(&convv[r0 as usize * ck..r1 as usize * ck]);
+                                    }
+                                    let (h0, h1) = (hr.0 as usize, hr.1 as usize);
+                                    Ok(Qwen35Gdn {
+                                        wqkv: matw_row_ranges(&file, &gguf, &t("attn_qkv.weight"), ranges)?,
+                                        wz: matw_row_ranges(&file, &gguf, &t("attn_gate.weight"), &[vr])?,
+                                        conv: DeviceBuf::from_f32(&conv_sl)?,
+                                        alpha_w: DeviceBuf::from_f32(&alpha[h0 * ne..h1 * ne])?,
+                                        beta_w: DeviceBuf::from_f32(&beta[h0 * ne..h1 * ne])?,
+                                        a: DeviceBuf::from_f32(&av[h0..h1])?,
+                                        dt_bias: DeviceBuf::from_f32(&dtv[h0..h1])?,
+                                        ssm_norm: upload(&file, &gguf, &t("ssm_norm.weight"))?,
+                                        ssm_out: matw_col_half(&file, &gguf, &t("ssm_out.weight"), second)?,
+                                    })
+                                };
+                                let a_half = mk(
+                                    &[(0, kh), (kd, kd + kh), (2 * kd, 2 * kd + vh2)],
+                                    (0, vh2), (0, vheads / 2), false,
+                                )?;
+                                let cur_dev = kernels::get_device();
+                                kernels::set_device(dev_b)?;
+                                *tp_gdn_stash.borrow_mut() = Some(mk(
+                                    &[(kh, kd), (kd + kh, 2 * kd), (2 * kd + vh2, 2 * kd + vd)],
+                                    (vh2, vd), (vheads / 2, vheads), true,
+                                )?);
+                                kernels::set_device(cur_dev)?;
+                                Some(a_half)
                             } else {
                                 Some(Qwen35Gdn {
                                     wqkv: MatW::load(&file, &gguf, &t("attn_qkv.weight"))?,
@@ -3935,13 +4076,17 @@ mod real {
             };
 
             let mut layers = Vec::with_capacity(shape.n_exec_layer as usize);
-            let mut tp_layers: Vec<Option<TpFfnW>> = Vec::new();
+            let mut tp_layers: Vec<Option<TpLayerW>> = Vec::new();
             for il in 0..shape.n_exec_layer {
                 // dense split: the whole layer uploads to its owner
                 kernels::set_device(layer_dev[il as usize])?;
                 layers.push(load_layer(il, &mut attn_vram_budget, &mut no_budget)?);
                 if tp_cfg.is_some() {
-                    tp_layers.push(tp_stash.borrow_mut().take());
+                    let (f, g2) = (tp_ffn_stash.borrow_mut().take(), tp_gdn_stash.borrow_mut().take());
+                    tp_layers.push(match (f, g2) {
+                        (None, None) => None,
+                        (f, g2) => Some(TpLayerW { ffn: f, gdn: g2 }),
+                    });
                 }
             }
             kernels::set_device(primary)?;
