@@ -1047,6 +1047,9 @@ mod real {
         /// DSpark draft heads (fc / main_norm / markov / confidence):
         /// present only on a converted draft gguf, None on targets
         dspark: Option<dsv4::DsparkW>,
+        /// FFN tensor-parallel shards on the second card (PULSAR_TP=1,
+        /// dense qwen35); None everywhere else
+        pub(crate) tp: Option<TpW>,
     }
 
     /// deepseek4 output_hc_*: collapse the final HC streams before
@@ -2588,6 +2591,35 @@ mod real {
         Ok(DeviceBuf::from_bytes(&read_tensor_bytes(file, g, name)?)?)
     }
 
+    /// FFN tensor-parallel shards (PULSAR_TP=1, dense qwen35): card B's
+    /// halves. gate/up hold output rows [half..n_ff), down holds input
+    /// blocks [half..) of every row repacked contiguously. Card A's
+    /// Ffn::DenseKq holds the other halves; each card's down output is a
+    /// partial sum and the eval adds them.
+    struct TpFfnW {
+        gate: KqW,
+        up: KqW,
+        down: KqW,
+    }
+    pub(crate) struct TpW {
+        pub(crate) dev: i32,
+        /// per-card ffn width = n_ff_exp / 2
+        pub(crate) half: u32,
+        layers: Vec<Option<TpFfnW>>,
+    }
+
+    /// Raw K-quant tensor bytes + per-row size (shared by the whole and
+    /// sliced uploads).
+    fn read_kq_bytes(file: &VFile, g: &Gguf, name: &str) -> Result<(Vec<u8>, u64, u32)> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        let quant = quant_code(t.ty)
+            .ok_or_else(|| format!("{name}: unsupported K-quant type {:?}", t.ty))?;
+        let bytes = t.byte_size().ok_or_else(|| meta_err(name))?;
+        let mut buf = vec![0u8; bytes as usize];
+        file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+        Ok((buf, t.ty.row_bytes(t.dims[0]).unwrap(), quant))
+    }
+
     /// K-quant tensor -> resident device bytes + the matmul_kq metadata.
     /// Reads RAW file bytes: read_tensor_bytes would requant K-quants to
     /// q8_0 (1.9x the VRAM and the wrong layout for matmul_kq).
@@ -2981,8 +3013,38 @@ mod real {
             // PULSAR_SPLIT=<n> forces n leading layers on the primary,
             // PULSAR_SPLIT=off keeps everything on one card.
             let qwen35_dense = shape.family == Family::Qwen35 && shape.n_expert == 1;
+            // FFN tensor parallel (PULSAR_TP=1, dense qwen35, 2+ cards):
+            // both cards read their FFN half of EVERY layer in parallel,
+            // where the dense split reads each card's layers in sequence.
+            // The FFN is ~57% of the per-token bytes on a dense 27B, so
+            // this is most of TP's win at none of the KV/GDN sharding
+            // cost; attention stays whole on the primary, and the dense
+            // split is skipped (all layers owned by the primary).
+            let tp_cfg: Option<(i32, u32)> = if qwen35_dense
+                && kernels::device_count() > 1
+                && std::env::var("PULSAR_TP").ok().as_deref() == Some("1")
+                && shape.n_ff_exp.is_multiple_of(512)
+            {
+                let dev_b = (0..kernels::device_count())
+                    .filter(|&d| d != primary)
+                    .max_by(|&a, &b| {
+                        kernels::vram_bandwidth(a)
+                            .partial_cmp(&kernels::vram_bandwidth(b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap();
+                eprintln!(
+                    "pulsar: FFN tensor parallel on devices {primary}+{dev_b} ({}-wide halves)",
+                    shape.n_ff_exp / 2
+                );
+                Some((dev_b, shape.n_ff_exp / 2))
+            } else {
+                None
+            };
+            let tp_stash: std::cell::RefCell<Option<TpFfnW>> = std::cell::RefCell::new(None);
             let mut layer_dev = vec![primary; shape.n_exec_layer as usize];
             if qwen35_dense
+                && tp_cfg.is_none()
                 && kernels::device_count() > 1
                 && std::env::var("PULSAR_SPLIT").ok().as_deref() != Some("off")
             {
@@ -3319,11 +3381,54 @@ mod real {
                 {
                     // dense qwen35 (27B): the FFN triple resident in
                     // native K-quant on whatever device is current (the
-                    // layer's owner under the dense split)
-                    Ffn::DenseKq {
-                        gate: upload_kq(&file, &gguf, &t("ffn_gate.weight"))?,
-                        up: upload_kq(&file, &gguf, &t("ffn_up.weight"))?,
-                        down: upload_kq(&file, &gguf, &t("ffn_down.weight"))?,
+                    // layer's owner under the dense split). Under
+                    // PULSAR_TP the triple splits across the pair -
+                    // gate/up by output rows, down by input blocks - so
+                    // both cards read their half of every layer's FFN in
+                    // parallel and the partial down outputs add. The
+                    // nextn/MTP layer stays whole (il >= n_exec_layer).
+                    if let Some((dev_b, half)) = tp_cfg.filter(|_| il < shape.n_exec_layer) {
+                        let cur = kernels::get_device();
+                        let (gb, grb, gq) = read_kq_bytes(&file, &gguf, &t("ffn_gate.weight"))?;
+                        let (ub, urb, uq) = read_kq_bytes(&file, &gguf, &t("ffn_up.weight"))?;
+                        let (db, drb, dq) = read_kq_bytes(&file, &gguf, &t("ffn_down.weight"))?;
+                        let gsplit = half as usize * grb as usize;
+                        let usplit = half as usize * urb as usize;
+                        // down: the contraction dim halves, so every
+                        // output row contributes its first half of
+                        // quant blocks to A and the rest to B
+                        let drb = drb as usize;
+                        let dh = drb / 2;
+                        let n_out = db.len() / drb;
+                        let mut da = Vec::with_capacity(n_out * dh);
+                        let mut dbb = Vec::with_capacity(n_out * dh);
+                        for r in 0..n_out {
+                            let row = &db[r * drb..(r + 1) * drb];
+                            da.extend_from_slice(&row[..dh]);
+                            dbb.extend_from_slice(&row[dh..]);
+                        }
+                        let kq = |bytes: &[u8], rb: u64, q: u32| -> Result<KqW> {
+                            Ok(KqW { w: DeviceBuf::from_bytes(bytes)?, row_bytes: rb, quant: q })
+                        };
+                        let a = Ffn::DenseKq {
+                            gate: kq(&gb[..gsplit], grb, gq)?,
+                            up: kq(&ub[..usplit], urb, uq)?,
+                            down: kq(&da, dh as u64, dq)?,
+                        };
+                        kernels::set_device(dev_b)?;
+                        *tp_stash.borrow_mut() = Some(TpFfnW {
+                            gate: kq(&gb[gsplit..], grb, gq)?,
+                            up: kq(&ub[usplit..], urb, uq)?,
+                            down: kq(&dbb, dh as u64, dq)?,
+                        });
+                        kernels::set_device(cur)?;
+                        a
+                    } else {
+                        Ffn::DenseKq {
+                            gate: upload_kq(&file, &gguf, &t("ffn_gate.weight"))?,
+                            up: upload_kq(&file, &gguf, &t("ffn_up.weight"))?,
+                            down: upload_kq(&file, &gguf, &t("ffn_down.weight"))?,
+                        }
                     }
                 } else {
                     let exps = |suffix: &str| -> Result<ExpertTensor> {
@@ -3830,10 +3935,14 @@ mod real {
             };
 
             let mut layers = Vec::with_capacity(shape.n_exec_layer as usize);
+            let mut tp_layers: Vec<Option<TpFfnW>> = Vec::new();
             for il in 0..shape.n_exec_layer {
                 // dense split: the whole layer uploads to its owner
                 kernels::set_device(layer_dev[il as usize])?;
                 layers.push(load_layer(il, &mut attn_vram_budget, &mut no_budget)?);
+                if tp_cfg.is_some() {
+                    tp_layers.push(tp_stash.borrow_mut().take());
+                }
             }
             kernels::set_device(primary)?;
 
@@ -4021,6 +4130,7 @@ mod real {
                 ones_hc,
                 dsv4_out,
                 dspark,
+                tp: tp_cfg.map(|(dev, half)| TpW { dev, half, layers: tp_layers }),
             })
         }
     }

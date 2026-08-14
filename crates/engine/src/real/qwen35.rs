@@ -240,6 +240,22 @@ impl DenseBank {
     }
 }
 
+/// FFN tensor-parallel scratch on card B (PULSAR_TP): the quantized
+/// activation bounces into xq, the half-width chain runs there while
+/// the primary runs its own half, and out carries B's partial down
+/// output back through recv (allocated on the PRIMARY) for the add.
+/// T_MAX rows like every other qwen35 scratch.
+struct TpBank {
+    dev: i32,
+    xq: DeviceBuf,
+    gate: DeviceBuf,
+    up: DeviceBuf,
+    mid: DeviceBuf,
+    midq: DeviceBuf,
+    out: DeviceBuf,
+    recv: DeviceBuf,
+}
+
 /// qwen35 runtime: GDN states + scratch sized for T_MAX-token chunks.
 pub(super) struct Qwen35Rt {
     states: Vec<Option<GdnState>>,
@@ -253,6 +269,8 @@ pub(super) struct Qwen35Rt {
     /// disables.
     graphs: std::collections::HashMap<(u32, usize), kernels::Graph>,
     graphs_on: bool,
+    /// FFN tensor-parallel scratch on the second card (PULSAR_TP)
+    tpb: Option<TpBank>,
     qkv: DeviceBuf,      // [T][conv_dim] raw projection
     conv_out: DeviceBuf, // [T][conv_dim] conv+silu, layout [q|k|v] per row
     z: DeviceBuf,        // [T][value_dim]
@@ -306,10 +324,34 @@ impl Qwen35Rt {
         let f32s = |n: usize| DeviceBuf::alloc(n * 4);
         let graphs_on = std::env::var("PULSAR_GRAPHS").ok().as_deref() != Some("0")
             && m.layers.iter().any(|l| matches!(l.ffn, super::Ffn::DenseKq { .. }));
+        let tpb = match &m.tp {
+            Some(tp) => {
+                let q8k = |n: usize| {
+                    n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
+                };
+                let half = tp.half as usize;
+                let recv = f32s(T_MAX * s.n_embd as usize)?; // on the primary
+                kernels::set_device(tp.dev)?;
+                let b = TpBank {
+                    dev: tp.dev,
+                    xq: DeviceBuf::alloc(T_MAX * q8k(s.n_embd as usize))?,
+                    gate: f32s(T_MAX * half)?,
+                    up: f32s(T_MAX * half)?,
+                    mid: f32s(T_MAX * half)?,
+                    midq: DeviceBuf::alloc(T_MAX * q8k(half))?,
+                    out: f32s(T_MAX * s.n_embd as usize)?,
+                    recv,
+                };
+                kernels::set_device(primary)?;
+                Some(b)
+            }
+            None => None,
+        };
         Ok(Qwen35Rt {
             bank,
             graphs: std::collections::HashMap::new(),
             graphs_on,
+            tpb,
             states,
             qkv: f32s(T_MAX * conv_dim)?,
             conv_out: f32s(T_MAX * conv_dim)?,
@@ -968,7 +1010,12 @@ impl Model {
         let dflash_on = rt.dflash.is_some();
         let graphable = |il: usize| {
             let l = &self.layers[il];
+            // no graphs under FFN tensor parallel: the TP branch hops
+            // devices and bounces through host memory, both illegal
+            // inside stream capture (measured cost of graphs-off on the
+            // 27B: ~0.7 tok/s of 21)
             !dflash_on
+                && self.tp.is_none()
                 && matches!(&l.attn, Attn::Qwen35(w) if w.gdn.is_some())
                 && matches!(l.ffn, Ffn::DenseKq { .. })
         };
@@ -1175,6 +1222,51 @@ impl Model {
         }
         kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, t, eps)?;
         if let Ffn::DenseKq { gate, up, down } = &l.ffn {
+            let tp = self
+                .tp
+                .as_ref()
+                .and_then(|tp| tp.layers.get(il).and_then(|o| o.as_ref()).map(|w| (tp.half, w)));
+            if let (Some((half, bw)), Some(tb)) = (tp, rt.tpb.as_mut()) {
+                // FFN tensor parallel: ship the quantized activation to
+                // card B, launch B's half chain, launch A's half chain
+                // (separate devices, async launches, so they overlap),
+                // then pull B's partial down output back and add. The
+                // bounce copies are latency-bound (~6KB a row); the win
+                // is both cards reading their FFN half of every layer
+                // at their own VRAM speed simultaneously.
+                kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
+                let xb = t as usize
+                    * (s.n_embd as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
+                    * kernels::Q8_K_BLOCK_BYTES;
+                // raw q8_K bytes ride the f32 readback (292 = 4 * 73)
+                let xh = st.xq.read_f32(xb / 4)?;
+                kernels::set_device(tb.dev)?;
+                tb.xq.write(0, kernels::as_bytes(&xh))?;
+                kernels::matmul_kq(&mut tb.gate, &bw.gate.w, &tb.xq, s.n_embd, half, t, bw.gate.row_bytes, bw.gate.quant)?;
+                kernels::matmul_kq(&mut tb.up, &bw.up.w, &tb.xq, s.n_embd, half, t, bw.up.row_bytes, bw.up.quant)?;
+                kernels::swiglu(&mut tb.mid, &tb.gate, &tb.up, t * half, 0.0, 1.0, 0)?;
+                kernels::quantize_q8_k(&mut tb.midq, &tb.mid, half, t)?;
+                kernels::matmul_kq(&mut tb.out, &bw.down.w, &tb.midq, half, s.n_embd, t, bw.down.row_bytes, bw.down.quant)?;
+                kernels::set_device(kernels::primary_device())?;
+                // A's half runs while B's chain is in flight
+                kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, half, t, gate.row_bytes, gate.quant)?;
+                kernels::matmul_kq(&mut st.up_act, &up.w, &st.xq, s.n_embd, half, t, up.row_bytes, up.quant)?;
+                kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * half, 0.0, 1.0, 0)?;
+                kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, half, t)?;
+                kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, half, s.n_embd, t, down.row_bytes, down.quant)?;
+                // B's partial: the read syncs B's stream only
+                kernels::set_device(tb.dev)?;
+                let ph = tb.out.read_f32(t as usize * s.n_embd as usize)?;
+                kernels::set_device(kernels::primary_device())?;
+                tb.recv.write(0, kernels::as_bytes(&ph))?;
+                kernels::add_assign(&mut st.ffn_out, &tb.recv, t * s.n_embd)?;
+                kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
+                if prof {
+                    kernels::sync()?;
+                    st.prof.resolve += mark.elapsed();
+                }
+                return Ok(());
+            }
             // dense 27B: resident K-quant triple, no experts, no syncs
             kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
             kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, s.n_ff_exp, t, gate.row_bytes, gate.quant)?;
