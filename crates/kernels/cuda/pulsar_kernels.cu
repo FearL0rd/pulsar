@@ -2169,6 +2169,96 @@ struct dot_q5_K {
     }
 };
 
+/* q4_K plus the qh high-bit plane: q = nibble | (qh bit << 4), scales
+ * and mins identical (k4_scale_min). Same lane layout as wdot_q4_K:
+ * chunk j = lane/8 (64 values), word wi = 4*(lane%8). For chunk j the
+ * low nibbles carry qh bit 2j, the high nibbles bit 2j+1, both indexed
+ * by the value's position l = wi..wi+3 (qh is 32 bytes, reused across
+ * chunks). block_q5_K is 176 bytes = 4-aligned rows, so the direct u32
+ * loads q4_K uses are legal here too (q6_K's 210 needed byte loads).
+ * Added for Qwen3.8-27B UD-Q4_K_XL, which ships attention and FFN
+ * mostly Q5_K: the generic per-lane dot ran the dense FFN at 161ms a
+ * token where ThinkingCap's wdot path takes 34ms. */
+/* Warp-cooperative iq4_xs: sub-block ib = lane/4, four qs bytes per
+ * lane (i = 4*(lane%4)), low nibbles pair with q8[32*ib + i], high with
+ * q8[32*ib + 16 + i], both under the sub-block's single 6-bit scale.
+ * Same codebook decode (iq4nl_lut4 + dp4a) as the per-lane dot; the
+ * win is one BLOCK split across the warp instead of one block per
+ * lane. No zero-tail guard: MatW contractions are 256-divisible by
+ * keep_native and quantize_q8_k zero-pads, so there is no overread. */
+struct wdot_iq4_xs {
+    struct Prep {
+        int32_t va, vb;
+        float dl;
+        uint32_t off; /* q8 byte offset of the va word */
+    };
+    __device__ __forceinline__ static Prep prepare(const char *row, uint32_t b, uint32_t lane) {
+        const block_iq4_xs *x = (const block_iq4_xs *)row + b;
+        const uint32_t ib = lane >> 2, i = (lane & 3u) << 2;
+        const int ls = (int)(((x->scales_l[ib >> 1] >> (4 * (ib & 1u))) & 0xfu) |
+                             (((x->scales_h >> (2 * ib)) & 3u) << 4)) - 32;
+        const uint32_t b4 = *(const uint32_t *)(x->qs + 16 * ib + i);
+        Prep p;
+        p.va = iq4nl_lut4(b4 & 0x0f0f0f0fu);
+        p.vb = iq4nl_lut4((b4 >> 4) & 0x0f0f0f0fu);
+        p.dl = f16_to_f32(x->d) * (float)ls;
+        p.off = 32 * ib + i;
+        return p;
+    }
+    __device__ __forceinline__ static float apply(const Prep &p, const block_q8_K *y, uint32_t b, uint32_t lane) {
+        (void)lane;
+        const block_q8_K *yb = y + b;
+        const int sa = __dp4a(p.va, *(const int32_t *)(yb->qs + p.off), 0);
+        const int sb = __dp4a(p.vb, *(const int32_t *)(yb->qs + p.off + 16), 0);
+        return p.dl * yb->d * (float)(sa + sb);
+    }
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+        return apply(prepare(row, b, lane), xq, b, lane);
+    }
+};
+
+struct wdot_q5_K {
+    struct Prep {
+        uint32_t vlo, vhi;
+        float d, dmin;
+        int sc1, sc2, m1, m2;
+        uint32_t j, wi;
+    };
+    __device__ __forceinline__ static Prep prepare(const char *row, uint32_t b, uint32_t lane) {
+        const block_q5_K *x = (const block_q5_K *)row + b;
+        Prep p;
+        p.j = lane >> 3;
+        p.wi = (lane & 7u) << 2;
+        const uint32_t v = *(const uint32_t *)(x->qs + 32 * p.j + p.wi);
+        const uint32_t h = *(const uint32_t *)(x->qh + p.wi);
+        p.vlo = (v & 0x0f0f0f0fu) | (((h >> (2 * p.j)) & 0x01010101u) << 4);
+        p.vhi = ((v >> 4) & 0x0f0f0f0fu) | (((h >> (2 * p.j + 1)) & 0x01010101u) << 4);
+        p.d = f16_to_f32(x->d);
+        p.dmin = f16_to_f32(x->dmin);
+        uint8_t sc1, m1, sc2, m2;
+        k4_scale_min(2 * p.j, x->scales, &sc1, &m1);
+        k4_scale_min(2 * p.j + 1, x->scales, &sc2, &m2);
+        p.sc1 = sc1; p.m1 = m1; p.sc2 = sc2; p.m2 = m2;
+        return p;
+    }
+    __device__ __forceinline__ static float apply(const Prep &p, const block_q8_K *y, uint32_t b, uint32_t lane) {
+        const block_q8_K *yb = y + b;
+        const int8_t *q8 = yb->qs + 64 * p.j;
+        const int s1 = __dp4a((int)p.vlo, *(const int32_t *)(q8 + p.wi), 0);
+        const int s2 = __dp4a((int)p.vhi, *(const int32_t *)(q8 + 32 + p.wi), 0);
+        float acc = p.d * yb->d * (float)(p.sc1 * s1 + p.sc2 * s2);
+        if ((lane & 7u) == 0) {
+            acc -= p.dmin * yb->d *
+                   (float)(p.m1 * (yb->bsums[4 * p.j] + yb->bsums[4 * p.j + 1]) +
+                           p.m2 * (yb->bsums[4 * p.j + 2] + yb->bsums[4 * p.j + 3]));
+        }
+        return acc;
+    }
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+        return apply(prepare(row, b, lane), xq, b, lane);
+    }
+};
+
 struct dot_q6_K {
     __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
         return dev_dot_q6_K_q8_K_block((const block_q6_K *)row + b, xq + b);
@@ -3430,7 +3520,9 @@ extern "C" int pulsar_matmul_kq(
          * loads, not on occupancy - ncu: L1 94%, DRAM 28%, 56 regs */
         switch (quant) {
         case PULSAR_QUANT_Q4_K: PULSAR_KQW_T(wdot_q4_K);
+        case PULSAR_QUANT_Q5_K: PULSAR_KQW_T(wdot_q5_K);
         case PULSAR_QUANT_Q6_K: PULSAR_KQW_T(wdot_q6_K);
+        case PULSAR_QUANT_IQ4_XS: PULSAR_KQW_T(wdot_iq4_xs);
         default: break;
         }
         #undef PULSAR_KQW_T
@@ -3452,6 +3544,10 @@ extern "C" int pulsar_matmul_kq(
         PULSAR_KQ16(PULSAR_QUANT_Q5_K, dot_q5_K);
         PULSAR_KQ16(PULSAR_QUANT_Q6_K, dot_q6_K);
         PULSAR_KQ16(PULSAR_QUANT_Q3_K, dot_q3_K);
+        /* unsloth UD dense ggufs mix IQ4 into the K-quant stack
+         * (Qwen3.8-27B UD-Q4_K_XL ships ffn_gate as IQ4_XS) */
+        PULSAR_KQ16(PULSAR_QUANT_IQ4_XS, dot_iq4_xs);
+        PULSAR_KQ16(PULSAR_QUANT_IQ4_NL, dot_iq4_nl);
 #undef PULSAR_KQ16
         default: return 0;
         }
@@ -3468,13 +3564,19 @@ extern "C" int pulsar_matmul_kq(
         matmul_kqw_kernel<wdot_q4_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_Q5_K:
-        matmul_kq_kernel<dot_q5_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        matmul_kqw_kernel<wdot_q5_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_Q6_K:
         matmul_kqw_kernel<wdot_q6_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_Q3_K:
         matmul_kq_kernel<dot_q3_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        break;
+    case PULSAR_QUANT_IQ4_XS:
+        matmul_kqw_kernel<wdot_iq4_xs><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        break;
+    case PULSAR_QUANT_IQ4_NL:
+        matmul_kq_kernel<dot_iq4_nl><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     default:
         return 0;

@@ -621,10 +621,19 @@ mod real {
     }
 
     impl MatW {
-        /// True when this tensor should stay native: a K-quant with a
-        /// warp-cooperative dot and a 256-divisible contraction dim.
+        /// True when this tensor should stay native: a quant matmul_kq
+        /// dispatches, with a 256-divisible contraction dim. Wider than
+        /// just the warp-cooperative pair (Q4K/Q6K) on purpose: unsloth
+        /// UD dense ggufs ship Q5K/IQ4_XS attention and FFN tensors
+        /// (Qwen3.8-27B), and requanting those to q8_0 costs 1.6-1.9x
+        /// the VRAM and bytes-per-token AND puts a lazily-grown q8_0
+        /// prequant scratch inside the GDN CUDA-graph capture, where
+        /// cudaMalloc is illegal.
         fn keep_native(t: &TensorInfo) -> bool {
-            matches!(t.ty, TensorType::Q4K | TensorType::Q6K) && t.dims[0].is_multiple_of(256)
+            matches!(
+                t.ty,
+                TensorType::Q4K | TensorType::Q5K | TensorType::Q6K | TensorType::IQ4XS
+            ) && t.dims[0].is_multiple_of(256)
         }
 
         fn load(file: &VFile, g: &Gguf, name: &str) -> Result<MatW> {
