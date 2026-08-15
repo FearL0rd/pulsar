@@ -1019,9 +1019,16 @@ fn run() -> engine::Result {
     let pos0 = prompt_ids.len() as u32;
     let mut generated = Vec::new();
     let t2 = std::time::Instant::now();
+    // greedy one-shot on qwen35: argmax-only rows (device argmax + the
+    // TP vocab-split head) instead of a ~1MB logits readback per token
+    let amax_fast = model.shape.family == engine::Family::Qwen35;
+    let mut next_amax = logits.as_ref().map(|l| engine::argmax(l));
     for pos in pos0..pos0.saturating_add(n_predict as u32) {
-        let l = logits.as_ref().ok_or("no logits")?;
-        let next = engine::argmax(l);
+        let next = if amax_fast {
+            next_amax.ok_or("no argmax")?
+        } else {
+            engine::argmax(logits.as_ref().ok_or("no logits")?)
+        };
         if tok.is_eog(next) {
             break;
         }
@@ -1032,7 +1039,15 @@ fn run() -> engine::Result {
         if pos >= ctx {
             break;
         }
-        logits = model.forward_token(&mut st, next, pos, true)?;
+        if amax_fast {
+            st.skip_logit_read = true;
+            let r = model.forward_token(&mut st, next, pos, true);
+            st.skip_logit_read = false;
+            r?;
+            next_amax = st.last_argmax.first().copied();
+        } else {
+            logits = model.forward_token(&mut st, next, pos, true)?;
+        }
     }
     println!();
     if std::env::var_os("PULSAR_PROFILE").is_some() {

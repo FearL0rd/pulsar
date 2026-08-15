@@ -282,6 +282,10 @@ struct TpBank {
     /// readable on its own card)
     pos_a: DeviceBuf,
     pos_b: DeviceBuf,
+    /// vocab-split head: B's half-logits and its (value, index) argmax
+    /// pairs (8 B a row back instead of half a megabyte)
+    hlog: DeviceBuf,
+    bmax: DeviceBuf,
     /// A->B activation handoff and B->A partial return. Reusing xq and
     /// recv across layers is race-free: each link's event forms a
     /// cross-stream back-edge every layer (A's next xq overwrite sits
@@ -423,6 +427,8 @@ impl Qwen35Rt {
                     av: f32s(T_MAX * (s.n_head_kv / 2 * s.head_dim) as usize)?,
                     aheads: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
                     pos_b: DeviceBuf::alloc(4)?,
+                    hlog: f32s(16 * (s.n_vocab / 2) as usize)?,
+                    bmax: DeviceBuf::alloc(16 * 8)?,
                     pos_a: {
                         kernels::set_device(primary)?;
                         let b = DeviceBuf::alloc(4)?;
@@ -1101,13 +1107,44 @@ impl Model {
         let row = s.n_embd as usize * 4;
         kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (last_t - k) as usize * row, k as usize * row)?;
         kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, s.rms_eps)?;
-        self.head_logits(st, k)?;
         if st.skip_logit_read {
-            // spec verify wants only per-row argmaxes: 4 bytes a row
-            // instead of ~1MB of logits per row over pageable PCIe
+            // argmax-only rows: the head is the biggest serial card-A
+            // item (2.06ms/token, nsys), and these paths never need the
+            // logits themselves - so under TP each card computes its
+            // vocab half and argmaxes it in place, 8 bytes a row back
+            // per card, merged host-side exactly like one full scan
+            // (strict > keeps the full scan's first-index tie rule).
+            let split = self.tp.as_ref().and_then(|tp| tp.head.as_ref()).and_then(|hb| {
+                self.output_kq.map(|(rb, q)| (hb, rb, q))
+            });
+            if let (Some((hb, row_bytes, quant)), Some(tb)) = (split, rt.tpb.as_mut()) {
+                let v2 = s.n_vocab / 2;
+                tb.lx.send(&st.normed, (k * s.n_embd) as usize * 4)?;
+                kernels::set_device(tb.dev)?;
+                tb.lx.recv(&mut tb.normed, (k * s.n_embd) as usize * 4)?;
+                kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, k)?;
+                kernels::matmul_kq(&mut tb.hlog, &hb.w, &tb.xq, s.n_embd, v2, k, hb.row_bytes, hb.quant)?;
+                kernels::argmax_rows_launch(&mut tb.bmax, &tb.hlog, v2, k)?;
+                kernels::set_device(kernels::primary_device())?;
+                kernels::quantize_q8_k(&mut st.head_xq, &st.normed, s.n_embd, k)?;
+                kernels::matmul_kq(&mut st.logits, &self.output, &st.head_xq, s.n_embd, v2, k, row_bytes, quant)?;
+                kernels::argmax_rows_launch(&mut st.amax_out, &st.logits, v2, k)?;
+                let ap = kernels::argmax_pairs_read(&st.amax_out, k)?;
+                kernels::set_device(tb.dev)?;
+                let bp = kernels::argmax_pairs_read(&tb.bmax, k)?;
+                kernels::set_device(kernels::primary_device())?;
+                st.last_argmax = ap
+                    .iter()
+                    .zip(&bp)
+                    .map(|(a, b)| if b.0 > a.0 { b.1 + v2 } else { a.1 })
+                    .collect();
+                return Ok(Some(Vec::new()));
+            }
+            self.head_logits(st, k)?;
             st.last_argmax = kernels::argmax_rows(&mut st.amax_out, &st.logits, s.n_vocab, k)?;
             return Ok(Some(Vec::new()));
         }
+        self.head_logits(st, k)?;
         kernels::sync()?;
         Ok(Some(st.logits.read_f32(k as usize * s.n_vocab as usize)?))
     }

@@ -2614,6 +2614,10 @@ mod real {
         /// per-card ffn width = n_ff_exp / 2
         pub(crate) half: u32,
         layers: Vec<Option<TpLayerW>>,
+        /// card B's vocab rows [n_vocab/2..) of the lm head: the head is
+        /// 2.06ms/token of serial card-A time (nsys), and the greedy /
+        /// spec paths only need per-half argmaxes merged host-side
+        head: Option<KqW>,
     }
 
     /// Raw K-quant tensor bytes + per-row size (shared by the whole and
@@ -4156,6 +4160,23 @@ mod real {
                 })
             };
 
+            let mut tp_head: Option<KqW> = None;
+            if let Some((dev_b, _)) = tp_cfg {
+                if output_kq.is_some()
+                    && shape.n_vocab.is_multiple_of(2)
+                    && gguf.tensor("output.weight").is_some()
+                {
+                    let (bytes, rb, quant) = read_kq_bytes(&file, &gguf, "output.weight")?;
+                    let v2 = shape.n_vocab as u64 / 2;
+                    kernels::set_device(dev_b)?;
+                    tp_head = Some(KqW {
+                        w: DeviceBuf::from_bytes(&bytes[(v2 * rb) as usize..])?,
+                        row_bytes: rb,
+                        quant,
+                    });
+                    kernels::set_device(primary)?;
+                }
+            }
             let mut layers = Vec::with_capacity(shape.n_exec_layer as usize);
             let mut tp_layers: Vec<Option<TpLayerW>> = Vec::new();
             for il in 0..shape.n_exec_layer {
@@ -4358,7 +4379,7 @@ mod real {
                 ones_hc,
                 dsv4_out,
                 dspark,
-                tp: tp_cfg.map(|(dev, half)| TpW { dev, half, layers: tp_layers }),
+                tp: tp_cfg.map(|(dev, half)| TpW { dev, half, layers: tp_layers, head: tp_head }),
             })
         }
     }
@@ -4638,8 +4659,10 @@ mod real {
         /// Device argmax scratch + results for the spec loop's
         /// readback-free verify (skip_logit_read)
         amax_out: DeviceBuf,
-        pub(crate) last_argmax: Vec<u32>,
-        pub(crate) skip_logit_read: bool,
+        /// results / flag for the argmax-only head paths (spec verify,
+        /// greedy decode); pub: the CLI's one-shot loop drives them
+        pub last_argmax: Vec<u32>,
+        pub skip_logit_read: bool,
         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
         /// 5=q4_0. All lossy formats opt-in via PULSAR_KV=<fmt>; the
@@ -6017,7 +6040,7 @@ mod real {
                 kcache,
                 vcache,
                 tp_kcache,
-                amax_out: DeviceBuf::alloc(spec_rows.max(1) as usize * 4)?,
+                amax_out: DeviceBuf::alloc(spec_rows.max(1) as usize * 8)?,
                 last_argmax: Vec::new(),
                 skip_logit_read: false,
                 kvq,
@@ -8449,6 +8472,30 @@ mod real {
             return Ok(pos);
         }
 
+        // plain greedy on qwen35: argmax-only rows ride the device
+        // argmax (and the vocab-split head under TP) - no megabyte
+        // logits readback per token. Sampling paths keep full logits.
+        if sampler.is_greedy() && model.shape.family == Family::Qwen35 {
+            let mut next = argmax(logits.as_deref().ok_or("no logits")?);
+            for _ in 0..max_tokens {
+                if cancel() {
+                    return Ok(pos);
+                }
+                if stop(next) || pos + 1 >= st.ctx() {
+                    model.forward_batch(st, &[next], pos, false)?;
+                    pos += 1;
+                    break;
+                }
+                on_token(next);
+                st.skip_logit_read = true;
+                let r = model.forward_batch(st, &[next], pos, true);
+                st.skip_logit_read = false;
+                r?;
+                next = *st.last_argmax.first().ok_or("no argmax row")?;
+                pos += 1;
+            }
+            return Ok(pos);
+        }
         for _ in 0..max_tokens {
             if cancel() {
                 return Ok(pos);

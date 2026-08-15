@@ -1158,12 +1158,31 @@ mod real {
         check(unsafe { pulsar_gqa_attention_dev(out.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), n_tok, n_head, n_kv_head, head_dim, cap, pos_dev.ptr(), scale) }, "gqa_attention_dev")
     }
 
-    /// Row-wise argmax on device: 4 bytes back per row instead of the
-    /// whole logits row. First index wins ties (matches the host scan).
-    pub fn argmax_rows(out: &mut DeviceBuf, x: &DeviceBuf, n: u32, rows: u32) -> Result<Vec<u32>> {
+    /// Row-wise argmax on device: 8 bytes back per row - a (value,
+    /// index) pair, so vocab-split halves merge host-side exactly like
+    /// one full scan. First index wins ties (matches the host scan).
+    pub fn argmax_rows_pairs(out: &mut DeviceBuf, x: &DeviceBuf, n: u32, rows: u32) -> Result<Vec<(f32, u32)>> {
         check(unsafe { pulsar_argmax_rows(out.ptr_mut(), x.ptr(), n, rows) }, "argmax_rows")?;
         sync()?;
-        Ok(out.read_i32(rows as usize)?.into_iter().map(|v| v.max(0) as u32).collect())
+        let raw = out.read_f32(rows as usize * 2)?;
+        Ok((0..rows as usize).map(|i| (raw[i * 2], raw[i * 2 + 1].to_bits())).collect())
+    }
+
+    pub fn argmax_rows(out: &mut DeviceBuf, x: &DeviceBuf, n: u32, rows: u32) -> Result<Vec<u32>> {
+        Ok(argmax_rows_pairs(out, x, n, rows)?.into_iter().map(|(_, i)| i).collect())
+    }
+
+    /// Launch-only argmax (no sync): the vocab-split head launches one
+    /// per card and reads both AFTER both chains are in flight.
+    pub fn argmax_rows_launch(out: &mut DeviceBuf, x: &DeviceBuf, n: u32, rows: u32) -> Result {
+        check(unsafe { pulsar_argmax_rows(out.ptr_mut(), x.ptr(), n, rows) }, "argmax_rows")
+    }
+
+    /// Read back (value, index) pairs from an argmax_rows_launch (syncs
+    /// the buffer's device).
+    pub fn argmax_pairs_read(out: &DeviceBuf, rows: u32) -> Result<Vec<(f32, u32)>> {
+        let raw = out.read_f32(rows as usize * 2)?;
+        Ok((0..rows as usize).map(|i| (raw[i * 2], raw[i * 2 + 1].to_bits())).collect())
     }
 
     /// Async one-thread device write (per-token position cells).

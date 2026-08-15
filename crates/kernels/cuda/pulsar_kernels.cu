@@ -5693,7 +5693,7 @@ extern "C" int pulsar_gqa_attention_dev(
  * matching the host scan the spec loop used. Turns per-round megabyte
  * logits readbacks into 4 bytes per row. */
 __global__ static void argmax_rows_kernel(
-        int32_t *out, const float *x, uint32_t n, uint32_t rows) {
+        void *out, const float *x, uint32_t n, uint32_t rows) {
     const uint32_t row = blockIdx.x;
     if (row >= rows) return;
     const float *xr = x + (uint64_t)row * n;
@@ -5720,7 +5720,13 @@ __global__ static void argmax_rows_kernel(
         }
         __syncthreads();
     }
-    if (threadIdx.x == 0) out[row] = (int32_t)si[0];
+    if (threadIdx.x == 0) {
+        /* (value, index) pair per row: a vocab-split head compares the
+         * halves' maxima host-side exactly like one full scan would */
+        float *op = (float *)out + (uint64_t)row * 2u;
+        op[0] = sv[0];
+        memcpy(op + 1, &si[0], 4);
+    }
 }
 
 extern "C" int pulsar_argmax_rows(
