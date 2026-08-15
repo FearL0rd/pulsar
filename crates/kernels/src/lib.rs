@@ -65,6 +65,7 @@ mod real {
     pub const QUANT_IQ3_S: u32 = 14;
     pub const QUANT_IQ2_S: u32 = 15;
     pub const QUANT_IQ1_S: u32 = 16;
+    pub const QUANT_NVFP4: u32 = 17;
 
     const H2D: i32 = 1;
     const D2H: i32 = 2;
@@ -1536,6 +1537,7 @@ mod tests {
             (QUANT_Q5_K, "q5_K", 176),
             (QUANT_Q6_K, "q6_K", 210),
             (QUANT_IQ4_XS, "iq4_xs", 136),
+            (QUANT_NVFP4, "nvfp4", 144),
         ] {
             let rb = blocks * bpb;
             let wbytes = rows as usize * rb;

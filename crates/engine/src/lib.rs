@@ -568,6 +568,7 @@ mod real {
             TensorType::IQ2S => kernels::QUANT_IQ2_S,
             TensorType::IQ1S => kernels::QUANT_IQ1_S,
             TensorType::MXFP4 => kernels::QUANT_MXFP4,
+            TensorType::NVFP4 => kernels::QUANT_NVFP4,
             _ => return None,
         })
     }
@@ -632,7 +633,7 @@ mod real {
         fn keep_native(t: &TensorInfo) -> bool {
             matches!(
                 t.ty,
-                TensorType::Q4K | TensorType::Q5K | TensorType::Q6K | TensorType::IQ4XS
+                TensorType::Q4K | TensorType::Q5K | TensorType::Q6K | TensorType::IQ4XS | TensorType::NVFP4
             ) && t.dims[0].is_multiple_of(256)
         }
 
@@ -2762,6 +2763,49 @@ mod real {
                 let mut buf = vec![0u8; bytes];
                 file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
                 Ok(quant::cpu_dot::dequant_q8_0(&buf, n))
+            }
+            // NVFP4 aux tensors (ssm_alpha/ssm_beta on the NVFP4
+            // Qwen3.8 ggufs feed matmul_f32): mirror of ggml
+            // dequantize_row_nvfp4 - 64-value blocks, four UE4M3-scaled
+            // 16-value sub-blocks, kvalues_mxfp4 codebook (2x e2m1, the
+            // ue4m3 decode returns value*0.5 to compensate)
+            TensorType::NVFP4 => {
+                let n = t.n_elements() as usize;
+                let bytes = t.byte_size().ok_or_else(|| meta_err(name))? as usize;
+                let mut buf = vec![0u8; bytes];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                const KV: [f32; 16] = [
+                    0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+                    0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0,
+                ];
+                let ue4m3 = |x: u8| -> f32 {
+                    if x == 0 || x == 0x7F {
+                        return 0.0;
+                    }
+                    let exp = (x >> 3) & 0xF;
+                    let man = f32::from(x & 7);
+                    let raw = if exp == 0 {
+                        man * 2f32.powi(-9)
+                    } else {
+                        (1.0 + man / 8.0) * 2f32.powi(i32::from(exp) - 7)
+                    };
+                    raw * 0.5
+                };
+                let mut out = Vec::with_capacity(n);
+                for blk in buf.chunks_exact(36) {
+                    for sub in 0..4 {
+                        let d = ue4m3(blk[sub]);
+                        let qs = &blk[4 + sub * 8..4 + sub * 8 + 8];
+                        let mut vals = [0f32; 16];
+                        for (j, &b) in qs.iter().enumerate() {
+                            vals[j] = KV[(b & 0xF) as usize] * d;
+                            vals[j + 8] = KV[(b >> 4) as usize] * d;
+                        }
+                        out.extend_from_slice(&vals);
+                    }
+                }
+                out.truncate(n);
+                Ok(out)
             }
             other => Err(format!("{name}: no f32 path for {other:?}").into()),
         }

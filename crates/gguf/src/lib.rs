@@ -74,6 +74,7 @@ pub enum TensorType {
     /// each a 4-bit E2M1 float. gpt-oss ships its routed experts this way
     /// and requantizing them away defeats the point of the release.
     MXFP4,
+    NVFP4,
     /// Anything we do not model yet; the raw id is preserved.
     Other(u32),
 }
@@ -104,6 +105,7 @@ impl TensorType {
             26 => Self::I32,
             30 => Self::BF16,
             39 => Self::MXFP4,
+            40 => Self::NVFP4,
             other => Self::Other(other),
         }
     }
@@ -134,6 +136,7 @@ impl TensorType {
             Self::I32 => 26,
             Self::BF16 => 30,
             Self::MXFP4 => 39,
+            Self::NVFP4 => 40,
             Self::Other(id) => id,
         }
     }
@@ -163,6 +166,8 @@ impl TensorType {
             Self::IQ4NL => (32, 18),
             // one E8M0 scale byte + 32 packed 4-bit values
             Self::MXFP4 => (32, 17),
+            // 64 e2m1 values in 4 UE4M3-scaled 16-value sub-blocks
+            Self::NVFP4 => (64, 36),
             Self::Other(_) => return None,
         })
     }
