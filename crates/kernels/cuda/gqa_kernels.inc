@@ -59,7 +59,9 @@ __global__ static void gqa_rope_neox_kernel(
         uint32_t rot_dim, /* partial rotary: rotate first rot_dim dims */
         uint32_t pos0,
         float theta,
-        const float *factors) { /* [rot_dim/2] freq divisors, NULL = none */
+        const float *factors,   /* [rot_dim/2] freq divisors, NULL = none */
+        const uint32_t *pos_dev) { /* device position; NULL = pos0 (graphs) */
+    if (pos_dev) pos0 = *pos_dev;
     uint32_t half = rot_dim / 2u;
     uint64_t total = (uint64_t)n_tok * n_head * half;
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -87,7 +89,9 @@ __global__ static void gqa_kv_cache_append_kernel(
         uint32_t n_kv_head,
         uint32_t head_dim,
         uint32_t cap,
-        uint32_t pos0) {
+        uint32_t pos0,
+        const uint32_t *pos_dev) { /* device position; NULL = pos0 */
+    if (pos_dev) pos0 = *pos_dev;
     uint64_t total = (uint64_t)n_tok * n_kv_head * head_dim;
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
@@ -270,7 +274,9 @@ __global__ static void gqa_attention_kernel(
         uint32_t window,     /* sliding window; 0 = full causal */
         const float *rel,    /* inkling rel-pos bias [n_tok][n_head][rel_extent], NULL = none */
         uint32_t rel_extent,
-        const float *sinks) { /* gpt-oss per-head sink logit [n_head], NULL = none */
+        const float *sinks,  /* gpt-oss per-head sink logit [n_head], NULL = none */
+        const uint32_t *pos_dev) { /* device position; NULL = pos0 (graph capture) */
+    if (pos_dev) pos0 = *pos_dev;
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tok || h >= n_head) return;
@@ -543,7 +549,7 @@ static int gqa_attention_dispatch(
     dim3 grid(n_tok, n_head, 1);
     gqa_attention_kernel<KVF><<<grid, 128>>>(
             out, q, kc, vc, n_tok, n_head, n_kv_head, head_dim, cap, pos0,
-            scale, window, rel, rel_extent, sinks);
+            scale, window, rel, rel_extent, sinks, NULL);
     return cuda_ok(cudaGetLastError(), "gqa attention launch");
 }
 
@@ -567,7 +573,7 @@ extern "C" int ds4_gpu_gqa_rope(
     uint64_t total = (uint64_t)n_tok * n_head * (rot_dim / 2u);
     gqa_rope_neox_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
             (float *)x->ptr, n_tok, n_head, head_dim, rot_dim, pos0, theta,
-            factors ? (const float *)factors->ptr : NULL);
+            factors ? (const float *)factors->ptr : NULL, NULL);
     return cuda_ok(cudaGetLastError(), "gqa rope launch");
 }
 
@@ -579,7 +585,7 @@ extern "C" int ds4_gpu_gqa_kv_cache_append(
     uint64_t total = (uint64_t)n_tok * n_kv_head * head_dim;
     gqa_kv_cache_append_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
             (float *)cache->ptr, (const float *)kv_in->ptr,
-            n_tok, n_kv_head, head_dim, cap, pos0);
+            n_tok, n_kv_head, head_dim, cap, pos0, NULL);
     return cuda_ok(cudaGetLastError(), "gqa kv append launch");
 }
 
@@ -603,6 +609,56 @@ extern "C" int ds4_gpu_gqa_attention(
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
             rel ? (const float *)rel->ptr : NULL, rel_extent,
             sinks ? (const float *)sinks->ptr : NULL);
+}
+
+/* ---- device-position variants (multi-device graph capture) --------------
+ * Identical math with the position read from a device word instead of a
+ * baked kernel argument, so a captured graph replays at every token.
+ * f32 KV only (the codec paths stay on immediates and out of graphs);
+ * attention launches the plain single-pass kernel - the engine gates
+ * these to contexts below the split-K threshold. */
+
+extern "C" int ds4_gpu_gqa_rope_dev(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
+        uint32_t head_dim, uint32_t rot_dim, const void *pos_dev, float theta) {
+    if (!x || !pos_dev || n_tok == 0 || n_head == 0 || head_dim == 0 ||
+        rot_dim == 0 || rot_dim > head_dim || rot_dim % 2u) return 0;
+    uint64_t total = (uint64_t)n_tok * n_head * (rot_dim / 2u);
+    gqa_rope_neox_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)x->ptr, n_tok, n_head, head_dim, rot_dim, 0, theta,
+            NULL, (const uint32_t *)pos_dev);
+    return cuda_ok(cudaGetLastError(), "gqa rope dev launch");
+}
+
+extern "C" int ds4_gpu_gqa_kv_cache_append_dev(
+        ds4_gpu_tensor *cache, const ds4_gpu_tensor *kv_in,
+        uint32_t n_tok, uint32_t n_kv_head, uint32_t head_dim,
+        uint32_t cap, const void *pos_dev) {
+    if (!cache || !kv_in || !pos_dev || n_tok == 0) return 0;
+    uint64_t total = (uint64_t)n_tok * n_kv_head * head_dim;
+    gqa_kv_cache_append_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)cache->ptr, (const float *)kv_in->ptr,
+            n_tok, n_kv_head, head_dim, cap, 0, (const uint32_t *)pos_dev);
+    return cuda_ok(cudaGetLastError(), "gqa kv append dev launch");
+}
+
+extern "C" int ds4_gpu_gqa_attention_dev(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, const void *pos_dev, float scale) {
+    if (!out || !q || !k_cache || !v_cache || !pos_dev ||
+        n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+        head_dim == 0 || head_dim > 512u) {
+        return 0;
+    }
+    dim3 grid(n_tok, n_head, 1);
+    gqa_attention_kernel<Kvf::F32><<<grid, 128>>>(
+            (float *)out->ptr, (const float *)q->ptr,
+            k_cache->ptr, v_cache->ptr,
+            n_tok, n_head, n_kv_head, head_dim, cap, 0, scale, 0,
+            NULL, 0, NULL, (const uint32_t *)pos_dev);
+    return cuda_ok(cudaGetLastError(), "gqa attention dev launch");
 }
 
 /* ---- fp8 KV variants ---------------------------------------------------- */

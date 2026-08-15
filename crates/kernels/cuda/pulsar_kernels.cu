@@ -5665,6 +5665,39 @@ extern "C" int pulsar_gqa_attention(
     }
 }
 
+extern "C" int pulsar_gqa_rope_dev(
+        void *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t rot_dim, const void *pos_dev, float theta) {
+    ds4_gpu_tensor xt = shim(x);
+    return ds4_gpu_gqa_rope_dev(&xt, n_tok, n_head, head_dim, rot_dim, pos_dev, theta);
+}
+
+extern "C" int pulsar_gqa_kv_append_dev(
+        void *cache, const void *kv, uint32_t n_tok, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, const void *pos_dev) {
+    ds4_gpu_tensor ct = shim(cache), kt = shim(kv);
+    return ds4_gpu_gqa_kv_cache_append_dev(&ct, &kt, n_tok, n_kv_head, head_dim, cap, pos_dev);
+}
+
+extern "C" int pulsar_gqa_attention_dev(
+        void *out, const void *q, const void *k_cache, const void *v_cache,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, const void *pos_dev, float scale) {
+    ds4_gpu_tensor ot = shim(out), qt = shim(q), kt = shim(k_cache), vt = shim(v_cache);
+    return ds4_gpu_gqa_attention_dev(&ot, &qt, &kt, &vt, n_tok, n_head,
+                                     n_kv_head, head_dim, cap, pos_dev, scale);
+}
+
+/* one-thread device write: the per-token position cells the graph-
+ * captured kernels dereference (a host H2D would sync; this launches
+ * async on the per-thread stream, correctly ordered before the graph) */
+__global__ static void set_u32_kernel(uint32_t *dst, uint32_t v) { *dst = v; }
+
+extern "C" int pulsar_set_u32(void *dst, uint32_t v) {
+    set_u32_kernel<<<1, 1>>>((uint32_t *)dst, v);
+    return cuda_ok(cudaGetLastError(), "set_u32 launch");
+}
+
 extern "C" int pulsar_gqa_selftest(void) { return ds4_gpu_gqa_selftest(); }
 
 #include "mla_kernels.inc"

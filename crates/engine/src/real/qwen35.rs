@@ -277,6 +277,11 @@ struct TpBank {
     ak: DeviceBuf,
     av: DeviceBuf,
     aheads: DeviceBuf,
+    /// per-token position cells the graph-captured attention kernels
+    /// dereference; one per card (no P2P, a device word is only
+    /// readable on its own card)
+    pos_a: DeviceBuf,
+    pos_b: DeviceBuf,
     /// A->B activation handoff and B->A partial return. Reusing xq and
     /// recv across layers is race-free: each link's event forms a
     /// cross-stream back-edge every layer (A's next xq overwrite sits
@@ -417,6 +422,13 @@ impl Qwen35Rt {
                     ak: f32s(T_MAX * (s.n_head_kv / 2 * s.head_dim) as usize)?,
                     av: f32s(T_MAX * (s.n_head_kv / 2 * s.head_dim) as usize)?,
                     aheads: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
+                    pos_b: DeviceBuf::alloc(4)?,
+                    pos_a: {
+                        kernels::set_device(primary)?;
+                        let b = DeviceBuf::alloc(4)?;
+                        kernels::set_device(tp.dev)?;
+                        b
+                    },
                     lx,
                     lo: kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?,
                 };
@@ -1020,6 +1032,16 @@ impl Model {
             let t = chunk.len() as u32;
             let ids: Vec<i32> = chunk.iter().map(|&x| x as i32).collect();
             st.tok.write(0, kernels::as_bytes(&ids))?;
+            // per-token position cells (TP graph capture): the captured
+            // attention kernels dereference these, so a replayed graph
+            // sees the fresh position. Written OUTSIDE any capture, one
+            // async 1-thread launch per card.
+            if let Some(tb) = rt.tpb.as_mut() {
+                kernels::set_u32(&mut tb.pos_a, pos)?;
+                kernels::set_device(tb.dev)?;
+                kernels::set_u32(&mut tb.pos_b, pos)?;
+                kernels::set_device(primary)?;
+            }
             kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, t)?;
             self.eval_qwen35_span(st, rt, 0, n0, pos, t)?;
             if let Some(b) = &mut bank {
@@ -1096,6 +1118,10 @@ impl Model {
         // and the capture_gdn stash is a runtime branch with cudaMemcpy -
         // illegal under stream capture, silently skipped on replay
         let dflash_on = rt.dflash.is_some();
+        // attention layers join the graphs under TP when the position
+        // can be read from the device cells (f32 KV, below the split-K
+        // threshold): Arc 1 of the 60-tok/s plan
+        let attn_ok = self.tp.is_some() && st.ctx <= 4096 && st.kvq == 0;
         let graphable = |il: usize| {
             let l = &self.layers[il];
             // TP spans capture too (phase 4): TpLink runs on the
@@ -1103,8 +1129,12 @@ impl Model {
             // B's stream into the capture DAG, so the whole dual-card
             // GDN+FFN chain replays as one multi-device graph
             !dflash_on
-                && matches!(&l.attn, Attn::Qwen35(w) if w.gdn.is_some())
                 && matches!(l.ffn, Ffn::DenseKq { .. })
+                && match &l.attn {
+                    Attn::Qwen35(w) if w.gdn.is_some() => true,
+                    Attn::Qwen35(w) if w.attn.is_some() => attn_ok && self.tp_attn(il).is_some(),
+                    _ => false,
+                }
         };
         let mut graphs = std::mem::take(&mut rt.graphs);
         let mut il = lo;
@@ -1349,17 +1379,30 @@ impl Model {
                 matw(&mut tb.av, &bw.wv, &tb.normed, &tb.xq, s.n_embd, nkv2 * hd, t)?;
                 kernels::gqa_head_rms_norm(&mut tb.aq, Some(&bw.q_norm), t * nh2, hd, eps)?;
                 kernels::gqa_head_rms_norm(&mut tb.ak, Some(&bw.k_norm), t * nkv2, hd, eps)?;
-                kernels::gqa_rope(&mut tb.aq, t, nh2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
-                kernels::gqa_rope(&mut tb.ak, t, nkv2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                let dev_pos = st.ctx <= 4096 && st.kvq == 0;
                 let (bk, bv) = st.tp_kcache[il].as_mut().ok_or("tp attn cache missing")?;
-                kernels::gqa_kv_append(bk, &tb.ak, t, nkv2, hd, st.ctx, pos, st.kvq)?;
-                kernels::gqa_kv_append(bv, &tb.av, t, nkv2, hd, st.ctx, pos, st.kvq)?;
-                kernels::gqa_attention_rel(
-                    &mut tb.aheads, &tb.aq, bk, bv,
-                    t, nh2, nkv2, hd, st.ctx, pos,
-                    1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
-                    None,
-                )?;
+                if dev_pos {
+                    kernels::gqa_rope_dev(&mut tb.aq, t, nh2, hd, s.rot_dim, &tb.pos_b, s.rope_freq_base)?;
+                    kernels::gqa_rope_dev(&mut tb.ak, t, nkv2, hd, s.rot_dim, &tb.pos_b, s.rope_freq_base)?;
+                    kernels::gqa_kv_append_dev(bk, &tb.ak, t, nkv2, hd, st.ctx, &tb.pos_b)?;
+                    kernels::gqa_kv_append_dev(bv, &tb.av, t, nkv2, hd, st.ctx, &tb.pos_b)?;
+                    kernels::gqa_attention_dev(
+                        &mut tb.aheads, &tb.aq, bk, bv,
+                        t, nh2, nkv2, hd, st.ctx, &tb.pos_b,
+                        1.0 / (hd as f32).sqrt(),
+                    )?;
+                } else {
+                    kernels::gqa_rope(&mut tb.aq, t, nh2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                    kernels::gqa_rope(&mut tb.ak, t, nkv2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                    kernels::gqa_kv_append(bk, &tb.ak, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                    kernels::gqa_kv_append(bv, &tb.av, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                    kernels::gqa_attention_rel(
+                        &mut tb.aheads, &tb.aq, bk, bv,
+                        t, nh2, nkv2, hd, st.ctx, pos,
+                        1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
+                        None,
+                    )?;
+                }
                 kernels::qwen35_sigmoid_gate(&mut tb.aheads, &tb.agate, t * nh2 * hd)?;
                 if matches!(bw.out, MatW::Kq(_)) {
                     kernels::quantize_q8_k(&mut tb.midq, &tb.aheads, nh2 * hd, t)?;
@@ -1374,16 +1417,28 @@ impl Model {
                 matw(&mut st.v, &attn.wv, &st.normed, &st.xq, s.n_embd, nkv2 * hd, t)?;
                 kernels::gqa_head_rms_norm(&mut st.q, Some(&attn.q_norm), t * nh2, hd, eps)?;
                 kernels::gqa_head_rms_norm(&mut st.k, Some(&attn.k_norm), t * nkv2, hd, eps)?;
-                kernels::gqa_rope(&mut st.q, t, nh2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
-                kernels::gqa_rope(&mut st.k, t, nkv2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
-                kernels::gqa_kv_append(&mut st.kcache[il], &st.k, t, nkv2, hd, st.ctx, pos, st.kvq)?;
-                kernels::gqa_kv_append(&mut st.vcache[il], &st.v, t, nkv2, hd, st.ctx, pos, st.kvq)?;
-                kernels::gqa_attention_rel(
-                    &mut st.heads, &st.q, &st.kcache[il], &st.vcache[il],
-                    t, nh2, nkv2, hd, st.ctx, pos,
-                    1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
-                    None,
-                )?;
+                if dev_pos {
+                    kernels::gqa_rope_dev(&mut st.q, t, nh2, hd, s.rot_dim, &tb.pos_a, s.rope_freq_base)?;
+                    kernels::gqa_rope_dev(&mut st.k, t, nkv2, hd, s.rot_dim, &tb.pos_a, s.rope_freq_base)?;
+                    kernels::gqa_kv_append_dev(&mut st.kcache[il], &st.k, t, nkv2, hd, st.ctx, &tb.pos_a)?;
+                    kernels::gqa_kv_append_dev(&mut st.vcache[il], &st.v, t, nkv2, hd, st.ctx, &tb.pos_a)?;
+                    kernels::gqa_attention_dev(
+                        &mut st.heads, &st.q, &st.kcache[il], &st.vcache[il],
+                        t, nh2, nkv2, hd, st.ctx, &tb.pos_a,
+                        1.0 / (hd as f32).sqrt(),
+                    )?;
+                } else {
+                    kernels::gqa_rope(&mut st.q, t, nh2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                    kernels::gqa_rope(&mut st.k, t, nkv2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                    kernels::gqa_kv_append(&mut st.kcache[il], &st.k, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                    kernels::gqa_kv_append(&mut st.vcache[il], &st.v, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                    kernels::gqa_attention_rel(
+                        &mut st.heads, &st.q, &st.kcache[il], &st.vcache[il],
+                        t, nh2, nkv2, hd, st.ctx, pos,
+                        1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
+                        None,
+                    )?;
+                }
                 kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.gate, t * nh2 * hd)?;
                 if matches!(attn.out, MatW::Kq(_)) {
                     kernels::quantize_q8_k(&mut st.midq, &st.heads, nh2 * hd, t)?;

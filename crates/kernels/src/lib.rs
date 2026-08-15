@@ -114,7 +114,11 @@ mod real {
         fn pulsar_moe_down_bias(out: *mut c_void, ptrs: *const c_void, weights: *const c_void, out_dim: u32, n_used: u32, n_tok: u32) -> i32;
         fn pulsar_add_bias_rows(x: *mut c_void, bias: *const c_void, dim: u32, rows: u32) -> i32;
         fn pulsar_gqa_head_rms_norm(x: *mut c_void, w: *const c_void, rows: u32, head_dim: u32, eps: f32) -> i32;
-        fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
+        fn pulsar_gqa_rope_dev(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos_dev: *const c_void, theta: f32) -> i32;
+        fn pulsar_gqa_kv_append_dev(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: *const c_void) -> i32;
+        fn pulsar_gqa_attention_dev(out: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: *const c_void, scale: f32) -> i32;
+        fn pulsar_set_u32(dst: *mut c_void, v: u32) -> i32;
+         fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
         fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, kvq: u32) -> i32;
         fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32, rel: *const c_void, rel_extent: u32, kvq: u32, sinks: *const c_void) -> i32;
 
@@ -1136,6 +1140,28 @@ mod real {
     }
 
     #[allow(clippy::too_many_arguments)] // kernel launch mirrors the CUDA signature
+    /// Device-position rope (multi-device graph capture): position read
+    /// from a device word instead of a baked argument.
+    pub fn gqa_rope_dev(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos_dev: &DeviceBuf, theta: f32) -> Result {
+        check(unsafe { pulsar_gqa_rope_dev(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos_dev.ptr(), theta) }, "gqa_rope_dev")
+    }
+
+    pub fn gqa_kv_append_dev(cache: &mut DeviceBuf, kv: &DeviceBuf, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: &DeviceBuf) -> Result {
+        check(unsafe { pulsar_gqa_kv_append_dev(cache.ptr_mut(), kv.ptr(), n_tok, n_kv_head, head_dim, cap, pos_dev.ptr()) }, "gqa_kv_append_dev")
+    }
+
+    /// f32 KV, plain single-pass kernel (no split-K): the engine gates
+    /// this to contexts below the split threshold.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gqa_attention_dev(out: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: &DeviceBuf, scale: f32) -> Result {
+        check(unsafe { pulsar_gqa_attention_dev(out.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), n_tok, n_head, n_kv_head, head_dim, cap, pos_dev.ptr(), scale) }, "gqa_attention_dev")
+    }
+
+    /// Async one-thread device write (per-token position cells).
+    pub fn set_u32(dst: &mut DeviceBuf, v: u32) -> Result {
+        check(unsafe { pulsar_set_u32(dst.ptr_mut(), v) }, "set_u32")
+    }
+
     pub fn gqa_rope(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: Option<&DeviceBuf>) -> Result {
         check(unsafe { pulsar_gqa_rope(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos0, theta, factors.map_or(std::ptr::null(), |b| b.ptr())) }, "gqa_rope")
     }
