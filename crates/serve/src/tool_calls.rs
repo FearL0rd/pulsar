@@ -365,12 +365,61 @@ fn take_generic(s: &str) -> Option<(String, String, usize)> {
             return Some((name.to_string(), args, consumed));
         }
     }
-    // 2) Poolside Laguna XML body:
+    // 2) Qwen3.8 function/parameter XML body:
+    //    <function=list_files><parameter=path>.</parameter></function>
+    if let Some((name, args)) = take_function_xml_body(block) {
+        return Some((name, args, consumed));
+    }
+    // 3) Poolside Laguna XML body:
     //    terminal<arg_key>cmd</arg_key><arg_value>uname -a</arg_value>
     if let Some((name, args)) = take_poolside_body(block) {
         return Some((name, args, consumed));
     }
     None
+}
+
+/// Parse the Qwen3.8 tool-call body: an inner `<function=NAME>` block
+/// holding `<parameter=KEY>value</parameter>` entries. The model is
+/// instructed to emit exactly this shape (its chat template spells it
+/// out), and values may span multiple lines, so they are taken verbatim
+/// between the tags with only the newline the template puts after the
+/// open tag and before the close tag trimmed.
+fn take_function_xml_body(block: &str) -> Option<(String, String)> {
+    const FN_O: &str = "<function=";
+    const FN_C: &str = "</function>";
+    const P_O: &str = "<parameter=";
+    const P_C: &str = "</parameter>";
+
+    let block = block.trim();
+    let f0 = block.find(FN_O)?;
+    let after = &block[f0 + FN_O.len()..];
+    let name_end = after.find('>')?;
+    let name = after[..name_end].trim().to_string();
+    if name.is_empty() || name.split_whitespace().count() != 1 {
+        return None;
+    }
+    // body ends at </function> when present; a truncated block still
+    // yields the parameters it did emit
+    let body = &after[name_end + 1..];
+    let body = match body.find(FN_C) {
+        Some(e) => &body[..e],
+        None => body,
+    };
+    let mut map = serde_json::Map::new();
+    let mut cursor = body;
+    while let Some(k0) = cursor.find(P_O) {
+        let after_k0 = &cursor[k0 + P_O.len()..];
+        let Some(k1) = after_k0.find('>') else { break };
+        let key = after_k0[..k1].trim().to_string();
+        let after_key = &after_k0[k1 + 1..];
+        let Some(v1) = after_key.find(P_C) else { break };
+        // the template wraps the value in newlines; strip exactly those
+        let val = after_key[..v1].strip_prefix('\n').unwrap_or(&after_key[..v1]);
+        let val = val.strip_suffix('\n').unwrap_or(val);
+        map.insert(key, json_value_from_str(val));
+        cursor = &after_key[v1 + P_C.len()..];
+    }
+    Some((name, serde_json::Value::Object(map).to_string()))
 }
 
 /// Parse Poolside tool-call body (no outer tags): `name` + optional arg pairs.
@@ -646,6 +695,38 @@ done"#;
         assert_eq!(clean, "hello\n\ndone");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "SearchTool__search_searxng");
+    }
+
+    #[test]
+    fn qwen38_function_xml() {
+        let (clean, calls) = extract_tool_calls(
+            "sure\n<tool_call>\n<function=list_files>\n<parameter=path>\n/tmp\n</parameter>\n</function>\n</tool_call>",
+        );
+        assert_eq!(clean, "sure");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "list_files");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(v["path"], "/tmp");
+    }
+
+    #[test]
+    fn qwen38_function_xml_multiline_and_multi_param() {
+        let (_, calls) = extract_tool_calls(
+            "<tool_call>\n<function=write>\n<parameter=path>\na.py\n</parameter>\n<parameter=body>\nline1\nline2\n</parameter>\n</function>\n</tool_call>",
+        );
+        assert_eq!(calls.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(v["path"], "a.py");
+        assert_eq!(v["body"], "line1\nline2");
+    }
+
+    #[test]
+    fn hermes_json_still_wins() {
+        let (_, calls) = extract_tool_calls(
+            "<tool_call>{\"name\": \"x\", \"arguments\": {\"a\": 1}}</tool_call>",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "x");
     }
 
     #[test]
