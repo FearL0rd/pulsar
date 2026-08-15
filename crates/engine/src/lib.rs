@@ -5380,7 +5380,13 @@ mod real {
             // if PULSAR_KV was requested but the arch can't honor it (never
             // silently apply-and-hang; a stale env carries over on model switch).
             let kv_req = std::env::var("PULSAR_KV").ok();
-            let kv_dense = s.family == Family::Qwen35 && s.n_expert == 1;
+            // ...but TENSOR PARALLEL replaces the dense split entirely
+            // (no cross-card residual hop mid-forward, each card owns its
+            // kv heads), so the deadlock cause is absent and quantized KV
+            // is what makes long contexts fit: f32 costs 64KB/pos/card on
+            // Qwen3.8-27B, fp8 ~16KB.
+            let kv_dense =
+                s.family == Family::Qwen35 && s.n_expert == 1 && m.tp.is_none();
             // Exhaustive: whether a family can honor PULSAR_KV is a property
             // of its cache layout, and the wrong answer here is not a slow
             // path but a hang (see the qwen35-dense note above). A new family
@@ -5728,9 +5734,20 @@ mod real {
                 // own kv width, not the Shape max
                 let (kb, vb) = if s.family == Family::Qwen35 {
                     // only full-attention layers hold KV; the nextn/MTP
-                    // draft slot is a full-attention layer too
-                    if i == s.n_exec_layer as usize || (i as u32 + 1).is_multiple_of(s.full_attn_interval) {
+                    // draft slot is a full-attention layer too (and stays
+                    // whole on the primary, so it keeps full width).
+                    // TP-split layers own HALF the kv heads per card -
+                    // allocating full width there wasted 3.2GB a card at
+                    // ctx 200k, which is the difference between fitting
+                    // and not.
+                    if i == s.n_exec_layer as usize {
                         (k_bytes, v_bytes)
+                    } else if (i as u32 + 1).is_multiple_of(s.full_attn_interval) {
+                        if m.tp_attn(i).is_some() {
+                            (k_bytes / 2, v_bytes / 2)
+                        } else {
+                            (k_bytes, v_bytes)
+                        }
                     } else {
                         (4, 4)
                     }
