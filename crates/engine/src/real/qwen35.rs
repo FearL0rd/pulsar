@@ -1102,6 +1102,12 @@ impl Model {
         kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (last_t - k) as usize * row, k as usize * row)?;
         kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, s.rms_eps)?;
         self.head_logits(st, k)?;
+        if st.skip_logit_read {
+            // spec verify wants only per-row argmaxes: 4 bytes a row
+            // instead of ~1MB of logits per row over pageable PCIe
+            st.last_argmax = kernels::argmax_rows(&mut st.amax_out, &st.logits, s.n_vocab, k)?;
+            return Ok(Some(Vec::new()));
+        }
         kernels::sync()?;
         Ok(Some(st.logits.read_f32(k as usize * s.n_vocab as usize)?))
     }

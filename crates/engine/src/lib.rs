@@ -4635,6 +4635,11 @@ mod real {
         /// Card-B kv-head cache halves per attn layer (PULSAR_TP); empty
         /// without TP. Positional like kcache, so ckpt rewind needs no copy.
         tp_kcache: Vec<Option<(DeviceBuf, DeviceBuf)>>,
+        /// Device argmax scratch + results for the spec loop's
+        /// readback-free verify (skip_logit_read)
+        amax_out: DeviceBuf,
+        pub(crate) last_argmax: Vec<u32>,
+        pub(crate) skip_logit_read: bool,
         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
         /// 5=q4_0. All lossy formats opt-in via PULSAR_KV=<fmt>; the
@@ -6012,6 +6017,9 @@ mod real {
                 kcache,
                 vcache,
                 tp_kcache,
+                amax_out: DeviceBuf::alloc(spec_rows.max(1) as usize * 4)?,
+                last_argmax: Vec::new(),
+                skip_logit_read: false,
                 kvq,
                 kv_devs,
                 kvq_lat,
@@ -8146,13 +8154,16 @@ mod real {
             let s = self.shape;
             kernels::rms_norm(&mut st.normed, &st.cur, &mtp.head_norm, s.n_embd, 1, s.rms_eps)?;
             self.head_logits(st, 1)?;
-            kernels::sync()?;
-            let logits = st.logits.read_f32(s.n_vocab as usize)?;
             if std::env::var_os("PULSAR_MTP_DEBUG").is_some() {
+                kernels::sync()?;
+                let logits = st.logits.read_f32(s.n_vocab as usize)?;
                 let bad = logits.iter().filter(|v| !v.is_finite()).count();
                 eprintln!("mtp-draft pos={pos}: logits nan={bad}, draft={}", argmax(&logits));
             }
-            Ok(argmax(&logits))
+            // argmax on device: the draft only needs the token id, not a
+            // megabyte of logits over pageable PCIe
+            let ids = kernels::argmax_rows(&mut st.amax_out, &st.logits, s.n_vocab, 1)?;
+            Ok(ids[0])
         }
 
         fn mtp_body(&self, st: &mut State, token: u32, pos: u32) -> Result {
@@ -8375,12 +8386,23 @@ mod real {
                 if recurrent {
                     st.qwen35.as_mut().ok_or("qwen35 state missing")?.gdn_snapshot()?;
                 }
-                let all = model
-                    .forward_rows(st, &chain, pos, (k + 1) as u32)?
-                    .ok_or("no verify logits")?;
+                // qwen35: readback-free verify (device argmax, 4 bytes a
+                // row); other spec families keep the logits readback
+                let row_amax: Vec<u32> = if recurrent {
+                    st.skip_logit_read = true;
+                    let r = model.forward_rows(st, &chain, pos, (k + 1) as u32);
+                    st.skip_logit_read = false;
+                    r?.ok_or("no verify logits")?;
+                    std::mem::take(&mut st.last_argmax)
+                } else {
+                    let all = model
+                        .forward_rows(st, &chain, pos, (k + 1) as u32)?
+                        .ok_or("no verify logits")?;
+                    (0..=k).map(|i| argmax(&all[i * v..(i + 1) * v])).collect()
+                };
                 t_verify += t0.elapsed();
                 let mut j = 0usize;
-                while j < k && argmax(&all[j * v..(j + 1) * v]) == chain[j + 1] {
+                while j < k && row_amax[j] == chain[j + 1] {
                     st.mtp_accepted += 1;
                     j += 1;
                 }
@@ -8393,8 +8415,7 @@ mod real {
                     t_refwd += t0.elapsed();
                 }
                 if debug {
-                    let nans = all.iter().filter(|x| !x.is_finite()).count();
-                    eprintln!("mtp: pos={pos} chain={chain:?} accepted={j}/{k} nan={nans}");
+                    eprintln!("mtp: pos={pos} chain={chain:?} accepted={j}/{k}");
                 }
 
                 // Re-anchor the MTP cache on TRUE hiddens for the accepted
@@ -8406,7 +8427,7 @@ mod real {
                 model.mtp_prefill_fill(st, (j + 1) as u32, pos)?;
                 t_fill += t0.elapsed();
                 pos += (j + 1) as u32;
-                next = argmax(&all[j * v..(j + 1) * v]);
+                next = row_amax[j];
 
                 for &d in &chain[1..=j] {
                     if stop(d) {

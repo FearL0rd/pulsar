@@ -118,6 +118,7 @@ mod real {
         fn pulsar_gqa_kv_append_dev(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: *const c_void) -> i32;
         fn pulsar_gqa_attention_dev(out: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: *const c_void, scale: f32) -> i32;
         fn pulsar_set_u32(dst: *mut c_void, v: u32) -> i32;
+        fn pulsar_argmax_rows(out: *mut c_void, x: *const c_void, n: u32, rows: u32) -> i32;
          fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
         fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, kvq: u32) -> i32;
         fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32, rel: *const c_void, rel_extent: u32, kvq: u32, sinks: *const c_void) -> i32;
@@ -1155,6 +1156,14 @@ mod real {
     #[allow(clippy::too_many_arguments)]
     pub fn gqa_attention_dev(out: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos_dev: &DeviceBuf, scale: f32) -> Result {
         check(unsafe { pulsar_gqa_attention_dev(out.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), n_tok, n_head, n_kv_head, head_dim, cap, pos_dev.ptr(), scale) }, "gqa_attention_dev")
+    }
+
+    /// Row-wise argmax on device: 4 bytes back per row instead of the
+    /// whole logits row. First index wins ties (matches the host scan).
+    pub fn argmax_rows(out: &mut DeviceBuf, x: &DeviceBuf, n: u32, rows: u32) -> Result<Vec<u32>> {
+        check(unsafe { pulsar_argmax_rows(out.ptr_mut(), x.ptr(), n, rows) }, "argmax_rows")?;
+        sync()?;
+        Ok(out.read_i32(rows as usize)?.into_iter().map(|v| v.max(0) as u32).collect())
     }
 
     /// Async one-thread device write (per-token position cells).

@@ -5688,6 +5688,48 @@ extern "C" int pulsar_gqa_attention_dev(
                                      n_kv_head, head_dim, cap, pos_dev, scale);
 }
 
+/* Row-wise argmax: one block per row, 256 threads scan the row strided
+ * and reduce (value, index) in shared memory. First index wins ties,
+ * matching the host scan the spec loop used. Turns per-round megabyte
+ * logits readbacks into 4 bytes per row. */
+__global__ static void argmax_rows_kernel(
+        int32_t *out, const float *x, uint32_t n, uint32_t rows) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float best = -INFINITY;
+    uint32_t bi = 0;
+    for (uint32_t i = threadIdx.x; i < n; i += 256u) {
+        const float v = xr[i];
+        if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+    }
+    __shared__ float sv[256];
+    __shared__ uint32_t si[256];
+    sv[threadIdx.x] = best;
+    si[threadIdx.x] = bi;
+    __syncthreads();
+    for (uint32_t st = 128u; st != 0; st >>= 1u) {
+        if (threadIdx.x < st) {
+            const float ov = sv[threadIdx.x + st];
+            const uint32_t oi = si[threadIdx.x + st];
+            if (ov > sv[threadIdx.x] ||
+                (ov == sv[threadIdx.x] && oi < si[threadIdx.x])) {
+                sv[threadIdx.x] = ov;
+                si[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[row] = (int32_t)si[0];
+}
+
+extern "C" int pulsar_argmax_rows(
+        void *out, const void *x, uint32_t n, uint32_t rows) {
+    if (n == 0 || rows == 0) return 0;
+    argmax_rows_kernel<<<rows, 256>>>((int32_t *)out, (const float *)x, n, rows);
+    return cuda_ok(cudaGetLastError(), "argmax_rows launch");
+}
+
 /* one-thread device write: the per-token position cells the graph-
  * captured kernels dereference (a host H2D would sync; this launches
  * async on the per-thread stream, correctly ordered before the graph) */
