@@ -875,8 +875,10 @@ mod real {
         wqkv: MatW, // [n_embd -> 2*key_dim + value_dim]
         wz: MatW,   // [n_embd -> value_dim] (attn_gate)
         conv: DeviceBuf, // f32 [conv_dim][ssm_conv_k]
-        alpha_w: DeviceBuf, // f32 [n_embd -> ssm_v_heads]
-        beta_w: DeviceBuf,
+        /// concatenated ssm_alpha ++ ssm_beta rows, f32
+        /// [n_embd -> 2*ssm_v_heads]: at decode ONE matmul feeds both
+        /// coefficient sets; the halves stay addressable by row offset
+        ab_w: DeviceBuf,
         /// g = a * softplus(alpha + dt_bias); a stored as -exp(A_log)
         a: DeviceBuf,
         dt_bias: DeviceBuf,
@@ -3981,8 +3983,11 @@ mod real {
                                         wqkv: matw_row_ranges(&file, &gguf, &t("attn_qkv.weight"), ranges)?,
                                         wz: matw_row_ranges(&file, &gguf, &t("attn_gate.weight"), &[vr])?,
                                         conv: DeviceBuf::from_f32(&conv_sl)?,
-                                        alpha_w: DeviceBuf::from_f32(&alpha[h0 * ne..h1 * ne])?,
-                                        beta_w: DeviceBuf::from_f32(&beta[h0 * ne..h1 * ne])?,
+                                        ab_w: {
+                                            let mut ab = alpha[h0 * ne..h1 * ne].to_vec();
+                                            ab.extend_from_slice(&beta[h0 * ne..h1 * ne]);
+                                            DeviceBuf::from_f32(&ab)?
+                                        },
                                         a: DeviceBuf::from_f32(&av[h0..h1])?,
                                         dt_bias: DeviceBuf::from_f32(&dtv[h0..h1])?,
                                         ssm_norm: upload(&file, &gguf, &t("ssm_norm.weight"))?,
@@ -4009,8 +4014,11 @@ mod real {
                                     // upload() would quantize the F16 2D tensor to q8_0 bytes,
                                     // which the conv kernel reads past (4x size mismatch) -> OOB.
                                     conv: upload_as_f32(&file, &gguf, &t("ssm_conv1d.weight"))?,
-                                    alpha_w: upload_as_f32(&file, &gguf, &t("ssm_alpha.weight"))?,
-                                    beta_w: upload_as_f32(&file, &gguf, &t("ssm_beta.weight"))?,
+                                    ab_w: {
+                                        let mut ab = read_any_f32(&file, &gguf, &t("ssm_alpha.weight"))?;
+                                        ab.extend(read_any_f32(&file, &gguf, &t("ssm_beta.weight"))?);
+                                        DeviceBuf::from_f32(&ab)?
+                                    },
                                     a: upload(&file, &gguf, &t("ssm_a"))?,
                                     dt_bias: upload(&file, &gguf, &t("ssm_dt.bias"))?,
                                     ssm_norm: upload(&file, &gguf, &t("ssm_norm.weight"))?,

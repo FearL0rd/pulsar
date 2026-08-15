@@ -146,6 +146,7 @@ struct DenseBank {
     small: DeviceBuf,
     g: DeviceBuf,
     beta: DeviceBuf,
+    gb: DeviceBuf,
     gdn_o: DeviceBuf,
     gdn_tmp: DeviceBuf,
     qfull: DeviceBuf,
@@ -195,6 +196,7 @@ impl DenseBank {
             gk: f32s(T_MAX * key_dim)?,
             gv: f32s(T_MAX * value_dim)?,
             small: f32s(T_MAX * s.ssm_v_heads as usize)?,
+            gb: f32s(2 * s.ssm_v_heads as usize)?,
             g: f32s(T_MAX * s.ssm_v_heads as usize)?,
             beta: f32s(T_MAX * s.ssm_v_heads as usize)?,
             gdn_o: f32s(T_MAX * value_dim)?,
@@ -266,6 +268,7 @@ struct TpBank {
     gv: DeviceBuf,
     g: DeviceBuf,
     beta: DeviceBuf,
+    gb: DeviceBuf,
     gdn_o: DeviceBuf,
     gdn_tmp: DeviceBuf,
     states: Vec<Option<GdnState>>,
@@ -317,6 +320,9 @@ pub(super) struct Qwen35Rt {
     gk: DeviceBuf,       // [T][key_dim]
     gv: DeviceBuf,       // [T][value_dim]
     small: DeviceBuf,    // [T][ssm_v_heads] alpha/beta matvec scratch
+    /// packed [g | beta] row for the concatenated coefficient matmul
+    /// (decode fast path)
+    gb: DeviceBuf,
     g: DeviceBuf,        // [T][ssm_v_heads] log-decay upload
     beta: DeviceBuf,     // [T][ssm_v_heads]
     gdn_o: DeviceBuf,    // [T][value_dim]
@@ -417,6 +423,7 @@ impl Qwen35Rt {
                     gv: f32s(T_MAX * vdh)?,
                     g: f32s(T_MAX * vh)?,
                     beta: f32s(T_MAX * vh)?,
+                    gb: f32s(2 * vh)?,
                     gdn_o: f32s(T_MAX * vdh)?,
                     gdn_tmp: f32s(T_MAX * vdh)?,
                     states: bstates,
@@ -456,6 +463,7 @@ impl Qwen35Rt {
             gk: f32s(T_MAX * key_dim)?,
             gv: f32s(T_MAX * value_dim)?,
             small: f32s(T_MAX * s.ssm_v_heads as usize)?,
+            gb: f32s(2 * s.ssm_v_heads as usize)?,
             g: f32s(T_MAX * s.ssm_v_heads as usize)?,
             beta: f32s(T_MAX * s.ssm_v_heads as usize)?,
             gdn_o: f32s(T_MAX * value_dim)?,
@@ -1304,18 +1312,33 @@ impl Model {
                 }
                 matw(&mut tb.qkv, &bw.wqkv, &tb.normed, &tb.xq, s.n_embd, cdh, t)?;
                 matw(&mut tb.z, &bw.wz, &tb.normed, &tb.xq, s.n_embd, vdh, t)?;
-                kernels::matmul_f32(&mut tb.g, &bw.alpha_w, &tb.normed, s.n_embd, vh, t)?;
-                kernels::matmul_f32(&mut tb.beta, &bw.beta_w, &tb.normed, s.n_embd, vh, t)?;
-                kernels::qwen35_gdn_coeffs(&mut tb.g, &mut tb.beta, &bw.a, &bw.dt_bias, t, vh)?;
+                let packed = t == 1;
+                if packed {
+                    // ONE [n_embd -> 2vh] matmul feeds both coefficient
+                    // sets; the packed row is g[0..vh] ++ beta[vh..2vh]
+                    kernels::matmul_f32(&mut tb.gb, &bw.ab_w, &tb.normed, s.n_embd, 2 * vh, 1)?;
+                    kernels::qwen35_gdn_coeffs_packed(&mut tb.gb, vh as usize * 4, &bw.a, &bw.dt_bias, vh)?;
+                } else {
+                    kernels::matmul_f32(&mut tb.g, &bw.ab_w, &tb.normed, s.n_embd, vh, t)?;
+                    kernels::matmul_f32_off(&mut tb.beta, &bw.ab_w, vh as usize * s.n_embd as usize * 4, &tb.normed, s.n_embd, vh, t)?;
+                    kernels::qwen35_gdn_coeffs(&mut tb.g, &mut tb.beta, &bw.a, &bw.dt_bias, t, vh)?;
+                }
                 let bs = tb.states[il].as_mut().ok_or("tp gdn state missing")?;
                 kernels::qwen35_conv_batch(&mut tb.conv_out, &tb.qkv, &bw.conv, &mut bs.conv, cdh, s.ssm_conv_k, t)?;
                 kernels::qwen35_split_qkv(&mut tb.gq, &mut tb.gk, &mut tb.gv, &tb.conv_out, t, kdh, vdh)?;
                 kernels::qwen35_l2_norm(&mut tb.gq, t * kh, s.ssm_state, eps)?;
                 kernels::qwen35_l2_norm(&mut tb.gk, t * kh, s.ssm_state, eps)?;
-                kernels::qwen35_gdn_batch(
-                    &mut tb.gdn_o, &mut bs.s, &tb.gq, &tb.gk, &tb.gv, &tb.g, &tb.beta,
-                    vh, kh, s.ssm_state, t,
-                )?;
+                if packed {
+                    kernels::qwen35_gdn_batch_packed(
+                        &mut tb.gdn_o, &mut bs.s, &tb.gq, &tb.gk, &tb.gv, &tb.gb, vh as usize * 4,
+                        vh, kh, s.ssm_state,
+                    )?;
+                } else {
+                    kernels::qwen35_gdn_batch(
+                        &mut tb.gdn_o, &mut bs.s, &tb.gq, &tb.gk, &tb.gv, &tb.g, &tb.beta,
+                        vh, kh, s.ssm_state, t,
+                    )?;
+                }
                 kernels::gqa_head_rms_norm(&mut tb.gdn_o, Some(&bw.ssm_norm), t * vh, s.ssm_state, eps)?;
                 kernels::swiglu(&mut tb.gdn_tmp, &tb.z, &tb.gdn_o, t * vdh, 0.0, 1.0, 0)?;
                 if matches!(bw.ssm_out, MatW::Kq(_)) {
@@ -1327,18 +1350,30 @@ impl Model {
                 // A's half, overlapping with B's chain
                 matw(&mut rt.qkv, &gdn.wqkv, &st.normed, &st.xq, s.n_embd, cdh, t)?;
                 matw(&mut rt.z, &gdn.wz, &st.normed, &st.xq, s.n_embd, vdh, t)?;
-                kernels::matmul_f32(&mut rt.g, &gdn.alpha_w, &st.normed, s.n_embd, vh, t)?;
-                kernels::matmul_f32(&mut rt.beta, &gdn.beta_w, &st.normed, s.n_embd, vh, t)?;
-                kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, vh)?;
+                if packed {
+                    kernels::matmul_f32(&mut rt.gb, &gdn.ab_w, &st.normed, s.n_embd, 2 * vh, 1)?;
+                    kernels::qwen35_gdn_coeffs_packed(&mut rt.gb, vh as usize * 4, &gdn.a, &gdn.dt_bias, vh)?;
+                } else {
+                    kernels::matmul_f32(&mut rt.g, &gdn.ab_w, &st.normed, s.n_embd, vh, t)?;
+                    kernels::matmul_f32_off(&mut rt.beta, &gdn.ab_w, vh as usize * s.n_embd as usize * 4, &st.normed, s.n_embd, vh, t)?;
+                    kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, vh)?;
+                }
                 let gs = rt.states[il].as_mut().ok_or("gdn state missing")?;
                 kernels::qwen35_conv_batch(&mut rt.conv_out, &rt.qkv, &gdn.conv, &mut gs.conv, cdh, s.ssm_conv_k, t)?;
                 kernels::qwen35_split_qkv(&mut rt.gq, &mut rt.gk, &mut rt.gv, &rt.conv_out, t, kdh, vdh)?;
                 kernels::qwen35_l2_norm(&mut rt.gq, t * kh, s.ssm_state, eps)?;
                 kernels::qwen35_l2_norm(&mut rt.gk, t * kh, s.ssm_state, eps)?;
-                kernels::qwen35_gdn_batch(
-                    &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.g, &rt.beta,
-                    vh, kh, s.ssm_state, t,
-                )?;
+                if packed {
+                    kernels::qwen35_gdn_batch_packed(
+                        &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.gb, vh as usize * 4,
+                        vh, kh, s.ssm_state,
+                    )?;
+                } else {
+                    kernels::qwen35_gdn_batch(
+                        &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.g, &rt.beta,
+                        vh, kh, s.ssm_state, t,
+                    )?;
+                }
                 kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * vh, s.ssm_state, eps)?;
                 kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * vdh, 0.0, 1.0, 0)?;
                 if matches!(gdn.ssm_out, MatW::Kq(_)) {
@@ -1358,8 +1393,8 @@ impl Model {
                 eprintln!("  qkv {:?} z {:?}", rt.qkv.read_f32(2)?, rt.z.read_f32(2)?);
             }
             // g/beta coefficients fully on-device (no host readbacks)
-            kernels::matmul_f32(&mut rt.g, &gdn.alpha_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
-            kernels::matmul_f32(&mut rt.beta, &gdn.beta_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
+            kernels::matmul_f32(&mut rt.g, &gdn.ab_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
+            kernels::matmul_f32_off(&mut rt.beta, &gdn.ab_w, s.ssm_v_heads as usize * s.n_embd as usize * 4, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
             kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, s.ssm_v_heads)?;
 
             // fast-rollback stash: the raw qkv rows + final coeffs are

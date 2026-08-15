@@ -1472,6 +1472,52 @@ mod real {
     }
 
     /// In place over [n_tok][n_head]: g = a*softplus(g+dt), beta = sigmoid(beta).
+    /// Coeffs over a PACKED [g | beta] row (the concatenated alpha/beta
+    /// matmul at n_tok == 1): same kernel, offset pointers.
+    pub fn qwen35_gdn_coeffs_packed(gb: &mut DeviceBuf, beta_off: usize, a: &DeviceBuf, dt: &DeviceBuf, n_head: u32) -> Result {
+        check(
+            unsafe {
+                pulsar_qwen35_gdn_coeffs(
+                    gb.ptr_mut(),
+                    (gb.ptr_mut() as *mut u8).add(beta_off) as *mut c_void,
+                    a.ptr(), dt.ptr(), 1, n_head,
+                )
+            },
+            "qwen35_gdn_coeffs",
+        )
+    }
+
+    /// gdn_batch reading g/beta from one packed row (n_tok == 1).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_gdn_batch_packed(out: &mut DeviceBuf, state: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, gb: &DeviceBuf, beta_off: usize, h_v: u32, h_k: u32, dim: u32) -> Result {
+        check(
+            unsafe {
+                pulsar_qwen35_gdn_batch(
+                    out.ptr_mut(), state.ptr_mut(), q.ptr(), k.ptr(), v.ptr(),
+                    gb.ptr(),
+                    (gb.ptr() as *const u8).add(beta_off) as *const c_void,
+                    h_v, h_k, dim, 1,
+                )
+            },
+            "qwen35_gdn_batch",
+        )
+    }
+
+    /// matmul_f32 with a byte offset into the weight (the concatenated
+    /// alpha/beta tensor's halves at n_tok > 1).
+    pub fn matmul_f32_off(out: &mut DeviceBuf, w: &DeviceBuf, w_off: usize, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
+        check(
+            unsafe {
+                pulsar_matmul_f32(
+                    out.ptr_mut(),
+                    (w.ptr() as *const u8).add(w_off) as *const c_void,
+                    x.ptr(), in_dim, out_dim, n_tok,
+                )
+            },
+            "matmul_f32",
+        )
+    }
+
     pub fn qwen35_gdn_coeffs(g_alpha: &mut DeviceBuf, beta: &mut DeviceBuf, a: &DeviceBuf, dt: &DeviceBuf, n_tok: u32, n_head: u32) -> Result {
         check(unsafe { pulsar_qwen35_gdn_coeffs(g_alpha.ptr_mut(), beta.ptr_mut(), a.ptr(), dt.ptr(), n_tok, n_head) }, "qwen35_gdn_coeffs")
     }
