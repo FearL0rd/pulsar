@@ -3738,6 +3738,113 @@ __global__ static void matmul_kq_gemm_q4K(
     }
 }
 
+
+/* q6_K flavor of the prefill GEMM. Same frame as q4K above; the block
+ * dequantizes to (q - 32) int8 so the offset folds into the values and
+ * no bsum term is needed, and scales run per 16 values (scales[v>>4]).
+ * q6_K blocks are 210 bytes - rows are only 2-aligned, so the quant
+ * bytes go through load_u32_bytes like wdot_q6_K does. */
+__global__ static void matmul_kq_gemm_q6K(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+    __shared__ int8_t wq_s[PULSAR_GEMM_BM * PULSAR_GEMM_WS];
+    __shared__ int8_t yq_s[PULSAR_GEMM_BN * PULSAR_GEMM_YS];
+    __shared__ float wsc_s[PULSAR_GEMM_BM][16];
+    __shared__ float yd_s[PULSAR_GEMM_BN];
+
+    const uint32_t tx = threadIdx.x;
+    const uint32_t ty = threadIdx.y;
+    const uint32_t tid = ty * 64u + tx;
+    const uint32_t row0 = blockIdx.x * PULSAR_GEMM_BM;
+    const uint32_t tok0 = blockIdx.y * PULSAR_GEMM_BN;
+    const uint32_t tok = tok0 + tx;
+
+    float acc[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) acc[r] = 0.0f;
+
+    for (uint32_t b = 0; b < in_blocks; b++) {
+        {
+            const uint32_t r = tid >> 3;
+            const uint32_t j5 = tid & 7u;
+            const uint32_t rg = row0 + r < out_dim ? row0 + r : out_dim - 1u;
+            const block_q6_K *xb = (const block_q6_K *)(w + (uint64_t)rg * row_bytes) + b;
+            /* thread j5 -> (chunk j of 128, hi nibble, 16-value half) */
+            const uint32_t j = j5 >> 2, hi = (j5 >> 1) & 1u, ib = (j5 & 1u) << 4;
+            const uint8_t *ql = xb->ql + 64u * j;
+            int8_t *dst = wq_s + r * PULSAR_GEMM_WS + 128u * j + 64u * hi + ib;
+            #pragma unroll
+            for (int i = 0; i < 16; i += 4) {
+                const uint32_t lo0 = load_u32_bytes(ql + ib + i);
+                const uint32_t lo1 = load_u32_bytes(ql + 32u + ib + i);
+                const uint32_t h = load_u32_bytes(xb->qh + 32u * j + ib + i);
+                uint32_t va, vb;
+                if (hi == 0u) {
+                    va = (lo0 & 0x0f0f0f0fu) | (((h >> 0) & 0x03030303u) << 4);
+                    vb = (lo1 & 0x0f0f0f0fu) | (((h >> 2) & 0x03030303u) << 4);
+                } else {
+                    va = ((lo0 >> 4) & 0x0f0f0f0fu) | (((h >> 4) & 0x03030303u) << 4);
+                    vb = ((lo1 >> 4) & 0x0f0f0f0fu) | (((h >> 6) & 0x03030303u) << 4);
+                }
+                *(uint32_t *)(dst + i) = (uint32_t)__vsub4((int)va, 0x20202020);
+                *(uint32_t *)(dst + 32 + i) = (uint32_t)__vsub4((int)vb, 0x20202020);
+            }
+            /* this thread's two 16-value runs sit at scale slots k0, k0+2 */
+            const uint32_t k0 = (128u * j + 64u * hi + ib) >> 4;
+            const float d = f16_to_f32(xb->d);
+            wsc_s[r][k0] = d * (float)xb->scales[k0];
+            wsc_s[r][k0 + 2u] = d * (float)xb->scales[k0 + 2u];
+        }
+        {
+            const uint32_t t = tid >> 2;
+            const uint32_t q = tid & 3u;
+            const uint32_t tg = tok0 + t < n_tok ? tok0 + t : n_tok - 1u;
+            const block_q8_K *yb = xq + (uint64_t)tg * in_blocks + b;
+            const uint8_t *src = (const uint8_t *)yb->qs + 64u * q;
+            int8_t *dst = yq_s + t * PULSAR_GEMM_YS + 64u * q;
+            #pragma unroll
+            for (int i = 0; i < 64; i += 4)
+                *(uint32_t *)(dst + i) = *(const uint32_t *)(src + i);
+            if (q == 0u) yd_s[t] = yb->d;
+        }
+        __syncthreads();
+
+        const int8_t *yrow = yq_s + tx * PULSAR_GEMM_YS;
+        const float ydv = yd_s[tx];
+        #pragma unroll
+        for (uint32_t k = 0; k < 16u; k++) {
+            int yw[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                yw[i] = *(const int32_t *)(yrow + 16u * k + 4u * i);
+            #pragma unroll
+            for (int r = 0; r < 8; r++) {
+                const uint32_t rl = ty * 8u + r;
+                const int8_t *wr_ = wq_s + rl * PULSAR_GEMM_WS + 16u * k;
+                int sg = 0;
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                    sg = __dp4a(*(const int32_t *)(wr_ + 4 * i), yw[i], sg);
+                acc[r] += ydv * wsc_s[rl][k] * (float)sg;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tok < n_tok) {
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            const uint32_t rg = row0 + ty * 8u + r;
+            if (rg < out_dim) out[(uint64_t)tok * out_dim + rg] = acc[r];
+        }
+    }
+}
+
 extern "C" int pulsar_matmul_kq(
         void *out_dev,
         const void *w_dev,
@@ -3755,13 +3862,20 @@ extern "C" int pulsar_matmul_kq(
     /* wide prefill batches on q4_K take the shared-memory GEMM: one
      * weight read per 64 tokens instead of per 16. PULSAR_NO_GEMM=1
      * falls back to the grouped path (uncached read: it is one launch). */
-    if (n_tok >= 32u && quant == PULSAR_QUANT_Q4_K && !getenv("PULSAR_NO_GEMM")) {
+    if (n_tok >= 32u &&
+        (quant == PULSAR_QUANT_Q4_K || quant == PULSAR_QUANT_Q6_K) &&
+        !getenv("PULSAR_NO_GEMM")) {
         dim3 ggrid((out_dim + PULSAR_GEMM_BM - 1u) / PULSAR_GEMM_BM,
                    (n_tok + PULSAR_GEMM_BN - 1u) / PULSAR_GEMM_BN, 1);
         dim3 gblock(64, 4, 1);
-        matmul_kq_gemm_q4K<<<ggrid, gblock>>>(
-                (float *)out_dev, (const char *)w_dev,
-                (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        if (quant == PULSAR_QUANT_Q4_K)
+            matmul_kq_gemm_q4K<<<ggrid, gblock>>>(
+                    (float *)out_dev, (const char *)w_dev,
+                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        else
+            matmul_kq_gemm_q6K<<<ggrid, gblock>>>(
+                    (float *)out_dev, (const char *)w_dev,
+                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         return cuda_ok(cudaGetLastError(), "matmul_kq_gemm launch");
     }
 
