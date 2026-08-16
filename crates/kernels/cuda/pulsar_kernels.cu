@@ -3603,6 +3603,33 @@ extern "C" int pulsar_matmul_kq(
     }
     const uint32_t in_blocks = in_dim / PULSAR_QK_K;
     dim3 block(32, 4, 1);
+    /* Wide batches (prefill chunks) tile in groups of TT: each group
+     * reads the weights ONCE for its 16 tokens. Without this, anything
+     * past 16 fell through to the per-token kernel below, whose grid is
+     * (out_dim, n_tok) - i.e. one full weight pass PER TOKEN. That cliff
+     * is why the prefill chunk width was pinned at 16: widening it made
+     * prefill slower (4000 tok: 49s at width 16, 74s at width 128)
+     * instead of faster. Recursing per group keeps one code path.
+     * The group stays 16: TT=32 spills acc[] to local memory and
+     * measured 61.6s vs 45.2s. The kernel is LSU-bound on the q8
+     * activation loads (ncu: L1 94%, DRAM 28%), so a wider register
+     * tile buys nothing - getting past this needs the activations
+     * staged in shared memory, or tensor-core MMA. */
+    if (n_tok > 16u) {
+        const uint32_t in_blocks_g = in_dim / PULSAR_QK_K;
+        for (uint32_t base = 0; base < n_tok; base += 16u) {
+            const uint32_t cnt = n_tok - base < 16u ? n_tok - base : 16u;
+            if (!pulsar_matmul_kq(
+                    (float *)out_dev + (uint64_t)base * out_dim,
+                    w_dev,
+                    (const block_q8_K *)xq_dev + (uint64_t)base * in_blocks_g,
+                    in_dim, out_dim, cnt, row_bytes, quant)) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+
     /* multi-token batches (MTP/DFlash verify, chunked prefill) tile
      * tokens over one weight read; q4_K/q6_K ride the warp-cooperative
      * dots for any 2..16 rows */

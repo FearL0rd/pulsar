@@ -31,7 +31,7 @@ fn matw(out: &mut DeviceBuf, w: &MatW, x: &DeviceBuf, xq: &DeviceBuf, in_dim: u3
 
 /// Verify/prefill chunk width (DFlash block size; also the register
 /// budget the batched GDN kernel was written for).
-const T_MAX: usize = 16;
+const T_MAX: usize = 128;
 /// DFlash feature-ring capacity = the draft context window (lucebox
 /// defaults to 2048; v1 keeps the fc cost down with 256).
 pub(super) const RING_CAP: usize = 256;
