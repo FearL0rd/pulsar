@@ -3865,6 +3865,13 @@ __device__ __forceinline__ static void ldmatrix_x4(
 __device__ __forceinline__ static float f4_at(const float4 &f, uint32_t i) {
     return i == 0u ? f.x : i == 1u ? f.y : i == 2u ? f.z : f.w;
 }
+__device__ __forceinline__ static void ldmatrix_x2(
+        uint32_t f[2], const void *smem_row) {
+    const uint32_t sa = (uint32_t)__cvta_generic_to_shared(smem_row);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+        : "=r"(f[0]), "=r"(f[1]) : "r"(sa));
+}
 #endif
 
 /* a_s rows pad to 272 so ldmatrix's 32 row addresses spread over the
@@ -3888,12 +3895,16 @@ __global__ static void matmul_kq_gemm_mma_kernel(
     const uint32_t g = lane >> 2u;           /* fragment row / B column */
     const uint32_t tg = lane & 3u;           /* K quad / D column pair */
 
-    /* 32 rows staged, two 16-row mma tiles: every B fragment a warp
-     * loads feeds TWO mmas instead of one - B traffic was the limit,
-     * the 16-row version clocked identical to the dp4a gemm */
-    __shared__ int8_t a_s[32][PULSAR_GEMM_AS];
-    __shared__ float s_w[32][16];
-    __shared__ float s_m[32][16];
+    /* 32-row tile (a 16-row diet halved B reuse and lost: 14.9s vs
+     * 12.6s - B global loads are the top stall, do not double them),
+     * double-buffered: registers cap occupancy at 3 blocks/SM anyway,
+     * so the second buffer is free smem; staging sb+1 overlaps the
+     * mma of sb and the loop runs ONE barrier per superblock. */
+    __shared__ int8_t a_s[2][32][PULSAR_GEMM_AS];
+    __shared__ float s_w[2][32][16];
+    /* [2] planes unconditionally, matching the MoE kernel: HAS_MIN
+     * false leaves them unwritten dead weight, never UB */
+    __shared__ float s_m[2][32][16];
 
     float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -3902,56 +3913,62 @@ __global__ static void matmul_kq_gemm_mma_kernel(
     const uint32_t t_c0 = tb + tg * 2u;
     const uint32_t t_c1 = tb + tg * 2u + 1u;
     /* clamped, not NULL: b rides an always-valid row so the inner loop
-     * carries no guard; out-of-range tokens only skip the store */
+     * carries no guard; out-of-range tokens only skip the store. B
+     * stays in global on purpose: an smem-staged y tile + ldmatrix B
+     * fragments measured SLOWER (12.98s vs 12.67s) - the token rows
+     * are re-read by every grid.x block and sit hot in L1. */
     const char *yb = (const char *)(xq + (uint64_t)(t_b < n_tok ? t_b : n_tok - 1u) * in_blocks);
     const char *yc0 = t_c0 < n_tok ? (const char *)(xq + (uint64_t)t_c0 * in_blocks) : NULL;
     const char *yc1 = t_c1 < n_tok ? (const char *)(xq + (uint64_t)t_c1 * in_blocks) : NULL;
 
-    for (uint32_t sb = 0; sb < in_blocks; sb++) {
-        __syncthreads();
-        {
-            const uint32_t c = threadIdx.x & 15u;
-            for (uint32_t r = threadIdx.x >> 4u; r < 32u; r += 16u) {
-                int32_t w4[4] = {0, 0, 0, 0};
-                float sc = 0.0f, mo = 0.0f;
-                if (r0 + r < out_dim) {
-                    UNPACK::chunk16(w + (uint64_t)(r0 + r) * row_bytes
-                                            + (uint64_t)sb * UNPACK::SB_BYTES,
-                                    c, w4, &sc, &mo);
-                }
-                *(int4 *)&a_s[r][c * 16u] = *(const int4 *)w4;
-                s_w[r][c] = sc;
-                if (UNPACK::HAS_MIN) s_m[r][c] = mo;
-            }
-        }
-        __syncthreads();
+    /* two (row, chunk) slots per thread per stage */
+    const uint32_t sc_i = threadIdx.x & 15u;
 
-        /* B stays in global on purpose: an smem-staged y tile + ldmatrix
-         * B fragments measured SLOWER (12.98s vs 12.67s on the 4000-tok
-         * bench) - the token rows are re-read by every grid.x block and
-         * sit hot in L1, so staging only added traffic. */
+#define PULSAR_GEMM_STAGE(buf, sb)                                             \
+    do {                                                                       \
+        for (uint32_t r = threadIdx.x >> 4u; r < 32u; r += 16u) {              \
+            const uint32_t rg = r0 + r < out_dim ? r0 + r : out_dim - 1u;      \
+            int32_t w4[4] = {0, 0, 0, 0};                                      \
+            float sc = 0.0f, mo = 0.0f;                                        \
+            UNPACK::chunk16(w + (uint64_t)rg * row_bytes                       \
+                                    + (uint64_t)(sb) * UNPACK::SB_BYTES,       \
+                            sc_i, w4, &sc, &mo);                               \
+            *(int4 *)&a_s[buf][r][sc_i * 16u] = *(const int4 *)w4;             \
+            s_w[buf][r][sc_i] = sc;                                            \
+            if (UNPACK::HAS_MIN) s_m[buf][r][sc_i] = mo;                       \
+        }                                                                      \
+    } while (0)
+
+    PULSAR_GEMM_STAGE(0u, 0u);
+    __syncthreads();
+
+    for (uint32_t sb = 0; sb < in_blocks; sb++) {
+        const uint32_t cur = sb & 1u;
+        if (sb + 1u < in_blocks) PULSAR_GEMM_STAGE(cur ^ 1u, sb + 1u);
+
         const char *ybs = yb + (uint64_t)sb * sizeof(block_q8_K);
         const char *yc0s = yc0 ? yc0 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
         const char *yc1s = yc1 ? yc1 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
         const float d0 = yc0s ? ((const block_q8_K *)yc0s)->d : 0.0f;
         const float d1 = yc1s ? ((const block_q8_K *)yc1s)->d : 0.0f;
 
-        /* ncu: MIO-queue stalls were 35% of warp wait - the inner loop
-         * was all narrow 32-bit smem loads. Scales now come 4 chunks
-         * per float4; the A fragments of BOTH 16-row tiles come from
-         * one ldmatrix.x4 per chunk (lane i supplies row i). */
+        /* ncu: MIO-queue stalls were 35% of warp wait when this loop
+         * was narrow 32-bit smem loads. Scales come 4 chunks per
+         * float4; the A fragments of BOTH 16-row tiles arrive in one
+         * ldmatrix.x4 per chunk (lane i supplies row i; rows pad to
+         * 272 to spread the banks). */
         #pragma unroll
         for (uint32_t ch4 = 0; ch4 < 4u; ch4++) {
-            const float4 sw0 = *(const float4 *)&s_w[g][ch4 * 4u];
-            const float4 sw8 = *(const float4 *)&s_w[g + 8u][ch4 * 4u];
-            const float4 swg = *(const float4 *)&s_w[g + 16u][ch4 * 4u];
-            const float4 swq = *(const float4 *)&s_w[g + 24u][ch4 * 4u];
+            const float4 sw0 = *(const float4 *)&s_w[cur][g][ch4 * 4u];
+            const float4 sw8 = *(const float4 *)&s_w[cur][g + 8u][ch4 * 4u];
+            const float4 swg = *(const float4 *)&s_w[cur][g + 16u][ch4 * 4u];
+            const float4 swq = *(const float4 *)&s_w[cur][g + 24u][ch4 * 4u];
             float4 sm0 = {0, 0, 0, 0}, sm8 = sm0, smg = sm0, smq = sm0;
             if (UNPACK::HAS_MIN) {
-                sm0 = *(const float4 *)&s_m[g][ch4 * 4u];
-                sm8 = *(const float4 *)&s_m[g + 8u][ch4 * 4u];
-                smg = *(const float4 *)&s_m[g + 16u][ch4 * 4u];
-                smq = *(const float4 *)&s_m[g + 24u][ch4 * 4u];
+                sm0 = *(const float4 *)&s_m[cur][g][ch4 * 4u];
+                sm8 = *(const float4 *)&s_m[cur][g + 8u][ch4 * 4u];
+                smg = *(const float4 *)&s_m[cur][g + 16u][ch4 * 4u];
+                smq = *(const float4 *)&s_m[cur][g + 24u][ch4 * 4u];
             }
             #pragma unroll
             for (uint32_t chi = 0; chi < 4u; chi++) {
@@ -3970,7 +3987,7 @@ __global__ static void matmul_kq_gemm_mma_kernel(
                     acc[7] -= f4_at(smq, chi) * bs1;
                 }
                 uint32_t f[4];
-                ldmatrix_x4(f, &a_s[lane][ch * 16u]);
+                ldmatrix_x4(f, &a_s[cur][lane][ch * 16u]);
                 int32_t dsum[4];
                 mma_s8_16x8x16(dsum, (const int32_t *)f, b);
                 acc[0] += (float)dsum[0] * f4_at(sw0, chi) * d0;
@@ -3984,7 +4001,9 @@ __global__ static void matmul_kq_gemm_mma_kernel(
                 acc[7] += (float)dsum[3] * f4_at(swq, chi) * d1;
             }
         }
+        __syncthreads();
     }
+#undef PULSAR_GEMM_STAGE
 
     /* D fragment element -> (row, token): c0/c1 at rows g and g+8,
      * repeated for the second 16-row tile */
