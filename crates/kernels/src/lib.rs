@@ -1624,6 +1624,47 @@ mod tests {
     /// Effective bandwidth of matmul_kq per quant on a dense-27B FFN
     /// shape - a probe, not a correctness test (weights are pseudorandom
     /// bytes; every wdot path is branchless so timing is data-blind).
+    #[test]
+    fn kq_gemm_matches_reference() {
+        use super::*;
+        let out_dim = 100u32; // not a multiple of 32: exercises the row tail
+        let in_dim = 512u32;
+        let n_tok = 70u32; // >= 32 takes the gemm; 70 exercises the token tail
+        let blocks = (in_dim / 256) as usize;
+        let rb = blocks * 144;
+        let wbytes = out_dim as usize * rb;
+        let mut host: Vec<u8> = (0..wbytes).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
+        // pin every block's f16 d/dmin to finite values
+        for b in 0..out_dim as usize * blocks {
+            host[b * 144..b * 144 + 2].copy_from_slice(&0x3400u16.to_le_bytes()); // d = 0.25
+            host[b * 144 + 2..b * 144 + 4].copy_from_slice(&0x3000u16.to_le_bytes()); // dmin = 0.125
+        }
+        let mut w = DeviceBuf::alloc(wbytes).unwrap();
+        w.write(0, &host).unwrap();
+        let x: Vec<f32> = (0..(in_dim * n_tok) as usize).map(|i| ((i * 37) % 97) as f32 * 0.01 - 0.5).collect();
+        let mut xf = DeviceBuf::alloc(x.len() * 4).unwrap();
+        xf.write(0, as_bytes(&x)).unwrap();
+        let mut xq = DeviceBuf::alloc(n_tok as usize * blocks * Q8_K_BLOCK_BYTES).unwrap();
+        quantize_q8_k(&mut xq, &xf, in_dim, n_tok).unwrap();
+        let mut out = DeviceBuf::alloc((n_tok * out_dim) as usize * 4).unwrap();
+        // reference: the proven grouped-16 path, same inputs
+        std::env::set_var("PULSAR_NO_GEMM", "1");
+        matmul_kq(&mut out, &w, &xq, in_dim, out_dim, n_tok, rb as u64, QUANT_Q4_K).unwrap();
+        sync().unwrap();
+        let want = out.read_f32((n_tok * out_dim) as usize).unwrap();
+        std::env::remove_var("PULSAR_NO_GEMM");
+        matmul_kq(&mut out, &w, &xq, in_dim, out_dim, n_tok, rb as u64, QUANT_Q4_K).unwrap();
+        sync().unwrap();
+        let got = out.read_f32((n_tok * out_dim) as usize).unwrap();
+        let mut worst = 0f32;
+        for i in 0..got.len() {
+            let d = (got[i] - want[i]).abs() / want[i].abs().max(1.0);
+            if d > worst { worst = d; }
+        }
+        eprintln!("kq gemm vs reference: worst rel diff {worst:.2e}");
+        assert!(worst < 1e-4, "gemm diverges from the grouped path: {worst}");
+    }
+
     /// cargo test --release -p kernels kq_bandwidth -- --ignored --nocapture
     #[test]
     #[ignore = "perf probe, requires a CUDA device"]
