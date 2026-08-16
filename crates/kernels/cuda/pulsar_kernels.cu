@@ -3853,6 +3853,24 @@ __global__ static void matmul_kq_gemm_q6K(
  * each of its 8 warps owns one 8-token column tile, so a block covers
  * 16 rows x 64 tokens. B rides L1/L2 straight from the q8_K rows, same
  * as the MoE kernel. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ static void ldmatrix_x4(
+        uint32_t f[4], const void *smem_row) {
+    const uint32_t sa = (uint32_t)__cvta_generic_to_shared(smem_row);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+        : "=r"(f[0]), "=r"(f[1]), "=r"(f[2]), "=r"(f[3])
+        : "r"(sa));
+}
+__device__ __forceinline__ static float f4_at(const float4 &f, uint32_t i) {
+    return i == 0u ? f.x : i == 1u ? f.y : i == 2u ? f.z : f.w;
+}
+#endif
+
+/* a_s rows pad to 272 so ldmatrix's 32 row addresses spread over the
+ * banks (256 would land every row on bank 0) */
+#define PULSAR_GEMM_AS 272u
+
 template <typename UNPACK>
 __global__ static void matmul_kq_gemm_mma_kernel(
         float *out,
@@ -3873,7 +3891,7 @@ __global__ static void matmul_kq_gemm_mma_kernel(
     /* 32 rows staged, two 16-row mma tiles: every B fragment a warp
      * loads feeds TWO mmas instead of one - B traffic was the limit,
      * the 16-row version clocked identical to the dp4a gemm */
-    __shared__ int8_t a_s[32][256];
+    __shared__ int8_t a_s[32][PULSAR_GEMM_AS];
     __shared__ float s_w[32][16];
     __shared__ float s_m[32][16];
 
@@ -3883,7 +3901,9 @@ __global__ static void matmul_kq_gemm_mma_kernel(
     const uint32_t t_b = tb + g;
     const uint32_t t_c0 = tb + tg * 2u;
     const uint32_t t_c1 = tb + tg * 2u + 1u;
-    const char *yb = t_b < n_tok ? (const char *)(xq + (uint64_t)t_b * in_blocks) : NULL;
+    /* clamped, not NULL: b rides an always-valid row so the inner loop
+     * carries no guard; out-of-range tokens only skip the store */
+    const char *yb = (const char *)(xq + (uint64_t)(t_b < n_tok ? t_b : n_tok - 1u) * in_blocks);
     const char *yc0 = t_c0 < n_tok ? (const char *)(xq + (uint64_t)t_c0 * in_blocks) : NULL;
     const char *yc1 = t_c1 < n_tok ? (const char *)(xq + (uint64_t)t_c1 * in_blocks) : NULL;
 
@@ -3906,40 +3926,62 @@ __global__ static void matmul_kq_gemm_mma_kernel(
         }
         __syncthreads();
 
-        const char *ybs = yb ? yb + (uint64_t)sb * sizeof(block_q8_K) : NULL;
+        /* B stays in global on purpose: an smem-staged y tile + ldmatrix
+         * B fragments measured SLOWER (12.98s vs 12.67s on the 4000-tok
+         * bench) - the token rows are re-read by every grid.x block and
+         * sit hot in L1, so staging only added traffic. */
+        const char *ybs = yb + (uint64_t)sb * sizeof(block_q8_K);
         const char *yc0s = yc0 ? yc0 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
         const char *yc1s = yc1 ? yc1 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
         const float d0 = yc0s ? ((const block_q8_K *)yc0s)->d : 0.0f;
         const float d1 = yc1s ? ((const block_q8_K *)yc1s)->d : 0.0f;
 
+        /* ncu: MIO-queue stalls were 35% of warp wait - the inner loop
+         * was all narrow 32-bit smem loads. Scales now come 4 chunks
+         * per float4; the A fragments of BOTH 16-row tiles come from
+         * one ldmatrix.x4 per chunk (lane i supplies row i). */
         #pragma unroll
-        for (uint32_t ch = 0; ch < 16u; ch++) {
-            const int32_t b = ybs
-                    ? *(const int32_t *)(ybs + 4u + ch * 16u + tg * 4u)
-                    : 0;
+        for (uint32_t ch4 = 0; ch4 < 4u; ch4++) {
+            const float4 sw0 = *(const float4 *)&s_w[g][ch4 * 4u];
+            const float4 sw8 = *(const float4 *)&s_w[g + 8u][ch4 * 4u];
+            const float4 swg = *(const float4 *)&s_w[g + 16u][ch4 * 4u];
+            const float4 swq = *(const float4 *)&s_w[g + 24u][ch4 * 4u];
+            float4 sm0 = {0, 0, 0, 0}, sm8 = sm0, smg = sm0, smq = sm0;
             if (UNPACK::HAS_MIN) {
-                const float bs0 = yc0s ? (float)((const int16_t *)(yc0s + 4u + 256u))[ch] : 0.0f;
-                const float bs1 = yc1s ? (float)((const int16_t *)(yc1s + 4u + 256u))[ch] : 0.0f;
-                #pragma unroll
-                for (uint32_t h = 0; h < 2u; h++) {
-                    acc[4u * h + 0u] -= s_m[16u * h + g][ch] * bs0 * d0;
-                    acc[4u * h + 1u] -= s_m[16u * h + g][ch] * bs1 * d1;
-                    acc[4u * h + 2u] -= s_m[16u * h + g + 8u][ch] * bs0 * d0;
-                    acc[4u * h + 3u] -= s_m[16u * h + g + 8u][ch] * bs1 * d1;
-                }
+                sm0 = *(const float4 *)&s_m[g][ch4 * 4u];
+                sm8 = *(const float4 *)&s_m[g + 8u][ch4 * 4u];
+                smg = *(const float4 *)&s_m[g + 16u][ch4 * 4u];
+                smq = *(const float4 *)&s_m[g + 24u][ch4 * 4u];
             }
             #pragma unroll
-            for (uint32_t h = 0; h < 2u; h++) {
-                int32_t a[2], dsum[4];
-                a[0] = *(const int32_t *)&a_s[16u * h + g][ch * 16u + tg * 4u];
-                a[1] = *(const int32_t *)&a_s[16u * h + g + 8u][ch * 16u + tg * 4u];
-                mma_s8_16x8x16(dsum, a, b);
-                const float sg0 = s_w[16u * h + g][ch];
-                const float sg8 = s_w[16u * h + g + 8u][ch];
-                acc[4u * h + 0u] += (float)dsum[0] * sg0 * d0;
-                acc[4u * h + 1u] += (float)dsum[1] * sg0 * d1;
-                acc[4u * h + 2u] += (float)dsum[2] * sg8 * d0;
-                acc[4u * h + 3u] += (float)dsum[3] * sg8 * d1;
+            for (uint32_t chi = 0; chi < 4u; chi++) {
+                const uint32_t ch = ch4 * 4u + chi;
+                const int32_t b = *(const int32_t *)(ybs + 4u + ch * 16u + tg * 4u);
+                if (UNPACK::HAS_MIN) {
+                    const float bs0 = yc0s ? (float)((const int16_t *)(yc0s + 4u + 256u))[ch] * d0 : 0.0f;
+                    const float bs1 = yc1s ? (float)((const int16_t *)(yc1s + 4u + 256u))[ch] * d1 : 0.0f;
+                    acc[0] -= f4_at(sm0, chi) * bs0;
+                    acc[1] -= f4_at(sm0, chi) * bs1;
+                    acc[2] -= f4_at(sm8, chi) * bs0;
+                    acc[3] -= f4_at(sm8, chi) * bs1;
+                    acc[4] -= f4_at(smg, chi) * bs0;
+                    acc[5] -= f4_at(smg, chi) * bs1;
+                    acc[6] -= f4_at(smq, chi) * bs0;
+                    acc[7] -= f4_at(smq, chi) * bs1;
+                }
+                uint32_t f[4];
+                ldmatrix_x4(f, &a_s[lane][ch * 16u]);
+                int32_t dsum[4];
+                mma_s8_16x8x16(dsum, (const int32_t *)f, b);
+                acc[0] += (float)dsum[0] * f4_at(sw0, chi) * d0;
+                acc[1] += (float)dsum[1] * f4_at(sw0, chi) * d1;
+                acc[2] += (float)dsum[2] * f4_at(sw8, chi) * d0;
+                acc[3] += (float)dsum[3] * f4_at(sw8, chi) * d1;
+                mma_s8_16x8x16(dsum, (const int32_t *)(f + 2), b);
+                acc[4] += (float)dsum[0] * f4_at(swg, chi) * d0;
+                acc[5] += (float)dsum[1] * f4_at(swg, chi) * d1;
+                acc[6] += (float)dsum[2] * f4_at(swq, chi) * d0;
+                acc[7] += (float)dsum[3] * f4_at(swq, chi) * d1;
             }
         }
     }
