@@ -3525,12 +3525,33 @@ __global__ static void matmul_kqw_tokens_kernel(
         uint64_t row_bytes) {
     const uint32_t lane = threadIdx.x;
     const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
-    if (row >= out_dim) return;
-    const char *wr = w + (uint64_t)row * row_bytes;
+    /* NO early return: the staging loop below has __syncthreads(), so
+     * every thread of the block must reach it. Rows past out_dim clamp
+     * their weight pointer (read is harmless) and skip only the store. */
+    const bool live = row < out_dim;
+    const char *wr = w + (uint64_t)(live ? row : out_dim - 1u) * row_bytes;
+
+    /* The 4 row-warps of a block all dot against the SAME activation
+     * blocks, so reading them from global per warp burns 4x the L1
+     * traffic - and ncu had this kernel at L1 94% / DRAM 28%, i.e.
+     * bound on exactly those loads. Stage the tile's q8 blocks in
+     * shared once per weight block; all warps then read them from
+     * smem and the L1 path is left to the weight rows. */
+    constexpr uint32_t QW = sizeof(block_q8_K) / 4u;
+    __shared__ uint32_t xs[TT * QW];
+    const uint32_t tid = threadIdx.y * blockDim.x + lane;
+    const uint32_t nthr = blockDim.y * blockDim.x;
+
     float acc[TT];
     #pragma unroll
     for (int t = 0; t < TT; t++) acc[t] = 0.0f;
     for (uint32_t b = 0; b < in_blocks; b++) {
+        const uint32_t total = n_tok * QW;
+        for (uint32_t i = tid; i < total; i += nthr) {
+            const uint32_t t = i / QW;
+            xs[i] = ((const uint32_t *)(xq + (uint64_t)t * in_blocks + b))[i - t * QW];
+        }
+        __syncthreads();
         /* decode the weight word once; only the dp4a runs per token.
          * Compile-time unroll with an early exit keeps acc[] in
          * registers - a runtime trip count spills it to local memory. */
@@ -3538,8 +3559,9 @@ __global__ static void matmul_kqw_tokens_kernel(
         #pragma unroll
         for (int t = 0; t < TT; t++) {
             if ((uint32_t)t >= n_tok) break;
-            acc[t] += WDOT::apply(p, xq + (uint64_t)t * in_blocks, b, lane);
+            acc[t] += WDOT::apply(p, (const block_q8_K *)xs + t, 0u, lane);
         }
+        __syncthreads();
     }
     #pragma unroll
     for (int t = 0; t < TT; t++) {
@@ -3549,7 +3571,7 @@ __global__ static void matmul_kqw_tokens_kernel(
         for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
             a += __shfl_xor_sync(0xffffffffu, a, mask);
         }
-        if (lane == 0) out[(uint64_t)t * out_dim + row] = a;
+        if (lane == 0 && live) out[(uint64_t)t * out_dim + row] = a;
     }
 }
 
