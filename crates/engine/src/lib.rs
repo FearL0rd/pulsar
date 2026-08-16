@@ -4755,6 +4755,12 @@ mod real {
         mtp_hidden_save: DeviceBuf,
         pub mtp_drafted: u64,
         pub mtp_accepted: u64,
+        /// per-draft-position accept/draft counts (index 0 = first draft
+        /// token). Acceptance DECAY across positions is the number that
+        /// says whether a draft chain is healthy: a good MTP holds
+        /// ~0.90/0.78/0.70, a self-feed that drifts collapses instead.
+        pub mtp_pos_accepted: Vec<u64>,
+        pub mtp_pos_drafted: Vec<u64>,
         /// q8_K activation scratch for a K-quant lm-head (1 f32 otherwise)
         head_xq: DeviceBuf,
         // Inkling scratch (empty/dummies elsewhere): per-layer packed
@@ -6145,6 +6151,8 @@ mod real {
                 mtp_hidden_save: f32s(if m.mtp.is_some() { s.n_embd } else { 1 })?,
                 mtp_drafted: 0,
                 mtp_accepted: 0,
+                mtp_pos_accepted: vec![0; 8],
+                mtp_pos_drafted: vec![0; 8],
                 head_xq: if m.output_kq.is_some() {
                     DeviceBuf::alloc(
                         spec_rows as usize * s.n_embd as usize
@@ -8449,6 +8457,20 @@ mod real {
                     (0..=k).map(|i| argmax(&all[i * v..(i + 1) * v])).collect()
                 };
                 t_verify += t0.elapsed();
+                // Per-position draft quality, measured INDEPENDENTLY of
+                // the prefix rule: position i counts as a hit when the
+                // verified argmax equals the drafted token there, even if
+                // an earlier position already broke the chain. Prefix
+                // acceptance hides drift (everything after a miss reads
+                // as 0); this exposes it.
+                for i in 0..k {
+                    if i < st.mtp_pos_drafted.len() {
+                        st.mtp_pos_drafted[i] += 1;
+                        if row_amax[i] == chain[i + 1] {
+                            st.mtp_pos_accepted[i] += 1;
+                        }
+                    }
+                }
                 let mut j = 0usize;
                 while j < k && row_amax[j] == chain[j + 1] {
                     st.mtp_accepted += 1;
@@ -8493,6 +8515,16 @@ mod real {
                     "mtp timing: draft {:.2}s verify {:.2}s refwd {:.2}s fill {:.2}s over {emitted} tokens",
                     t_draft.as_secs_f64(), t_verify.as_secs_f64(), t_refwd.as_secs_f64(), t_fill.as_secs_f64()
                 );
+                let rates: Vec<String> = st
+                    .mtp_pos_drafted
+                    .iter()
+                    .zip(&st.mtp_pos_accepted)
+                    .take_while(|(d, _)| **d > 0)
+                    .map(|(d, a)| format!("{:.3}", *a as f64 / *d as f64))
+                    .collect();
+                if !rates.is_empty() {
+                    eprintln!("mtp per-position acceptance: {}", rates.join(", "));
+                }
             }
             return Ok(pos);
         }
