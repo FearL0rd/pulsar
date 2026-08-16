@@ -8209,6 +8209,18 @@ mod real {
             let mtp = self.mtp.as_ref().ok_or("mtp_draft without an MTP layer")?;
             let s = self.shape;
             kernels::rms_norm(&mut st.normed, &st.cur, &mtp.head_norm, s.n_embd, 1, s.rms_eps)?;
+            // The draft needs one token id, not calibrated logits, so it
+            // takes the vocab-split argmax head when TP is on: each card
+            // reads half the 248k-row head instead of card A reading all
+            // of it. The head is the single biggest read in a draft step.
+            if self.shape.family == Family::Qwen35 {
+                let mut rt = st.qwen35.take().ok_or("qwen35 state missing")?;
+                let r = self.head_argmax_split(st, &mut rt, 1);
+                st.qwen35 = Some(rt);
+                if r? {
+                    return Ok(*st.last_argmax.first().ok_or("no argmax row")?);
+                }
+            }
             self.head_logits(st, 1)?;
             if std::env::var_os("PULSAR_MTP_DEBUG").is_some() {
                 kernels::sync()?;
