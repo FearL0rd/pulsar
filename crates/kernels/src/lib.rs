@@ -1658,13 +1658,19 @@ mod tests {
         sync().unwrap();
         let want = out.read_f32((n_tok * out_dim) as usize).unwrap();
         std::env::remove_var("PULSAR_NO_GEMM");
-        matmul_kq(&mut out, &w, &xq, in_dim, out_dim, n_tok, rb as u64, quant).unwrap();
-        sync().unwrap();
-        let got = out.read_f32((n_tok * out_dim) as usize).unwrap();
+        // both gemm flavors against the grouped reference: default (mma
+        // on cc>=8) and the dp4a fallback
         let mut worst = 0f32;
-        for i in 0..got.len() {
-            let d = (got[i] - want[i]).abs() / want[i].abs().max(1.0);
-            if d > worst { worst = d; }
+        for force_dp4a in [false, true] {
+            if force_dp4a { std::env::set_var("PULSAR_NO_MMA", "1"); }
+            matmul_kq(&mut out, &w, &xq, in_dim, out_dim, n_tok, rb as u64, quant).unwrap();
+            sync().unwrap();
+            if force_dp4a { std::env::remove_var("PULSAR_NO_MMA"); }
+            let got = out.read_f32((n_tok * out_dim) as usize).unwrap();
+            for i in 0..got.len() {
+                let d = (got[i] - want[i]).abs() / want[i].abs().max(1.0);
+                if d > worst { worst = d; }
+            }
         }
         eprintln!("kq gemm {name} vs reference: worst rel diff {worst:.2e}");
         // q6_K reads noisier than q4_K: signed scales cancel, so the

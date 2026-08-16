@@ -3845,6 +3845,122 @@ __global__ static void matmul_kq_gemm_q6K(
     }
 }
 
+
+/* tensor-core flavor of the prefill GEMM (sm_80+). Reuses the MoE MMA
+ * machinery - the UNPACK::chunk16 dequant policies and the m16n8k16
+ * fragment mapping - minus the pair/gather bookkeeping: B columns are
+ * just consecutive tokens. A block stages a 16-row weight tile in smem;
+ * each of its 8 warps owns one 8-token column tile, so a block covers
+ * 16 rows x 64 tokens. B rides L1/L2 straight from the q8_K rows, same
+ * as the MoE kernel. */
+template <typename UNPACK>
+__global__ static void matmul_kq_gemm_mma_kernel(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t r0 = blockIdx.x * 32u;
+    const uint32_t tok0 = blockIdx.y * 64u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u; /* 0..7: which token octet */
+    const uint32_t g = lane >> 2u;           /* fragment row / B column */
+    const uint32_t tg = lane & 3u;           /* K quad / D column pair */
+
+    /* 32 rows staged, two 16-row mma tiles: every B fragment a warp
+     * loads feeds TWO mmas instead of one - B traffic was the limit,
+     * the 16-row version clocked identical to the dp4a gemm */
+    __shared__ int8_t a_s[32][256];
+    __shared__ float s_w[32][16];
+    __shared__ float s_m[32][16];
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const uint32_t tb = tok0 + warp * 8u;
+    const uint32_t t_b = tb + g;
+    const uint32_t t_c0 = tb + tg * 2u;
+    const uint32_t t_c1 = tb + tg * 2u + 1u;
+    const char *yb = t_b < n_tok ? (const char *)(xq + (uint64_t)t_b * in_blocks) : NULL;
+    const char *yc0 = t_c0 < n_tok ? (const char *)(xq + (uint64_t)t_c0 * in_blocks) : NULL;
+    const char *yc1 = t_c1 < n_tok ? (const char *)(xq + (uint64_t)t_c1 * in_blocks) : NULL;
+
+    for (uint32_t sb = 0; sb < in_blocks; sb++) {
+        __syncthreads();
+        {
+            const uint32_t c = threadIdx.x & 15u;
+            for (uint32_t r = threadIdx.x >> 4u; r < 32u; r += 16u) {
+                int32_t w4[4] = {0, 0, 0, 0};
+                float sc = 0.0f, mo = 0.0f;
+                if (r0 + r < out_dim) {
+                    UNPACK::chunk16(w + (uint64_t)(r0 + r) * row_bytes
+                                            + (uint64_t)sb * UNPACK::SB_BYTES,
+                                    c, w4, &sc, &mo);
+                }
+                *(int4 *)&a_s[r][c * 16u] = *(const int4 *)w4;
+                s_w[r][c] = sc;
+                if (UNPACK::HAS_MIN) s_m[r][c] = mo;
+            }
+        }
+        __syncthreads();
+
+        const char *ybs = yb ? yb + (uint64_t)sb * sizeof(block_q8_K) : NULL;
+        const char *yc0s = yc0 ? yc0 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
+        const char *yc1s = yc1 ? yc1 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
+        const float d0 = yc0s ? ((const block_q8_K *)yc0s)->d : 0.0f;
+        const float d1 = yc1s ? ((const block_q8_K *)yc1s)->d : 0.0f;
+
+        #pragma unroll
+        for (uint32_t ch = 0; ch < 16u; ch++) {
+            const int32_t b = ybs
+                    ? *(const int32_t *)(ybs + 4u + ch * 16u + tg * 4u)
+                    : 0;
+            if (UNPACK::HAS_MIN) {
+                const float bs0 = yc0s ? (float)((const int16_t *)(yc0s + 4u + 256u))[ch] : 0.0f;
+                const float bs1 = yc1s ? (float)((const int16_t *)(yc1s + 4u + 256u))[ch] : 0.0f;
+                #pragma unroll
+                for (uint32_t h = 0; h < 2u; h++) {
+                    acc[4u * h + 0u] -= s_m[16u * h + g][ch] * bs0 * d0;
+                    acc[4u * h + 1u] -= s_m[16u * h + g][ch] * bs1 * d1;
+                    acc[4u * h + 2u] -= s_m[16u * h + g + 8u][ch] * bs0 * d0;
+                    acc[4u * h + 3u] -= s_m[16u * h + g + 8u][ch] * bs1 * d1;
+                }
+            }
+            #pragma unroll
+            for (uint32_t h = 0; h < 2u; h++) {
+                int32_t a[2], dsum[4];
+                a[0] = *(const int32_t *)&a_s[16u * h + g][ch * 16u + tg * 4u];
+                a[1] = *(const int32_t *)&a_s[16u * h + g + 8u][ch * 16u + tg * 4u];
+                mma_s8_16x8x16(dsum, a, b);
+                const float sg0 = s_w[16u * h + g][ch];
+                const float sg8 = s_w[16u * h + g + 8u][ch];
+                acc[4u * h + 0u] += (float)dsum[0] * sg0 * d0;
+                acc[4u * h + 1u] += (float)dsum[1] * sg0 * d1;
+                acc[4u * h + 2u] += (float)dsum[2] * sg8 * d0;
+                acc[4u * h + 3u] += (float)dsum[3] * sg8 * d1;
+            }
+        }
+    }
+
+    /* D fragment element -> (row, token): c0/c1 at rows g and g+8,
+     * repeated for the second 16-row tile */
+    #pragma unroll
+    for (uint32_t h = 0; h < 2u; h++) {
+        const uint32_t rg0 = r0 + 16u * h + g, rg8 = r0 + 16u * h + g + 8u;
+        if (t_c0 < n_tok) {
+            if (rg0 < out_dim) out[(uint64_t)t_c0 * out_dim + rg0] = acc[4u * h + 0u];
+            if (rg8 < out_dim) out[(uint64_t)t_c0 * out_dim + rg8] = acc[4u * h + 2u];
+        }
+        if (t_c1 < n_tok) {
+            if (rg0 < out_dim) out[(uint64_t)t_c1 * out_dim + rg0] = acc[4u * h + 1u];
+            if (rg8 < out_dim) out[(uint64_t)t_c1 * out_dim + rg8] = acc[4u * h + 3u];
+        }
+    }
+#endif
+}
+
 extern "C" int pulsar_matmul_kq(
         void *out_dev,
         const void *w_dev,
@@ -3865,6 +3981,18 @@ extern "C" int pulsar_matmul_kq(
     if (n_tok >= 32u &&
         (quant == PULSAR_QUANT_Q4_K || quant == PULSAR_QUANT_Q6_K) &&
         !getenv("PULSAR_NO_GEMM")) {
+        if (pulsar_device_cc_major() >= 8 && !getenv("PULSAR_NO_MMA")) {
+            dim3 mgrid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
+            if (quant == PULSAR_QUANT_Q4_K)
+                matmul_kq_gemm_mma_kernel<unpack_q4_K><<<mgrid, 256>>>(
+                        (float *)out_dev, (const char *)w_dev,
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+            else
+                matmul_kq_gemm_mma_kernel<unpack_q6_K><<<mgrid, 256>>>(
+                        (float *)out_dev, (const char *)w_dev,
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+            return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_mma launch");
+        }
         dim3 ggrid((out_dim + PULSAR_GEMM_BM - 1u) / PULSAR_GEMM_BM,
                    (n_tok + PULSAR_GEMM_BN - 1u) / PULSAR_GEMM_BN, 1);
         dim3 gblock(64, 4, 1);
