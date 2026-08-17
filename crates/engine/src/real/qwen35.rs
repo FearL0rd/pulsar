@@ -1115,60 +1115,54 @@ impl Model {
             self.eval_qwen35_span(st, rt, 0, n0, pos, t)?;
             let n_banks = banks.len();
             for bi in 0..n_banks {
-                let b = &mut banks[bi];
-                let (bfirst, bend) = (b.first, b.end);
-                // hop 1: residual over to this bank's card (issued with
-                // the producer current, so the consumer's launches order
-                // after it), then run its layers on its own buffers.
-                // With several banks the residual returns to the primary
-                // between them - one extra hop per boundary, which is
-                // cheap next to a layer range and keeps every span's
-                // buffers on the card that runs it.
+                let (bfirst, bend, bdev) = (banks[bi].first, banks[bi].end, banks[bi].dev);
                 let bytes = (t * s.n_embd) as usize * 4;
-                // Async handoff. Each copy is issued on the CONSUMER's
-                // stream after waiting on the producer's event, so the
-                // consumer's own prior reads of the destination are
-                // ordered before the overwrite. The host no longer blocks
-                // at a bank boundary, which is what pinned all three
-                // cards into running one after another.
-                b.ev_p.record()?;
-                kernels::set_device(b.dev)?;
-                b.ev_p.wait()?;
-                kernels::copy_across_async(&mut b.cur, &st.cur, bytes)?;
-                // the copy READS the primary's residual from this bank's
-                // stream; without the old blocking copy-back nothing else
-                // stops the next chunk's embed from overwriting it
-                b.ev_in.record()?;
-                b.swap(st, rt);
-                self.eval_qwen35_span(st, rt, bfirst, bend, pos, t)?;
-                // hop 2 back: after the swap b.cur is the bank-side buffer
-                // holding the final residual
-                let b = &mut banks[bi];
-                b.swap(st, rt);
-                // The last bank residual is read on the primary only for
-                // the FINAL chunk of the call: by the head when logits are
-                // wanted, and by the MTP draft head, which builds its input
-                // from that hidden state even when rows == 0. Gating on
-                // rows alone silently starved the draft and dropped
-                // acceptance 83% -> 69% while greedy output stayed correct,
-                // because the target still verifies. For every other chunk
-                // the copy is dead work AND the thing that pins card 0: it
-                // puts a wait-on-bank-event into the PRIMARY stream, so the
-                // next chunk's embed cannot start until the banks finish.
-                // Dropping it lets card 0 run ahead, which is the whole
-                // point, since chunk i+1 layer 0 consumes its own token
-                // embeddings and not this residual.
-                if bi + 1 < n_banks || last {
-                    b.ev_b.record()?;
-                    kernels::set_device(kernels::primary_device())?;
-                    b.ev_b.wait()?;
-                    kernels::copy_across_async(&mut st.cur, &b.cur, bytes)?;
-                } else {
-                    kernels::set_device(kernels::primary_device())?;
+                // True bank-to-bank chain: primary -> bank 0 -> bank 1 ...
+                // and only the final bank of the final chunk hands back to
+                // the primary.
+                //
+                // Routing an intermediate hop through primary MEMORY does
+                // not work even when the copy is issued on a bank stream,
+                // because the primary must then wait on bank i+1's inbound
+                // copy, which is itself ordered after bank i's span. That
+                // wait is transitive and card 0 stalls for the whole chain
+                // anyway (measured: no better than routing through the
+                // primary stream outright).
+                //
+                // Every copy is issued on the CONSUMER's stream after the
+                // producer's event. ev_in means "I have finished reading my
+                // source, the owner may overwrite it": the primary waits on
+                // bank 0's, and bank i waits on bank i+1's before refilling
+                // its own buffer on the next chunk.
+                if bi == 0 {
+                    banks[0].ev_p.record()?;
                 }
-                // wait only for the handoff copy, never for the span: that
-                // is what keeps card 0 free to start the next chunk
-                banks[bi].ev_in.wait()?;
+                kernels::set_device(bdev)?;
+                if bi + 1 < n_banks {
+                    banks[bi + 1].ev_in.wait()?;
+                }
+                if bi == 0 {
+                    banks[0].ev_p.wait()?;
+                    kernels::copy_across_async(&mut banks[0].cur, &st.cur, bytes)?;
+                } else {
+                    banks[bi - 1].ev_b.wait()?;
+                    let (prev, rest) = banks.split_at_mut(bi);
+                    kernels::copy_across_async(&mut rest[0].cur, &prev[bi - 1].cur, bytes)?;
+                }
+                banks[bi].ev_in.record()?;
+                banks[bi].swap(st, rt);
+                self.eval_qwen35_span(st, rt, bfirst, bend, pos, t)?;
+                banks[bi].swap(st, rt);
+                banks[bi].ev_b.record()?;
+                if bi + 1 == n_banks {
+                    kernels::set_device(kernels::primary_device())?;
+                    // the head and the MTP draft head both read this
+                    if last {
+                        banks[bi].ev_b.wait()?;
+                        kernels::copy_across_async(&mut st.cur, &banks[bi].cur, bytes)?;
+                    }
+                    banks[0].ev_in.wait()?;
+                }
                 if bi + 1 < n_banks {
                     continue;
                 }
