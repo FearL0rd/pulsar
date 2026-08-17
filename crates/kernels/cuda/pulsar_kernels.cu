@@ -4126,6 +4126,13 @@ extern "C" int pulsar_matmul_kq(
         case PULSAR_QUANT_Q5_K: PULSAR_KQW_T(wdot_q5_K);
         case PULSAR_QUANT_Q6_K: PULSAR_KQW_T(wdot_q6_K);
 case PULSAR_QUANT_IQ4_XS: PULSAR_KQW_T(wdot_iq4_xs);
+        /* NVFP4 was missing here, so every multi-token pass on an NVFP4
+         * gguf fell to matmul_kqw_kernel = one FULL weight sweep per
+         * token. nsys on an MTP run: 90% of GPU time in
+         * matmul_kqw_kernel<wdot_nvfp4>. That made a 2-token
+         * speculative verify cost ~2 forwards, which is why MTP could
+         * not profit even at 88% draft acceptance. */
+        case PULSAR_QUANT_NVFP4: PULSAR_KQW_T(wdot_nvfp4);
         default: break;
         }
         #undef PULSAR_KQW_T
