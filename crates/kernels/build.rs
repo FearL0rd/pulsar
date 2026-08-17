@@ -66,7 +66,14 @@ fn main() {
 }
 
 fn default_archs() -> Vec<String> {
-    let requested = ["61", "75", "80", "86", "89"];
+    // 120a (not plain 120): Blackwell's FP4 tensor ops are
+    // architecture-SPECIFIC features. mma.kind::f8f6f4 with e2m1
+    // operands is rejected on .target sm_120 ("not supported") and
+    // accepted on sm_120a. Without an entry here a 5060 Ti JITs the
+    // compute_89 PTX floor instead of running native Blackwell SASS
+    // (measured neutral for the current kernels, but it is the
+    // precondition for any FP4 path).
+    let requested = ["61", "75", "80", "86", "89", "120a"];
     let output = std::process::Command::new("nvcc")
         .arg("--list-gpu-arch")
         .output();
