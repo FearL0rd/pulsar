@@ -460,9 +460,18 @@ mod real {
         /// (64-bit Linux) the pointer is valid on every device.
         pub fn alloc_pinned(bytes: usize) -> Result<Self> {
             ensure_device();
+            // PORTABLE matters on multi-GPU: without it the allocation is
+            // only registered in the context that made it, so another
+            // device copying out of the same host buffer is undefined.
+            // The TP staging buffer is allocated on card A and read by an
+            // H2D on card B, and the missing flag corrupted it
+            // deterministically - byte 0 survived while the middle of a
+            // 20KB transfer came back wrong, which is what made tensor
+            // parallel emit wrong tokens.
+            const PORTABLE: u32 = 1; // cudaHostAllocPortable
             const MAPPED: u32 = 2; // cudaHostAllocMapped
             let mut host = std::ptr::null_mut();
-            check_rt(unsafe { cudaHostAlloc(&mut host, bytes.max(1), MAPPED) }, "cudaHostAlloc")?;
+            check_rt(unsafe { cudaHostAlloc(&mut host, bytes.max(1), PORTABLE | MAPPED) }, "cudaHostAlloc")?;
             let mut dev = std::ptr::null_mut();
             check_rt(unsafe { cudaHostGetDevicePointer(&mut dev, host, 0) }, "cudaHostGetDevicePointer")?;
             Ok(DeviceBuf { ptr: dev, host, bytes, dev: -1 })
@@ -1624,6 +1633,49 @@ mod tests {
     /// Effective bandwidth of matmul_kq per quant on a dense-27B FFN
     /// shape - a probe, not a correctness test (weights are pseudorandom
     /// bytes; every wdot path is branchless so timing is data-blind).
+    /// TpLink moves a whole buffer between two devices, not just its head.
+    /// A partial transfer here is what made tensor parallel emit wrong
+    /// tokens: byte 0 arrived, the middle did not.
+    #[test]
+    fn tplink_transfers_whole_buffer() {
+        use super::*;
+        if device_count() < 2 {
+            eprintln!("tplink test: needs 2 devices, skipping");
+            return;
+        }
+        let n = 5120usize; // one qwen35 row
+        let src_host: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001 - 2.0).collect();
+        let primary = get_device();
+        let other = (0..device_count()).find(|&d| d != primary).unwrap();
+
+        set_device(primary).unwrap();
+        let mut a = DeviceBuf::alloc(n * 4).unwrap();
+        a.write(0, as_bytes(&src_host)).unwrap();
+        let link = TpLink::new(n * 4).unwrap();
+
+        set_device(other).unwrap();
+        let mut b = DeviceBuf::alloc(n * 4).unwrap();
+        let zero = vec![0u8; n * 4];
+        b.write(0, &zero).unwrap();
+
+        set_device(primary).unwrap();
+        link.send(&a, n * 4).unwrap();
+        set_device(other).unwrap();
+        link.recv(&mut b, n * 4).unwrap();
+        sync().unwrap();
+        let got = b.read_f32(n).unwrap();
+        set_device(primary).unwrap();
+
+        let bad: Vec<usize> = (0..n).filter(|&i| got[i] != src_host[i]).collect();
+        if !bad.is_empty() {
+            eprintln!(
+                "tplink: {} of {n} elements wrong; first {:?}, at {} got {} want {}",
+                bad.len(), &bad[..bad.len().min(8)], bad[0], got[bad[0]], src_host[bad[0]]
+            );
+        }
+        assert!(bad.is_empty(), "TpLink delivered a partial buffer");
+    }
+
     #[test]
     fn kq_gemm_matches_reference() {
         use super::*;

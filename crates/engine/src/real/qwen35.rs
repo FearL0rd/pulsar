@@ -1389,6 +1389,12 @@ impl Model {
                 let vdh = vh * s.ssm_state;
                 let cdh = 2 * kdh + vdh;
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
+                if dbg {
+                    kernels::sync()?;
+                    let d = (s.n_embd as usize / 2) * 4;
+                    eprintln!("  PRESEND il={il} t={t} bytes={} A[0] {:?} A[mid] {:?}",
+                        (t * s.n_embd) as usize * 4, st.normed.read_f32(2)?, st.normed.read_f32_at(d, 2)?);
+                }
                 tb.lx.send(&st.normed, (t * s.n_embd) as usize * 4)?;
                 kernels::set_device(tb.dev)?;
                 tb.lx.recv(&mut tb.normed, (t * s.n_embd) as usize * 4)?;
