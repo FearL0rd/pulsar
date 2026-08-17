@@ -3009,6 +3009,33 @@ struct unpack_q6_K {
     }
 };
 
+/* nvfp4 for the MMA path: 144B superblock = 4 blocks x 36B, each block
+ * 4 UE4M3 scale bytes then 32 nibble bytes. chunk c of 16 values maps to
+ * block c>>2, sub-block c&3; within a sub-block the low nibbles are
+ * values 0..7 and the high nibbles 8..15, so the two 4-byte words give
+ * out[0]=v0..3, out[1]=v4..7 (lows) and out[2]=v8..11, out[3]=v12..15
+ * (highs). The doubled-e2m1 codebook decodes to int8 and ue4m3_half
+ * carries the compensating 0.5, so there is no min term. */
+struct unpack_nvfp4 {
+    static const bool HAS_MIN = false;
+    static const uint32_t SB_BYTES = 144u;
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
+        const uint32_t nb = c >> 2, sub = c & 3u;
+        const char *bp = block + (uint64_t)nb * 36u;
+        uint8_t e;
+        memcpy(&e, bp + sub, 1);
+        *scale = ue4m3_half(e);
+        const uint32_t w0 = load_u32_bytes((const uint8_t *)(bp + 4u + sub * 8u));
+        const uint32_t w1 = load_u32_bytes((const uint8_t *)(bp + 4u + sub * 8u + 4u));
+        out[0] = mxfp4_lookup4(w0 & 0x0f0f0f0fu);
+        out[1] = mxfp4_lookup4(w1 & 0x0f0f0f0fu);
+        out[2] = mxfp4_lookup4((w0 >> 4) & 0x0f0f0f0fu);
+        out[3] = mxfp4_lookup4((w1 >> 4) & 0x0f0f0f0fu);
+    }
+};
+
 struct unpack_q4_K {
     static const bool HAS_MIN = true;
     static const uint32_t SB_BYTES = sizeof(block_q4_K);
@@ -4146,9 +4173,14 @@ extern "C" int pulsar_matmul_kq(
         (quant == PULSAR_QUANT_Q4_K || quant == PULSAR_QUANT_Q6_K
          || quant == PULSAR_QUANT_NVFP4) &&
         !getenv("PULSAR_NO_GEMM")) {
-        /* nvfp4 has no mma flavor yet: the mma path keys off
-         * UNPACK::chunk16 policies (unpack_q4_K/unpack_q6_K) and there
-         * is no unpack_nvfp4. Take the dp4a gemm for it. */
+        if (quant == PULSAR_QUANT_NVFP4 && pulsar_device_cc_major() >= 8
+            && !getenv("PULSAR_NO_MMA")) {
+            dim3 mgrid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
+            matmul_kq_gemm_mma_kernel<unpack_nvfp4><<<mgrid, 256>>>(
+                    (float *)out_dev, (const char *)w_dev,
+                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+            return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_mma nvfp4 launch");
+        }
         if (quant == PULSAR_QUANT_NVFP4) {
             dim3 ggrid((out_dim + PULSAR_GEMM_BM - 1u) / PULSAR_GEMM_BM,
                        (n_tok + PULSAR_GEMM_BN - 1u) / PULSAR_GEMM_BN, 1);
