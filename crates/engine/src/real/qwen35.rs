@@ -118,6 +118,9 @@ struct Stage2 {
 /// unchanged, then swapped back for the tail. The residual stream
 /// crosses cards exactly twice per chunk.
 struct DenseBank {
+    /// one past this bank's last layer (exclusive); banks tile the
+    /// non-primary layer ranges in order
+    end: usize,
     dev: i32,
     /// first layer owned by dev (layers split contiguously)
     first: usize,
@@ -154,13 +157,36 @@ struct DenseBank {
 }
 
 impl DenseBank {
-    fn new(m: &Model) -> Result<Option<DenseBank>> {
+    /// One bank per contiguous non-primary ownership range. A 3+ card
+    /// plan needs a bank per device: the eval buffers live on the card
+    /// running the layers, so a single bank could only ever serve one
+    /// secondary (it used to, and a 3-card plan died at
+    /// cudaDeviceSynchronize launching kernels on the wrong device).
+    fn all(m: &Model) -> Result<Vec<DenseBank>> {
+        let primary = kernels::get_device();
+        let n_layers = m.layers.len();
+        let mut out = Vec::new();
+        let mut il = 0usize;
+        while il < n_layers {
+            if m.layer_dev(il) == primary {
+                il += 1;
+                continue;
+            }
+            let d = m.layer_dev(il);
+            let mut end = il + 1;
+            while end < n_layers && m.layer_dev(end) == d {
+                end += 1;
+            }
+            out.push(DenseBank::one(m, il, end)?);
+            il = end;
+        }
+        Ok(out)
+    }
+
+    fn one(m: &Model, first: usize, end: usize) -> Result<DenseBank> {
+        let primary = kernels::get_device();
         let s = m.shape;
         let primary = kernels::get_device();
-        let Some(first) = m.layers.iter().enumerate().position(|(il, _)| m.layer_dev(il) != primary)
-        else {
-            return Ok(None);
-        };
         let dev = m.layer_dev(first);
         let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
         let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
@@ -175,6 +201,7 @@ impl DenseBank {
         let b = DenseBank {
             dev,
             first,
+            end,
             cur: f32s(T_MAX * n_embd)?,
             normed: f32s(T_MAX * n_embd)?,
             attn_out: f32s(T_MAX * n_embd)?,
@@ -205,7 +232,7 @@ impl DenseBank {
             gate: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
         };
         kernels::set_device(primary)?;
-        Ok(Some(b))
+        Ok(b)
     }
 
     /// Exchange the eval buffers with State/Qwen35Rt (call with the bank
@@ -310,7 +337,7 @@ struct TpBank {
 pub(super) struct Qwen35Rt {
     states: Vec<Option<GdnState>>,
     /// dense-split second-card buffers (None single-card)
-    bank: Option<DenseBank>,
+    banks: Vec<DenseBank>,
     /// CUDA graphs for GDN layer runs, keyed by (rows, first layer).
     /// GDN layers have no position inputs (recurrent state, no rope/KV)
     /// and the dense path is pure kernel launches, so a run's chain is
@@ -373,7 +400,7 @@ impl Qwen35Rt {
             }
         }
         kernels::set_device(primary)?;
-        let bank = DenseBank::new(m)?;
+        let banks = DenseBank::all(m)?;
         let f32s = |n: usize| DeviceBuf::alloc(n * 4);
         let graphs_on = std::env::var("PULSAR_GRAPHS").ok().as_deref() != Some("0")
             && m.layers.iter().any(|l| matches!(l.ffn, super::Ffn::DenseKq { .. }));
@@ -459,7 +486,7 @@ impl Qwen35Rt {
             None => None,
         };
         Ok(Qwen35Rt {
-            bank,
+            banks,
             graphs: std::collections::HashMap::new(),
             graphs_on,
             tpb,
@@ -591,7 +618,7 @@ impl Qwen35Rt {
         // producer-current ordering trick as the residual hop).
         let mut stage2 = Vec::new();
         let mut bank_rb = None;
-        if let Some(b) = &self.bank {
+        if let Some(b) = self.banks.first() {
             let prev = kernels::get_device();
             for (slot, &il) in layer_ids.iter().enumerate() {
                 if il >= b.first {
@@ -627,7 +654,11 @@ impl Qwen35Rt {
                     // snapshots/stashes copy_d2d against the layer's GDN
                     // state, so they must live on the layer's OWNER card
                     // (plain cudaMemcpy cannot cross devices without P2P)
-                    let bank_dev = self.bank.as_ref().filter(|b| il >= b.first).map(|b| b.dev);
+                    let bank_dev = self
+                        .banks
+                        .iter()
+                        .find(|b| il >= b.first && il < b.end)
+                        .map(|b| b.dev);
                     if let Some(d) = bank_dev {
                         kernels::set_device(d)?;
                     }
@@ -1046,8 +1077,8 @@ impl Model {
         // chunked batched forward; `rows` logits must come from ONE
         // final chunk (callers keep verify blocks <= T_MAX)
         let primary = kernels::get_device();
-        let mut bank = rt.bank.take();
-        let n0 = bank.as_ref().map_or(self.layers.len(), |b| b.first);
+        let mut banks = std::mem::take(&mut rt.banks);
+        let n0 = banks.first().map_or(self.layers.len(), |b| b.first);
         let mut pos = pos0;
         let mut last_t = 0u32;
         let mut run = |st: &mut State, rt: &mut Qwen35Rt, chunk: &[u32], pos: u32| -> Result {
@@ -1066,19 +1097,31 @@ impl Model {
             }
             kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, t)?;
             self.eval_qwen35_span(st, rt, 0, n0, pos, t)?;
-            if let Some(b) = &mut bank {
-                // hop 1: residual over to the second card (issued with
+            let n_banks = banks.len();
+            for bi in 0..n_banks {
+                let b = &mut banks[bi];
+                let (bfirst, bend) = (b.first, b.end);
+                // hop 1: residual over to this bank's card (issued with
                 // the producer current, so the consumer's launches order
-                // after it), then run its layers on its own buffers
+                // after it), then run its layers on its own buffers.
+                // With several banks the residual returns to the primary
+                // between them - one extra hop per boundary, which is
+                // cheap next to a layer range and keeps every span's
+                // buffers on the card that runs it.
                 let bytes = (t * s.n_embd) as usize * 4;
                 kernels::copy_across(&mut b.cur, &st.cur, bytes)?;
                 b.swap(st, rt);
                 kernels::set_device(b.dev)?;
-                self.eval_qwen35_span(st, rt, n0, self.layers.len(), pos, t)?;
-                // hop 2 back: after the swap b.cur is the card-1 buffer
+                self.eval_qwen35_span(st, rt, bfirst, bend, pos, t)?;
+                // hop 2 back: after the swap b.cur is the bank-side buffer
                 // holding the final residual
+                let b = &mut banks[bi];
                 b.swap(st, rt);
                 kernels::copy_across(&mut st.cur, &b.cur, bytes)?;
+                if bi + 1 < n_banks {
+                    kernels::set_device(kernels::primary_device())?;
+                    continue;
+                }
                 // dflash second-span captures: bounce to the primary while
                 // the producer card is still current (same ordering trick
                 // as the residual hop), scatter once back on the primary
@@ -1112,7 +1155,7 @@ impl Model {
             pos += chunk.len() as u32;
             last_t = chunk.len() as u32;
         }
-        rt.bank = bank;
+        rt.banks = banks;
         if rows == 0 {
             return Ok(None);
         }

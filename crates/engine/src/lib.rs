@@ -3399,36 +3399,6 @@ mod real {
                     }
                     i += take;
                 }
-                // DenseBank (real/qwen35.rs) holds exactly ONE secondary:
-                // it takes dev = layer_dev(first non-primary layer) and
-                // runs every remaining layer there, so a plan touching two
-                // secondaries launches kernels on the wrong device and dies
-                // at cudaDeviceSynchronize. Collapse any such plan onto the
-                // first secondary until the forward grows a bank per device.
-                // ponytail: this is the guard, not the fix - the fix is a
-                // Vec<DenseBank> with a hop at each ownership boundary,
-                // which is what a 3+ card rig needs to spread KV.
-                let used: Vec<i32> = {
-                    let mut u: Vec<i32> = Vec::new();
-                    for &d in layer_dev.iter() {
-                        if d != primary && !u.contains(&d) {
-                            u.push(d);
-                        }
-                    }
-                    u
-                };
-                if used.len() > 1 {
-                    eprintln!(
-                        "pulsar: dense split spans {} secondaries but the forward supports 1; collapsing onto device {}",
-                        used.len(),
-                        used[0]
-                    );
-                    for d in layer_dev.iter_mut() {
-                        if *d != primary {
-                            *d = used[0];
-                        }
-                    }
-                }
                 let b0: u64 = lbytes[..n0].iter().sum();
                 eprintln!(
                     "pulsar: dense split: layers 0..{n0} on device {primary} ({:.1}GiB)",
