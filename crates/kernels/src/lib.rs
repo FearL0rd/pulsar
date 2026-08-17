@@ -1138,8 +1138,16 @@ mod real {
         unsafe { pulsar_cc_major() }
     }
 
-    /// f32 -> NVFP4, in the same block format the weights ship in, so both
-    /// GEMM operands can feed the tensor core as raw 32-bit loads.
+    /// Bytes an NVFP4 activation buffer needs. Rows round up to a whole
+    /// octet: the GEMM reads 8 tokens per tile, and the quantizer fills
+    /// the padding by repeating the last real token.
+    pub fn nvfp4_act_bytes(in_dim: u32, n_tok: u32) -> usize {
+        (((n_tok + 7) & !7) as usize) * (in_dim as usize / 256) * NVFP4_SB_BYTES
+    }
+
+    /// f32 -> NVFP4. Same 4-bit encoding as the weights but an
+    /// octet-major tile, so a warp's B fragment is one contiguous
+    /// region; see PULSAR_NVFP4_ACT_TILE in the kernels.
     pub fn quantize_nvfp4(out: &mut DeviceBuf, x: &DeviceBuf, in_dim: u32, n_rows: u32) -> Result {
         check(unsafe { pulsar_quantize_nvfp4(out.ptr_mut(), x.ptr(), in_dim, n_rows) }, "quantize_nvfp4")
     }
@@ -1837,12 +1845,29 @@ mod tests {
             .collect();
         let mut xf = DeviceBuf::alloc(x.len() * 4).unwrap();
         xf.write(0, as_bytes(&x)).unwrap();
-        let abytes = n_tok as usize * rb;
+        let abytes = nvfp4_act_bytes(in_dim, n_tok);
         let mut xq = DeviceBuf::alloc(abytes).unwrap();
         quantize_nvfp4(&mut xq, &xf, in_dim, n_tok).unwrap();
         sync().unwrap();
         let mut aq = vec![0u8; abytes];
         xq.read(0, &mut aq).unwrap();
+        // activations land octet-major; rebuild the plain per-token
+        // layout so one decoder serves both operands
+        let mut aplain = vec![0u8; n_tok as usize * rb];
+        for t in 0..n_tok as usize {
+            let (o, r) = (t / 8, t % 8);
+            for sb in 0..blocks {
+                for kb in 0..4 {
+                    let src = (o * blocks + sb) * 1152 + kb * 288;
+                    let dst = t * rb + sb * 144 + kb * 36;
+                    aplain[dst..dst + 4]
+                        .copy_from_slice(&aq[src + 256 + r * 4..src + 260 + r * 4]);
+                    aplain[dst + 4..dst + 36]
+                        .copy_from_slice(&aq[src + r * 32..src + r * 32 + 32]);
+                }
+            }
+        }
+        let aq = aplain;
 
         // the quantizer stands on its own: e2m1 with a scale of absmax/6
         // cannot err by more than about absmax/6 anywhere
@@ -1925,7 +1950,7 @@ mod tests {
         xf.write(0, as_bytes(&x)).unwrap();
 
         let mut x8 = DeviceBuf::alloc(n_tok as usize * blocks * Q8_K_BLOCK_BYTES).unwrap();
-        let mut x4 = DeviceBuf::alloc(n_tok as usize * rb).unwrap();
+        let mut x4 = DeviceBuf::alloc(nvfp4_act_bytes(in_dim, n_tok)).unwrap();
         let mut out = DeviceBuf::alloc((n_tok * out_dim) as usize * 4).unwrap();
 
         let iters = 50;

@@ -4164,6 +4164,15 @@ __global__ static void matmul_kq_gemm_nvfp4(
  * TOPS here against 105 for the int8 m16n8k16 path this replaces. */
 #define PULSAR_NVFP4_SB_BYTES  144u   /* 256 values: 4 blocks x 36B */
 #define PULSAR_NVFP4_BLK_BYTES  36u   /* 64 values: 4 scales + 32 nibble */
+/* Activations use the same 4-bit encoding but an octet-major tile: per
+ * 8 tokens and superblock, four k-blocks of [8 rows x 32 nibble bytes]
+ * then [8 scale words]. A warp's whole B fragment is then one
+ * contiguous 288-byte region instead of eight rows 2304B apart, which
+ * is the difference between 8 cache lines per load and 2. Weights keep
+ * the on-disk layout; only activations, which we quantize ourselves,
+ * are free to be reordered. */
+#define PULSAR_NVFP4_ACT_TILE 1152u   /* 8 tokens x one 144B superblock */
+#define PULSAR_NVFP4_ACT_BLK   288u   /* 8x32 nibble bytes + 8 scale words */
 
 #if defined(__CUDA_ARCH_FEAT_SM120_ALL)
 /* arch-specific: plain sm_120 rejects .kind::mxf4nvf4 outright */
@@ -4225,27 +4234,34 @@ __device__ __forceinline__ static uint32_t e2m1_encode(float x) {
  * scale (it factors out of the mma as a per-column constant) if a model
  * ever trips it. */
 __global__ static void nvfp4_quantize_kernel(
-        uint8_t *out, const float *x, uint32_t in_dim, uint32_t n_sub) {
+        uint8_t *out, const float *x, uint32_t in_dim, uint32_t n_sub,
+        uint32_t n_rows) {
     const uint32_t sub = blockIdx.x * blockDim.x + threadIdx.x;
     if (sub >= n_sub) return;
-    const float *src = x + (uint64_t)blockIdx.y * in_dim + (uint64_t)sub * 16u;
+    /* rows round up to a whole octet; padding rows re-quantize the last
+     * real token rather than being left uninitialized, so no stale 0x7F
+     * can reach the mma as a NaN scale */
+    const uint32_t t = blockIdx.y;
+    const uint32_t src_row = t < n_rows ? t : n_rows - 1u;
+    const float *src = x + (uint64_t)src_row * in_dim + (uint64_t)sub * 16u;
 
     float amax = 0.0f;
     #pragma unroll
     for (int i = 0; i < 16; i++) amax = fmaxf(amax, fabsf(src[i]));
 
     const uint8_t e = e4m3_encode(amax * (1.0f / 6.0f));
-    uint8_t *dst = out
-            + (uint64_t)blockIdx.y * ((uint64_t)(in_dim / 256u) * PULSAR_NVFP4_SB_BYTES)
-            + (uint64_t)(sub >> 4) * PULSAR_NVFP4_SB_BYTES
-            + ((sub >> 2) & 3u) * PULSAR_NVFP4_BLK_BYTES;
-    dst[sub & 3u] = e;
+    const uint32_t sb = sub >> 4, kb = (sub >> 2) & 3u, sq = sub & 3u;
+    const uint32_t o = t >> 3, r = t & 7u;
+    uint8_t *base = out
+            + ((uint64_t)o * (in_dim / 256u) + sb) * PULSAR_NVFP4_ACT_TILE
+            + (uint64_t)kb * PULSAR_NVFP4_ACT_BLK;
+    base[256u + r * 4u + sq] = e;
 
     /* ue4m3_half carries the *0.5 that compensates the doubled codebook;
      * the hardware uses the true e2m1 values, so undo it here */
     const float dec = ue4m3_half(e) * 2.0f;
     const float inv = dec > 0.0f ? 1.0f / dec : 0.0f;
-    uint8_t *q = dst + 4u + (sub & 3u) * 8u;
+    uint8_t *q = base + r * 32u + sq * 8u;
     #pragma unroll
     for (int i = 0; i < 8; i++)
         q[i] = (uint8_t)(e2m1_encode(src[i] * inv)
@@ -4291,10 +4307,11 @@ __global__ static void matmul_nvfp4_a4_kernel(
     const uint32_t tb = tok0 + warp * 16u;
     /* clamped, not NULL: B rides an always-valid row so the inner loop
      * carries no guard; out-of-range tokens only skip the store */
-    const uint32_t t_b0 = tb + g < n_tok ? tb + g : n_tok - 1u;
-    const uint32_t t_b1 = tb + 8u + g < n_tok ? tb + 8u + g : n_tok - 1u;
-    const char *yb0 = xq + (uint64_t)t_b0 * in_blocks * PULSAR_NVFP4_SB_BYTES;
-    const char *yb1 = xq + (uint64_t)t_b1 * in_blocks * PULSAR_NVFP4_SB_BYTES;
+    const uint32_t n_oct = (n_tok + 7u) >> 3;
+    const uint32_t o0 = (tb >> 3) < n_oct ? (tb >> 3) : n_oct - 1u;
+    const uint32_t o1 = ((tb + 8u) >> 3) < n_oct ? ((tb + 8u) >> 3) : n_oct - 1u;
+    const char *yb0 = xq + (uint64_t)o0 * in_blocks * PULSAR_NVFP4_ACT_TILE;
+    const char *yb1 = xq + (uint64_t)o1 * in_blocks * PULSAR_NVFP4_ACT_TILE;
 
 #define PULSAR_NVFP4_STAGE(buf, sb)                                            \
     do {                                                                       \
@@ -4315,22 +4332,22 @@ __global__ static void matmul_nvfp4_a4_kernel(
     for (uint32_t sb = 0; sb < in_blocks; sb++) {
         const uint32_t cur = sb & 1u;
         if (sb + 1u < in_blocks) PULSAR_NVFP4_STAGE(cur ^ 1u, sb + 1u);
-        const char *ybs0 = yb0 + (uint64_t)sb * PULSAR_NVFP4_SB_BYTES;
-        const char *ybs1 = yb1 + (uint64_t)sb * PULSAR_NVFP4_SB_BYTES;
+        const char *ybs0 = yb0 + (uint64_t)sb * PULSAR_NVFP4_ACT_TILE;
+        const char *ybs1 = yb1 + (uint64_t)sb * PULSAR_NVFP4_ACT_TILE;
 
         #pragma unroll
         for (uint32_t kb = 0; kb < 4u; kb++) {
             /* word 0 of a block is its 4 scale bytes, words 1..8 the
              * nibbles; reg0 covers k [8l,8l+8), reg2 the same 32 later */
-            const char *blk0 = ybs0 + kb * PULSAR_NVFP4_BLK_BYTES;
-            const char *blk1 = ybs1 + kb * PULSAR_NVFP4_BLK_BYTES;
+            const char *blk0 = ybs0 + kb * PULSAR_NVFP4_ACT_BLK;
+            const char *blk1 = ybs1 + kb * PULSAR_NVFP4_ACT_BLK;
             uint32_t b0[2], b1[2];
-            b0[0] = *(const uint32_t *)(blk0 + 4u + l * 4u);
-            b0[1] = *(const uint32_t *)(blk0 + 20u + l * 4u);
-            b1[0] = *(const uint32_t *)(blk1 + 4u + l * 4u);
-            b1[1] = *(const uint32_t *)(blk1 + 20u + l * 4u);
-            const uint32_t sbw0 = *(const uint32_t *)blk0;
-            const uint32_t sbw1 = *(const uint32_t *)blk1;
+            b0[0] = *(const uint32_t *)(blk0 + g * 32u + l * 4u);
+            b0[1] = *(const uint32_t *)(blk0 + g * 32u + 16u + l * 4u);
+            b1[0] = *(const uint32_t *)(blk1 + g * 32u + l * 4u);
+            b1[1] = *(const uint32_t *)(blk1 + g * 32u + 16u + l * 4u);
+            const uint32_t sbw0 = *(const uint32_t *)(blk0 + 256u + g * 4u);
+            const uint32_t sbw1 = *(const uint32_t *)(blk1 + 256u + g * 4u);
             #pragma unroll
             for (uint32_t h = 0; h < 2u; h++) {
                 /* all four A registers in one instruction instead of
@@ -4383,9 +4400,9 @@ extern "C" int pulsar_quantize_nvfp4(
     if (in_dim == 0 || n_rows == 0) return 0;
     if (in_dim % 256u) return cuda_ok(cudaErrorInvalidValue, "nvfp4 quantize in_dim%256");
     const uint32_t n_sub = in_dim / 16u;
-    dim3 grid((n_sub + 255u) / 256u, n_rows, 1);
+    dim3 grid((n_sub + 255u) / 256u, (n_rows + 7u) & ~7u, 1);
     nvfp4_quantize_kernel<<<grid, 256>>>(
-            (uint8_t *)out_dev, (const float *)x_dev, in_dim, n_sub);
+            (uint8_t *)out_dev, (const float *)x_dev, in_dim, n_sub, n_rows);
     return cuda_ok(cudaGetLastError(), "nvfp4 quantize launch");
 }
 
