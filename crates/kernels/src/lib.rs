@@ -106,6 +106,9 @@ mod real {
         fn pulsar_add(out: *mut c_void, a: *const c_void, b: *const c_void, n: u32) -> i32;
         fn pulsar_router_select(selected: *mut c_void, weights: *mut c_void, logits: *const c_void, bias: *const c_void, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32, softmax_mode: u32, n_shexp: u32) -> i32;
         fn pulsar_quantize_q8_K(out: *mut c_void, x: *const c_void, in_dim: u32, n_rows: u32) -> i32;
+        fn pulsar_quantize_nvfp4(out: *mut c_void, x: *const c_void, in_dim: u32, n_rows: u32) -> i32;
+        fn pulsar_matmul_nvfp4_a4(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64) -> i32;
+        fn pulsar_cc_major() -> i32;
         fn pulsar_moe_pair_swiglu(mid: *mut c_void, ptrs: *const c_void, weights: *const c_void, x: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32, act_op: u32) -> i32;
         fn pulsar_moe_down(out: *mut c_void, ptrs: *const c_void, mid: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
         fn pulsar_moe_pair_swiglu_grouped(mid: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, weights: *const c_void, xq: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32, act_op: u32) -> i32;
@@ -1125,6 +1128,29 @@ mod real {
         check(unsafe { pulsar_quantize_q8_K(out.ptr_mut(), x.ptr(), in_dim, n_rows) }, "quantize_q8_k")
     }
 
+    /// Bytes per 256 values of NVFP4: 4 blocks of (4 ue4m3 scales + 32
+    /// nibble bytes). One block is exactly one m16n8k64 mma.
+    pub const NVFP4_SB_BYTES: usize = 144;
+
+    /// Compute-capability major of the current device. 12 is Blackwell,
+    /// the only tier carrying the FP4 tensor ops.
+    pub fn cc_major() -> i32 {
+        unsafe { pulsar_cc_major() }
+    }
+
+    /// f32 -> NVFP4, in the same block format the weights ship in, so both
+    /// GEMM operands can feed the tensor core as raw 32-bit loads.
+    pub fn quantize_nvfp4(out: &mut DeviceBuf, x: &DeviceBuf, in_dim: u32, n_rows: u32) -> Result {
+        check(unsafe { pulsar_quantize_nvfp4(out.ptr_mut(), x.ptr(), in_dim, n_rows) }, "quantize_nvfp4")
+    }
+
+    /// W4A4 prefill GEMM on Blackwell tensor cores: NVFP4 on both sides
+    /// with hardware per-16 block scaling and no dequantization at all.
+    /// Requires sm_120a; see docs/blackwell-fp4-mma.md.
+    pub fn matmul_nvfp4_a4(out: &mut DeviceBuf, w: &DeviceBuf, xq: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64) -> Result {
+        check(unsafe { pulsar_matmul_nvfp4_a4(out.ptr_mut(), w.ptr(), xq.ptr(), in_dim, out_dim, n_tok, row_bytes) }, "matmul_nvfp4_a4")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn moe_pair_swiglu(mid: &mut DeviceBuf, ptrs: &DeviceBuf, weights: &DeviceBuf, x: &DeviceBuf, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32, act_op: u32) -> Result {
         check(
@@ -1743,6 +1769,122 @@ mod tests {
         // greedy-ids equality at the engine level is the hard gate.
         assert!(worst < 2e-3, "{name} gemm diverges from the grouped path: {worst}");
         }
+    }
+
+    /// The FP4 GEMM is checked against a CPU decode of the very same
+    /// bytes the hardware reads, so a wrong fragment layout or a
+    /// misrouted scale lane shows up as a gross mismatch rather than
+    /// hiding under a tolerance. Skips on non-Blackwell devices.
+    #[test]
+    fn nvfp4_a4_gemm_matches_reference() {
+        use super::*;
+        if cc_major() < 12 {
+            eprintln!("nvfp4 a4: needs sm_120a, device is cc {}", cc_major());
+            return;
+        }
+        fn e2m1(c: u8) -> f32 {
+            const M: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+            let v = M[(c & 7) as usize];
+            if c & 8 != 0 { -v } else { v }
+        }
+        fn ue4m3(x: u8) -> f32 {
+            if x == 0 || x == 0x7F { return 0.0; }
+            let e = ((x >> 3) & 0xF) as i32;
+            let m = (x & 7) as f32;
+            if e == 0 { m * 2f32.powi(-9) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) }
+        }
+        // 36B block: 4 scale bytes then 32 nibble bytes, low nibbles
+        // values 0..7 of a 16-value sub-block and high nibbles 8..15
+        fn decode(bytes: &[u8], n: usize) -> Vec<f32> {
+            let mut out = vec![0f32; n];
+            for sb in 0..n / 256 {
+                for b in 0..4 {
+                    let base = sb * 144 + b * 36;
+                    for s in 0..4 {
+                        let sc = ue4m3(bytes[base + s]);
+                        for i in 0..8 {
+                            let by = bytes[base + 4 + s * 8 + i];
+                            out[sb * 256 + b * 64 + s * 16 + i] = e2m1(by & 0xF) * sc;
+                            out[sb * 256 + b * 64 + s * 16 + i + 8] = e2m1(by >> 4) * sc;
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        let in_dim = 512u32;
+        let out_dim = 96u32;
+        let n_tok = 70u32; // deliberately not a multiple of 64: tail path
+        let blocks = (in_dim / 256) as usize;
+        let rb = blocks * NVFP4_SB_BYTES;
+
+        let mut host: Vec<u8> = (0..out_dim as usize * rb)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        // pin every scale byte finite and nonzero: 0 is a zero block and
+        // 0x7F is NaN in hardware even though ggml reads it as zero
+        for b in 0..out_dim as usize * blocks * 4 {
+            for s in 0..4 {
+                host[b * 36 + s] = 0x30 + ((b + s) % 12) as u8;
+            }
+        }
+        let mut w = DeviceBuf::alloc(host.len()).unwrap();
+        w.write(0, &host).unwrap();
+
+        let x: Vec<f32> = (0..(in_dim * n_tok) as usize)
+            .map(|i| ((i * 37) % 97) as f32 * 0.01 - 0.5)
+            .collect();
+        let mut xf = DeviceBuf::alloc(x.len() * 4).unwrap();
+        xf.write(0, as_bytes(&x)).unwrap();
+        let abytes = n_tok as usize * rb;
+        let mut xq = DeviceBuf::alloc(abytes).unwrap();
+        quantize_nvfp4(&mut xq, &xf, in_dim, n_tok).unwrap();
+        sync().unwrap();
+        let mut aq = vec![0u8; abytes];
+        xq.read(0, &mut aq).unwrap();
+
+        // the quantizer stands on its own: e2m1 with a scale of absmax/6
+        // cannot err by more than about absmax/6 anywhere
+        let adec = decode(&aq, (in_dim * n_tok) as usize);
+        for t in 0..n_tok as usize {
+            for sub in 0..(in_dim / 16) as usize {
+                let o = t * in_dim as usize + sub * 16;
+                let amax = (0..16).fold(0f32, |m, i| m.max(x[o + i].abs()));
+                for i in 0..16 {
+                    let e = (adec[o + i] - x[o + i]).abs();
+                    assert!(e <= 0.25 * amax + 1e-6,
+                        "nvfp4 quantize err {e} at t{t} sub{sub} i{i} (amax {amax})");
+                }
+            }
+        }
+
+        let wdec = decode(&host, out_dim as usize * in_dim as usize);
+        let mut want = vec![0f32; (n_tok * out_dim) as usize];
+        for t in 0..n_tok as usize {
+            for r in 0..out_dim as usize {
+                let mut acc = 0f64;
+                for k in 0..in_dim as usize {
+                    acc += (wdec[r * in_dim as usize + k] * adec[t * in_dim as usize + k]) as f64;
+                }
+                want[t * out_dim as usize + r] = acc as f32;
+            }
+        }
+
+        let mut out = DeviceBuf::alloc((n_tok * out_dim) as usize * 4).unwrap();
+        matmul_nvfp4_a4(&mut out, &w, &xq, in_dim, out_dim, n_tok, rb as u64).unwrap();
+        sync().unwrap();
+        let got = out.read_f32((n_tok * out_dim) as usize).unwrap();
+
+        let mut worst = 0f32;
+        for i in 0..got.len() {
+            let d = (got[i] - want[i]).abs() / want[i].abs().max(1.0);
+            if d > worst { worst = d; }
+        }
+        eprintln!("nvfp4 a4 gemm vs cpu decode: worst rel diff {worst:.2e}");
+        // both sides sum the identical decoded values, so only f32
+        // accumulation order differs; a layout bug measures in percent
+        assert!(worst < 1e-4, "nvfp4 a4 gemm diverges from the decode: {worst}");
     }
 
     /// cargo test --release -p kernels kq_gemm_bench -- --ignored --nocapture

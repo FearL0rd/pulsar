@@ -4152,6 +4152,229 @@ __global__ static void matmul_kq_gemm_nvfp4(
     }
 }
 
+
+/* ---- native Blackwell FP4 path (W4A4) ------------------------------
+ * docs/blackwell-fp4-mma.md records the measured semantics this rests
+ * on. One 36-byte NVFP4 block is 64 values carrying four ue4m3 scales,
+ * which is exactly one m16n8k64 mma with scale_vec::4X, so weights feed
+ * the tensor core straight from the file: no dequant, no lookup table.
+ * A matmul does not care what order it sums k in, so quantizing
+ * activations into the SAME block format makes both operands raw 32-bit
+ * loads and no nibble shuffle is needed on either side. Measured 419
+ * TOPS here against 105 for the int8 m16n8k16 path this replaces. */
+#define PULSAR_NVFP4_SB_BYTES  144u   /* 256 values: 4 blocks x 36B */
+#define PULSAR_NVFP4_BLK_BYTES  36u   /* 64 values: 4 scales + 32 nibble */
+
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL)
+/* arch-specific: plain sm_120 rejects .kind::mxf4nvf4 outright */
+__device__ __forceinline__ static void mma_nvfp4_16x8x64(
+        float d[4], const uint32_t a[4], const uint32_t b[2],
+        uint32_t sa, uint32_t sb) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale."
+        "scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, "
+        "%10, {0, 0}, %11, {0, 0};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb));
+}
+#endif
+
+/* OCP e4m3 with the sign bit unused, matching ue4m3_half's decode. 0x7F
+ * is NaN in hardware (ggml reads it as zero), so the encoder never emits
+ * it: the top finite code is 0x7E = 448. */
+__device__ __forceinline__ static uint8_t e4m3_encode(float s) {
+    if (!(s > 0.0f)) return 0;
+    if (s >= 448.0f) return 0x7E;
+    if (s < ldexpf(1.0f, -9)) return 0;
+    int e;
+    const float m = frexpf(s, &e);          /* s = m * 2^e, m in [0.5,1) */
+    int E = e - 1 + 7;
+    int M = (int)rintf((2.0f * m - 1.0f) * 8.0f);
+    if (M == 8) { M = 0; E++; }
+    if (E <= 0) {                            /* subnormal: s = man * 2^-9 */
+        int man = (int)rintf(ldexpf(s, 9));
+        return (uint8_t)(man > 7 ? 7 : man);
+    }
+    if (E > 15) { E = 15; M = 6; }
+    if (E == 15 && M > 6) M = 6;
+    return (uint8_t)((E << 3) | M);
+}
+
+/* nearest e2m1 code; magnitudes {0,.5,1,1.5,2,3,4,6}, bit 3 is sign */
+__device__ __forceinline__ static uint32_t e2m1_encode(float x) {
+    const float a = fabsf(x);
+    uint32_t c;
+    if (a < 0.25f) c = 0;
+    else if (a < 0.75f) c = 1;
+    else if (a < 1.25f) c = 2;
+    else if (a < 1.75f) c = 3;
+    else if (a < 2.5f) c = 4;
+    else if (a < 3.5f) c = 5;
+    else if (a < 5.0f) c = 6;
+    else c = 7;
+    return (x < 0.0f ? 8u : 0u) | c;
+}
+
+/* f32 -> NVFP4 in the identical block format the weights ship in, one
+ * thread per 16-value sub-block. Scales are absolute (the format carries
+ * no per-tensor factor), so a window whose absmax exceeds 6*448 = 2688
+ * saturates.
+ * ponytail: saturation is fine for hidden states; add a per-token global
+ * scale (it factors out of the mma as a per-column constant) if a model
+ * ever trips it. */
+__global__ static void nvfp4_quantize_kernel(
+        uint8_t *out, const float *x, uint32_t in_dim, uint32_t n_sub) {
+    const uint32_t sub = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sub >= n_sub) return;
+    const float *src = x + (uint64_t)blockIdx.y * in_dim + (uint64_t)sub * 16u;
+
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) amax = fmaxf(amax, fabsf(src[i]));
+
+    const uint8_t e = e4m3_encode(amax * (1.0f / 6.0f));
+    uint8_t *dst = out
+            + (uint64_t)blockIdx.y * ((uint64_t)(in_dim / 256u) * PULSAR_NVFP4_SB_BYTES)
+            + (uint64_t)(sub >> 4) * PULSAR_NVFP4_SB_BYTES
+            + ((sub >> 2) & 3u) * PULSAR_NVFP4_BLK_BYTES;
+    dst[sub & 3u] = e;
+
+    /* ue4m3_half carries the *0.5 that compensates the doubled codebook;
+     * the hardware uses the true e2m1 values, so undo it here */
+    const float dec = ue4m3_half(e) * 2.0f;
+    const float inv = dec > 0.0f ? 1.0f / dec : 0.0f;
+    uint8_t *q = dst + 4u + (sub & 3u) * 8u;
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        q[i] = (uint8_t)(e2m1_encode(src[i] * inv)
+                         | (e2m1_encode(src[i + 8] * inv) << 4));
+}
+
+/* Same block/warp shape as the int8 prefill GEMM: 32 rows x 64 tokens,
+ * 8 warps each owning one token octet, which is exactly the mma's n=8.
+ * The smem stage is now a pure copy - no dequant - and a 36-word row
+ * stride lands lane (g,l) on bank g*4+l, so all 32 banks stay distinct. */
+__global__ static void matmul_nvfp4_a4_kernel(
+        float *out,
+        const char *w,
+        const char *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL)
+    const uint32_t r0 = blockIdx.x * 32u;
+    const uint32_t tok0 = blockIdx.y * 64u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t g = lane >> 2u;   /* fragment row / B column */
+    const uint32_t l = lane & 3u;    /* k quad / D column pair */
+
+    __shared__ uint32_t a_s[2][32][36];
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    const uint32_t tb = tok0 + warp * 8u;
+    /* clamped, not NULL: B rides an always-valid row so the inner loop
+     * carries no guard; out-of-range tokens only skip the store */
+    const uint32_t t_b = tb + g < n_tok ? tb + g : n_tok - 1u;
+    const char *yb = xq + (uint64_t)t_b * in_blocks * PULSAR_NVFP4_SB_BYTES;
+
+#define PULSAR_NVFP4_STAGE(buf, sb)                                            \
+    do {                                                                       \
+        for (uint32_t i = threadIdx.x; i < 32u * 36u; i += 256u) {             \
+            const uint32_t r = i / 36u, wd = i - r * 36u;                      \
+            const uint32_t rg = r0 + r < out_dim ? r0 + r : out_dim - 1u;      \
+            a_s[buf][r][wd] = *(const uint32_t *)(w + (uint64_t)rg * row_bytes \
+                    + (uint64_t)(sb) * PULSAR_NVFP4_SB_BYTES + wd * 4u);       \
+        }                                                                      \
+    } while (0)
+
+    PULSAR_NVFP4_STAGE(0u, 0u);
+    __syncthreads();
+
+    for (uint32_t sb = 0; sb < in_blocks; sb++) {
+        const uint32_t cur = sb & 1u;
+        if (sb + 1u < in_blocks) PULSAR_NVFP4_STAGE(cur ^ 1u, sb + 1u);
+        const char *ybs = yb + (uint64_t)sb * PULSAR_NVFP4_SB_BYTES;
+
+        #pragma unroll
+        for (uint32_t kb = 0; kb < 4u; kb++) {
+            /* word 0 of a block is its 4 scale bytes, words 1..8 the
+             * nibbles; reg0 covers k [8l,8l+8), reg2 the same 32 later */
+            const char *blk = ybs + kb * PULSAR_NVFP4_BLK_BYTES;
+            uint32_t b[2];
+            b[0] = *(const uint32_t *)(blk + 4u + l * 4u);
+            b[1] = *(const uint32_t *)(blk + 20u + l * 4u);
+            const uint32_t sbw = *(const uint32_t *)blk;
+            #pragma unroll
+            for (uint32_t h = 0; h < 2u; h++) {
+                const uint32_t rg = 16u * h + g;
+                uint32_t a[4];
+                a[0] = a_s[cur][rg][kb * 9u + 1u + l];
+                a[1] = a_s[cur][rg + 8u][kb * 9u + 1u + l];
+                a[2] = a_s[cur][rg][kb * 9u + 5u + l];
+                a[3] = a_s[cur][rg + 8u][kb * 9u + 5u + l];
+                /* row r's scales come from lane (r&7)*4 + (r>>3), i.e.
+                 * this lane feeds row g + 8l and only l < 2 is read;
+                 * l&1 keeps the index in range for the l >= 2 lanes */
+                const uint32_t saw = a_s[cur][16u * h + g + 8u * (l & 1u)][kb * 9u];
+                mma_nvfp4_16x8x64(&acc[4u * h], a, b, saw, sbw);
+            }
+        }
+        __syncthreads();
+    }
+#undef PULSAR_NVFP4_STAGE
+
+    #pragma unroll
+    for (uint32_t h = 0; h < 2u; h++) {
+        const uint32_t rg0 = r0 + 16u * h + g, rg8 = rg0 + 8u;
+        const uint32_t t0 = tb + l * 2u, t1 = t0 + 1u;
+        if (t0 < n_tok) {
+            if (rg0 < out_dim) out[(uint64_t)t0 * out_dim + rg0] = acc[4u * h + 0u];
+            if (rg8 < out_dim) out[(uint64_t)t0 * out_dim + rg8] = acc[4u * h + 2u];
+        }
+        if (t1 < n_tok) {
+            if (rg0 < out_dim) out[(uint64_t)t1 * out_dim + rg0] = acc[4u * h + 1u];
+            if (rg8 < out_dim) out[(uint64_t)t1 * out_dim + rg8] = acc[4u * h + 3u];
+        }
+    }
+#else
+    (void)out; (void)w; (void)xq; (void)in_blocks;
+    (void)out_dim; (void)n_tok; (void)row_bytes;
+#endif
+}
+
+/* exposed so the Rust selftest can skip on non-Blackwell devices */
+extern "C" int pulsar_cc_major(void) { return pulsar_device_cc_major(); }
+
+extern "C" int pulsar_quantize_nvfp4(
+        void *out_dev, const void *x_dev, uint32_t in_dim, uint32_t n_rows) {
+    if (in_dim == 0 || n_rows == 0) return 0;
+    if (in_dim % 256u) return cuda_ok(cudaErrorInvalidValue, "nvfp4 quantize in_dim%256");
+    const uint32_t n_sub = in_dim / 16u;
+    dim3 grid((n_sub + 255u) / 256u, n_rows, 1);
+    nvfp4_quantize_kernel<<<grid, 256>>>(
+            (uint8_t *)out_dev, (const float *)x_dev, in_dim, n_sub);
+    return cuda_ok(cudaGetLastError(), "nvfp4 quantize launch");
+}
+
+extern "C" int pulsar_matmul_nvfp4_a4(
+        void *out_dev, const void *w_dev, const void *xq_dev,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok, uint64_t row_bytes) {
+    if (out_dim == 0 || n_tok == 0) return 0;
+    if (in_dim % 256u) return cuda_ok(cudaErrorInvalidValue, "nvfp4 a4 in_dim%256");
+    if (pulsar_device_cc_major() < 12)
+        return cuda_ok(cudaErrorNotSupported, "nvfp4 a4 needs sm_120a");
+    dim3 grid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
+    matmul_nvfp4_a4_kernel<<<grid, 256>>>(
+            (float *)out_dev, (const char *)w_dev, (const char *)xq_dev,
+            in_dim / 256u, out_dim, n_tok, row_bytes);
+    return cuda_ok(cudaGetLastError(), "matmul_nvfp4_a4 launch");
+}
+
 extern "C" int pulsar_matmul_kq(
         void *out_dev,
         const void *w_dev,

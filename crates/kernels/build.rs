@@ -27,6 +27,18 @@ fn main() {
         .unwrap_or_else(|_| default_archs());
     let mut build = cc::Build::new();
     build.cuda(true).flag("-O3").flag("--use_fast_math");
+    // Point PATH at that toolkit rather than calling build.compiler():
+    // cc-rs resolves "nvcc" itself and rewrites host flags like -fPIC
+    // into -Xcompiler form for it, and an explicit compiler path loses
+    // that translation (nvcc then rejects -fPIC outright).
+    let nv = nvcc();
+    if nv.contains('/') {
+        if let Some(dir) = std::path::Path::new(&nv).parent() {
+            let old = std::env::var("PATH").unwrap_or_default();
+            std::env::set_var("PATH", format!("{}:{old}", dir.display()));
+        }
+    }
+    println!("cargo:warning=pulsar kernels: {} archs [{}]", nvcc(), archs.join(","));
     // Per-thread default stream: <<<>>> launches go to the calling
     // thread's stream instead of the legacy NULL stream, which makes
     // them CAPTURABLE into CUDA graphs (the legacy stream cannot begin
@@ -74,7 +86,7 @@ fn default_archs() -> Vec<String> {
     // (measured neutral for the current kernels, but it is the
     // precondition for any FP4 path).
     let requested = ["61", "75", "80", "86", "89", "120a"];
-    let output = std::process::Command::new("nvcc")
+    let output = std::process::Command::new(nvcc())
         .arg("--list-gpu-arch")
         .output();
     let supported = match output {
@@ -86,9 +98,11 @@ fn default_archs() -> Vec<String> {
         _ => return requested.iter().map(|arch| (*arch).into()).collect(),
     };
 
+    // --list-gpu-arch reports only compute_120, never compute_120a, so
+    // match on the numeric stem and keep the suffix.
     let filtered = requested
         .iter()
-        .filter(|arch| supported.contains(**arch))
+        .filter(|arch| supported.contains(arch.trim_end_matches(|c: char| !c.is_ascii_digit())))
         .map(|arch| (*arch).into())
         .collect::<Vec<String>>();
     if filtered.is_empty() {
@@ -96,6 +110,23 @@ fn default_archs() -> Vec<String> {
     } else {
         filtered
     }
+}
+
+/// The nvcc to build with. PATH may hold an older toolkit than the one
+/// /usr/local/cuda points at (substrate: /usr/bin/nvcc is 12.0 while
+/// /usr/local/cuda is 13.0), and picking the wrong one silently drops
+/// every arch the older toolkit cannot name - which is how Blackwell
+/// FP4 went missing from the fatbin while the build still succeeded.
+/// build.rs already links /usr/local/cuda/lib64, so prefer its nvcc.
+fn nvcc() -> String {
+    if let Ok(env) = std::env::var("PULSAR_NVCC") {
+        return env;
+    }
+    let cuda = "/usr/local/cuda/bin/nvcc";
+    if std::path::Path::new(cuda).exists() {
+        return cuda.into();
+    }
+    "nvcc".into()
 }
 
 fn pick_ccbin() -> Option<String> {
@@ -111,7 +142,7 @@ fn pick_ccbin() -> Option<String> {
     let probe = format!("{out}/ccbin_probe.cu");
     std::fs::write(&probe, "int main(){return 0;}\n").ok()?;
     for cand in candidates {
-        let ok = std::process::Command::new("nvcc")
+        let ok = std::process::Command::new(nvcc())
             .args([&format!("-ccbin={cand}"), "-c", &probe, "-o"])
             .arg(format!("{out}/ccbin_probe.o"))
             .output()
