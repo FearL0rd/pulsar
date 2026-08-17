@@ -1399,8 +1399,13 @@ impl Model {
                     // truncated/partial transfer matches at [0] and
                     // diverges later, which is exactly the signature we
                     // are chasing.
-                    // sync first: an async copy still in flight would
-                    // otherwise read as a data bug
+                    // sync BOTH devices: sync() only covers the current
+                    // one (card B here), while the D2H half of the
+                    // staging runs on card A
+                    let cur = kernels::get_device();
+                    kernels::set_device(kernels::primary_device())?;
+                    kernels::sync()?;
+                    kernels::set_device(cur)?;
                     kernels::sync()?;
                     let deep = (s.n_embd as usize / 2) * 4;
                     let tail = ((t as usize - 1) * s.n_embd as usize) * 4;
