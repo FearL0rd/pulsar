@@ -3198,6 +3198,71 @@ mod real {
             let tp_gdn_stash: std::cell::RefCell<Option<Qwen35Gdn>> = std::cell::RefCell::new(None);
             let tp_attn_stash: std::cell::RefCell<Option<Qwen35Attn>> = std::cell::RefCell::new(None);
             let mut layer_dev = vec![primary; shape.n_exec_layer as usize];
+            // TP + PP: TP splits each layer across the fast pair, so the
+            // dense split used to be mutually exclusive with it and any
+            // third card sat idle. A third device can still take a TAIL
+            // of whole layers as a pipeline stage - those layers get no
+            // TP weights (tp_attn/tp_gdn/tp_ffn are per-layer Options and
+            // return None), run the plain path on their owner, and their
+            // KV allocates there too via the dense_split branch in
+            // State::new. That is the only way a third card of a
+            // different class buys context: KV must live where its
+            // attention runs, so whole layers move, not caches.
+            // PULSAR_PP=<n> sets the tail length, =off disables.
+            if let Some((dev_b, _)) = tp_cfg {
+                let pp = std::env::var("PULSAR_PP").ok();
+                if pp.as_deref() != Some("off") {
+                    if let Some(third) = (0..kernels::device_count())
+                        .filter(|&d| d != primary && d != dev_b)
+                        .max_by(|&a, &b| {
+                            kernels::vram_bandwidth(a)
+                                .partial_cmp(&kernels::vram_bandwidth(b))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                    {
+                        // Per-layer bytes are ~uniform on this family, so
+                        // size the tail from the third card's free VRAM
+                        // rather than a fixed fraction: heterogeneous rigs
+                        // are the point. Reserve covers its KV share plus
+                        // prefill scratch.
+                        let n_layers = shape.n_exec_layer as usize;
+                        let mut n_tail = pp
+                            .as_deref()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if n_tail == 0 {
+                            // layer 0's own tensors ARE the per-layer cost
+                            // on this family (uniform blocks); no averaging
+                            // over a total that also carries embd/head
+                            let per: u64 = gguf
+                                .tensors
+                                .iter()
+                                .filter(|t| t.name.starts_with("blk.0."))
+                                .filter_map(|t| t.byte_size())
+                                .sum();
+                            if let (Ok((free, _)), true) = (kernels::mem_info(third), per > 0) {
+                                let reserve = 3u64 << 30;
+                                let usable = (free as u64).saturating_sub(reserve);
+                                n_tail = (usable / per) as usize;
+                            }
+                        }
+                        // keep TP meaningful: never hand over more than
+                        // half the stack
+                        n_tail = n_tail.min(n_layers / 2);
+                        if n_tail > 0 {
+                            for d in layer_dev.iter_mut().skip(n_layers - n_tail) {
+                                *d = third;
+                            }
+                            eprintln!(
+                                "pulsar: pipeline tail: layers {}..{} on device {third} (TP {primary}+{dev_b} for 0..{})",
+                                n_layers - n_tail,
+                                n_layers,
+                                n_layers - n_tail
+                            );
+                        }
+                    }
+                }
+            }
             if qwen35_dense
                 && tp_cfg.is_none()
                 && kernels::device_count() > 1
@@ -3542,7 +3607,8 @@ mod real {
                     // both cards read their half of every layer's FFN in
                     // parallel and the partial down outputs add. The
                     // nextn/MTP layer stays whole (il >= n_exec_layer).
-                    if let Some((dev_b, half)) = tp_cfg.filter(|_| il < shape.n_exec_layer) {
+                    if let Some((dev_b, half)) = tp_cfg.filter(|_| il < shape.n_exec_layer
+                            && layer_dev.get(il as usize).copied().unwrap_or(primary) == primary) {
                         let cur = kernels::get_device();
                         let (gb, grb, gq) = read_kq_bytes(&file, &gguf, &t("ffn_gate.weight"))?;
                         let (ub, urb, uq) = read_kq_bytes(&file, &gguf, &t("ffn_up.weight"))?;
@@ -3918,7 +3984,8 @@ mod real {
                         Attn::Qwen35(Box::new(Qwen35W {
                             attn: if !is_attn {
                                 None
-                            } else if let Some((dev_b, _)) = tp_cfg.filter(|_| il < shape.n_exec_layer) {
+                            } else if let Some((dev_b, _)) = tp_cfg.filter(|_| il < shape.n_exec_layer
+                            && layer_dev.get(il as usize).copied().unwrap_or(primary) == primary) {
                                 // TP head split: q|gate rows are per-head
                                 // [q hd | gate hd], heads outer, so head
                                 // ranges are contiguous row ranges; the
@@ -3955,7 +4022,8 @@ mod real {
                             },
                             gdn: if is_attn {
                                 None
-                            } else if let Some((dev_b, _)) = tp_cfg.filter(|_| il < shape.n_exec_layer) {
+                            } else if let Some((dev_b, _)) = tp_cfg.filter(|_| il < shape.n_exec_layer
+                            && layer_dev.get(il as usize).copied().unwrap_or(primary) == primary) {
                                 // TP head split: A keeps the first half of
                                 // the qk and v heads, B the second. The
                                 // delta-rule state is head-local, so each

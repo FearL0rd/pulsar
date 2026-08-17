@@ -239,6 +239,14 @@ impl DenseBank {
         swap(&mut self.gdn_tmp, &mut rt_scratch.gdn_tmp);
         swap(&mut self.qfull, &mut rt_scratch.qfull);
         swap(&mut self.gate, &mut rt_scratch.gate);
+        // gb (packed GDN a/dt_bias coeffs) was allocated on the bank but
+        // never exchanged, so every GDN layer of the split tail wrote and
+        // read it ACROSS devices: garbage gate coefficients on 3 of every
+        // 4 layers. Attention layers were unaffected, so the model kept
+        // emitting grammatical text and the corruption read as "degenerate
+        // looping output" rather than a crash - and check.sh never
+        // exercises the qwen35 dense split, so it stayed green.
+        swap(&mut self.gb, &mut rt_scratch.gb);
     }
 }
 
@@ -1299,9 +1307,22 @@ impl Model {
         }
 
         kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, t, eps)?;
-        let dbg = il == 0 && std::env::var_os("PULSAR_DEBUG_L2").is_some();
+        // PULSAR_DEBUG_L2=1 traces layer 0 only (the Laguna-era probe);
+        // =all traces EVERY layer, which is what a multi-device split
+        // needs: diff the per-layer lines of a split run against a
+        // single-device run and the FIRST diverging il localizes the
+        // fault (== n0 -> the boundary hop, > n0 -> per-layer state,
+        // < n0 -> the head span, i.e. planner/loader not the bank).
+        let l2v = std::env::var("PULSAR_DEBUG_L2").ok();
+        let all = l2v.as_deref() == Some("all");
+        let dbg = l2v.is_some() && (all || il == 0);
         if dbg {
-            eprintln!("  embd {:?} normed {:?}", st.cur.read_f32(2)?, st.normed.read_f32(2)?);
+            eprintln!(
+                "  L2 il={il} dev={} cur {:?} normed {:?}",
+                kernels::get_device(),
+                st.cur.read_f32(2)?,
+                st.normed.read_f32(2)?
+            );
         }
 
         if let Some(gdn) = &w.gdn {
