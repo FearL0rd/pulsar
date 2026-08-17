@@ -4395,6 +4395,82 @@ __global__ static void matmul_nvfp4_a4_kernel(
 /* exposed so the Rust selftest can skip on non-Blackwell devices */
 extern "C" int pulsar_cc_major(void) { return pulsar_device_cc_major(); }
 
+
+/* q8_K activations -> NVFP4, so the FP4 GEMM can be reached without
+ * touching a single engine call site: every caller already hands
+ * matmul_kq a q8_K buffer. The direct f32 path (pulsar_quantize_nvfp4)
+ * is one rounding step better and is what a later engine-level wiring
+ * should use; this converts what is already there.
+ * Layout is the octet-major activation tile the GEMM expects. */
+__global__ static void nvfp4_from_q8K_kernel(
+        uint8_t *out, const block_q8_K *xq, uint32_t in_dim,
+        uint32_t n_sub, uint32_t n_rows) {
+    const uint32_t sub = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sub >= n_sub) return;
+    const uint32_t t = blockIdx.y;
+    const uint32_t src_row = t < n_rows ? t : n_rows - 1u;
+    const uint32_t in_blocks = in_dim / 256u;
+    const uint32_t sb = sub >> 4, loc = sub & 15u;
+    const block_q8_K *blk = xq + (uint64_t)src_row * in_blocks + sb;
+    const int8_t *qs = blk->qs + loc * 16u;
+
+    int amax = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        const int a = qs[i] < 0 ? -(int)qs[i] : (int)qs[i];
+        if (a > amax) amax = a;
+    }
+    const uint8_t e = e4m3_encode(blk->d * (float)amax * (1.0f / 6.0f));
+    const uint32_t kb = (sub >> 2) & 3u, sq = sub & 3u;
+    uint8_t *base = out
+            + ((uint64_t)(t >> 3) * in_blocks + sb) * PULSAR_NVFP4_ACT_TILE
+            + (uint64_t)kb * PULSAR_NVFP4_ACT_BLK;
+    const uint32_t r = t & 7u;
+    base[256u + r * 4u + sq] = e;
+
+    const float dec = ue4m3_half(e) * 2.0f;
+    const float inv = dec > 0.0f ? blk->d / dec : 0.0f;
+    uint8_t *q = base + r * 32u + sq * 8u;
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        q[i] = (uint8_t)(e2m1_encode((float)qs[i] * inv)
+                         | (e2m1_encode((float)qs[i + 8] * inv) << 4));
+}
+
+/* per-device, grow-on-demand activation scratch (same shape as the gqa
+ * split scratch): the converted tile is transient and sized by n_tok */
+static void *g_nvfp4_act[16];
+static uint64_t g_nvfp4_act_cap[16];
+
+static void *nvfp4_act_scratch(uint64_t bytes) {
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return NULL;
+    if (bytes <= g_nvfp4_act_cap[dev]) return g_nvfp4_act[dev];
+    /* cudaMalloc is illegal mid graph-capture and pulsar captures the
+     * forward, so grow only when free to do so and take a generous floor
+     * to make that happen exactly once. A call that finds the buffer
+     * short while capturing returns NULL and rides the int8 path. */
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &cap) != cudaSuccess ||
+        cap != cudaStreamCaptureStatusNone) {
+        return NULL;
+    }
+    const uint64_t floor_bytes = 64u << 20;
+    if (bytes < floor_bytes) bytes = floor_bytes;
+    if (g_nvfp4_act[dev]) (void)cudaFree(g_nvfp4_act[dev]);
+    g_nvfp4_act[dev] = NULL;
+    g_nvfp4_act_cap[dev] = 0;
+    if (!cuda_ok(cudaMalloc(&g_nvfp4_act[dev], bytes), "nvfp4 act scratch")) return NULL;
+    g_nvfp4_act_cap[dev] = bytes;
+    return g_nvfp4_act[dev];
+}
+
+static bool nvfp4_a4_on() {
+    static const bool on = getenv("PULSAR_FP4") != NULL;
+    return on;
+}
+
 extern "C" int pulsar_quantize_nvfp4(
         void *out_dev, const void *x_dev, uint32_t in_dim, uint32_t n_rows) {
     if (in_dim == 0 || n_rows == 0) return 0;
@@ -4441,6 +4517,28 @@ extern "C" int pulsar_matmul_kq(
         (quant == PULSAR_QUANT_Q4_K || quant == PULSAR_QUANT_Q6_K
          || quant == PULSAR_QUANT_NVFP4) &&
         !getenv("PULSAR_NO_GEMM")) {
+        /* Blackwell native FP4: weights ride into the tensor core with
+         * no dequant at all and the mma covers k=64 per instruction
+         * instead of 16. Measured 2.79x on the GEMM in isolation.
+         * Opt-in via PULSAR_FP4 because it puts activations in fp4 too
+         * (W4A4), which changes numerics by construction. */
+        if (quant == PULSAR_QUANT_NVFP4 && pulsar_device_cc_major() >= 12
+            && nvfp4_a4_on()) {
+            const uint32_t rows = (n_tok + 7u) & ~7u;
+            const uint64_t abytes = (uint64_t)rows * in_blocks * PULSAR_NVFP4_SB_BYTES;
+            void *act = nvfp4_act_scratch(abytes);
+            if (act) { /* alloc failure falls through to the int8 path */
+                const uint32_t n_sub = in_dim / 16u;
+                dim3 cg((n_sub + 255u) / 256u, rows, 1);
+                nvfp4_from_q8K_kernel<<<cg, 256>>>(
+                        (uint8_t *)act, (const block_q8_K *)xq_dev, in_dim, n_sub, n_tok);
+                dim3 fg((out_dim + 31u) / 32u, (n_tok + 127u) / 128u, 1);
+                matmul_nvfp4_a4_kernel<<<fg, 256>>>(
+                        (float *)out_dev, (const char *)w_dev, (const char *)act,
+                        in_blocks, out_dim, n_tok, row_bytes);
+                return cuda_ok(cudaGetLastError(), "matmul_nvfp4_a4 dispatch");
+            }
+        }
         if (quant == PULSAR_QUANT_NVFP4 && pulsar_device_cc_major() >= 8
             && !getenv("PULSAR_NO_MMA")) {
             dim3 mgrid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
