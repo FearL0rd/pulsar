@@ -3965,7 +3965,10 @@ __device__ __forceinline__ static void ldmatrix_x2(
  * banks (256 would land every row on bank 0) */
 #define PULSAR_GEMM_AS 272u
 
-template <typename UNPACK>
+/* OCT is a template parameter, not a runtime pointer test: the B read
+ * sits in the innermost loop and a runtime select there measured ~4%
+ * even when never taken. */
+template <typename UNPACK, bool OCT>
 __global__ static void matmul_kq_gemm_mma_kernel(
         float *out,
         const char *w,
@@ -4039,12 +4042,12 @@ __global__ static void matmul_kq_gemm_mma_kernel(
         const char *yc1s = yc1 ? yc1 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
         /* octet tile: the warp's 8 tokens laid side by side, so the B
          * read below is one cache line rather than eight */
-        const char *obs = yoct
+        const char *obs = OCT
                 ? yoct + ((uint64_t)(tb >> 3) * in_blocks + sb) * PULSAR_OCT_TILE
                 : NULL;
-        const float d0 = obs ? *(const float *)(obs + 2048u + tg * 8u)
+        const float d0 = OCT ? *(const float *)(obs + 2048u + tg * 8u)
                              : (yc0s ? ((const block_q8_K *)yc0s)->d : 0.0f);
-        const float d1 = obs ? *(const float *)(obs + 2048u + tg * 8u + 4u)
+        const float d1 = OCT ? *(const float *)(obs + 2048u + tg * 8u + 4u)
                              : (yc1s ? ((const block_q8_K *)yc1s)->d : 0.0f);
 
         /* ncu: MIO-queue stalls were 35% of warp wait when this loop
@@ -4068,7 +4071,7 @@ __global__ static void matmul_kq_gemm_mma_kernel(
             #pragma unroll
             for (uint32_t chi = 0; chi < 4u; chi++) {
                 const uint32_t ch = ch4 * 4u + chi;
-                const int32_t b = obs
+                const int32_t b = OCT
                         ? *(const int32_t *)(obs + ch * 128u + g * 16u + tg * 4u)
                         : *(const int32_t *)(ybs + 4u + ch * 16u + tg * 4u);
                 if (UNPACK::HAS_MIN) {
@@ -4628,9 +4631,15 @@ extern "C" int pulsar_matmul_kq(
             && !getenv("PULSAR_NO_MMA")) {
             const char *yoct = gemm_octet_tile(xq_dev, in_blocks, n_tok);
             dim3 mgrid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
-            matmul_kq_gemm_mma_kernel<unpack_nvfp4><<<mgrid, 256>>>(
-                    (float *)out_dev, (const char *)w_dev,
-                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, yoct);
+            if (yoct) {
+                matmul_kq_gemm_mma_kernel<unpack_nvfp4, true><<<mgrid, 256>>>(
+                        (float *)out_dev, (const char *)w_dev,
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, yoct);
+            } else {
+                matmul_kq_gemm_mma_kernel<unpack_nvfp4, false><<<mgrid, 256>>>(
+                        (float *)out_dev, (const char *)w_dev,
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, NULL);
+            }
             return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_mma nvfp4 launch");
         }
         if (quant == PULSAR_QUANT_NVFP4) {
@@ -4645,11 +4654,11 @@ extern "C" int pulsar_matmul_kq(
         if (pulsar_device_cc_major() >= 8 && !getenv("PULSAR_NO_MMA")) {
             dim3 mgrid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
             if (quant == PULSAR_QUANT_Q4_K)
-                matmul_kq_gemm_mma_kernel<unpack_q4_K><<<mgrid, 256>>>(
+                matmul_kq_gemm_mma_kernel<unpack_q4_K, false><<<mgrid, 256>>>(
                         (float *)out_dev, (const char *)w_dev,
                         (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, NULL);
             else
-                matmul_kq_gemm_mma_kernel<unpack_q6_K><<<mgrid, 256>>>(
+                matmul_kq_gemm_mma_kernel<unpack_q6_K, false><<<mgrid, 256>>>(
                         (float *)out_dev, (const char *)w_dev,
                         (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, NULL);
             return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_mma launch");
