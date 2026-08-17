@@ -1399,6 +1399,9 @@ impl Model {
                     // truncated/partial transfer matches at [0] and
                     // diverges later, which is exactly the signature we
                     // are chasing.
+                    // sync first: an async copy still in flight would
+                    // otherwise read as a data bug
+                    kernels::sync()?;
                     let deep = (s.n_embd as usize / 2) * 4;
                     let tail = ((t as usize - 1) * s.n_embd as usize) * 4;
                     eprintln!("  TPlink il={il} B[0] {:?} B[mid] {:?} B[lastrow] {:?}",
