@@ -4117,7 +4117,26 @@ mod real {
                                     }
                                     let (h0, h1) = (hr.0 as usize, hr.1 as usize);
                                     Ok(Qwen35Gdn {
-                                        wqkv: matw_row_ranges(&file, &gguf, &t("attn_qkv.weight"), ranges)?,
+                                        wqkv: {
+                                            let w = matw_row_ranges(&file, &gguf, &t("attn_qkv.weight"), ranges)?;
+                                            if il == 0 && std::env::var_os("PULSAR_DEBUG_L2").is_some() {
+                                                // does B's sliced weight actually hold the rows
+                                                // the ranges name? compare its v-block's first
+                                                // row against the full tensor's same row.
+                                                if let MatW::Kq(k) = &w {
+                                                    let vrow = ranges[2].0; // first v row, global
+                                                    let off = (2 * (ranges[0].1 - ranges[0].0)) * k.row_bytes;
+                                                    let mut got = vec![0u8; 16];
+                                                    k.w.read(off as usize, &mut got)?;
+                                                    let (full, frb, _q) = read_kq_bytes(&file, &gguf, &t("attn_qkv.weight"))?;
+                                                    let fo = (vrow * frb) as usize;
+                                                    eprintln!("  WSLICE il=0 rb={} vrow={} B[{:?}] full[{:?}] {}",
+                                                        k.row_bytes, vrow, &got[..8], &full[fo..fo + 8],
+                                                        if got[..] == full[fo..fo + 16] { "MATCH" } else { "DIFFER" });
+                                                }
+                                            }
+                                            w
+                                        },
                                         wz: matw_row_ranges(&file, &gguf, &t("attn_gate.weight"), &[vr])?,
                                         conv: DeviceBuf::from_f32(&conv_sl)?,
                                         ab_w: {
