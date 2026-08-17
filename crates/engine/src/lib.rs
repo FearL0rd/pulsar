@@ -3268,7 +3268,36 @@ mod real {
                             .as_deref()
                             .and_then(|v| v.parse::<usize>().ok())
                             .unwrap_or(0);
-                        if n_tail == 0 {
+                        // A tail costs decode: its layers read their
+                        // weights from ONE card while the TP layers read
+                        // theirs from two in parallel, and layers are
+                        // sequential within a token. Measured on the 27B
+                        // NVFP4 (2x 5060 Ti + 4060 Ti): 36.5 tok/s with a
+                        // 32-layer tail vs 47.8 without, same prefill and
+                        // same 196608 max ctx, because the KV auto-sizer
+                        // absorbs the smaller budget by quantizing. So
+                        // only spill to the third card when the TP pair
+                        // genuinely cannot hold the weights; PULSAR_PP=<n>
+                        // still forces a tail when capacity beats speed.
+                        let fits_on_pair = {
+                            let total: u64 = gguf
+                                .tensors
+                                .iter()
+                                .filter_map(|t| t.byte_size())
+                                .sum();
+                            // TP halves the per-layer matrices, so each of
+                            // the pair holds ~half; leave room for KV and
+                            // the prefill hop/scratch buffers
+                            let need = total / 2 + (4u64 << 30);
+                            [primary, dev_b].iter().all(|&d| {
+                                kernels::mem_info(d).map_or(false, |(free, _)| free as u64 >= need)
+                            })
+                        };
+                        if n_tail == 0 && fits_on_pair {
+                            eprintln!(
+                                "pulsar: no pipeline tail: weights fit the TP pair, keeping every layer 2-way (PULSAR_PP=<n> to spill onto device {third} for more KV room)"
+                            );
+                        } else if n_tail == 0 {
                             // layer 0's own tensors ARE the per-layer cost
                             // on this family (uniform blocks); no averaging
                             // over a total that also carries embd/head
