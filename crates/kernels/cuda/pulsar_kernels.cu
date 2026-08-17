@@ -4266,29 +4266,46 @@ __global__ static void matmul_nvfp4_a4_kernel(
         uint64_t row_bytes) {
 #if defined(__CUDA_ARCH_FEAT_SM120_ALL)
     const uint32_t r0 = blockIdx.x * 32u;
-    const uint32_t tok0 = blockIdx.y * 64u;
+    const uint32_t tok0 = blockIdx.y * 128u;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
     const uint32_t g = lane >> 2u;   /* fragment row / B column */
     const uint32_t l = lane & 3u;    /* k quad / D column pair */
+    /* ldmatrix addressing: lane supplies row (lane&7) of matrix lane>>3 */
+    const uint32_t lm = lane >> 3u, lr = lane & 7u;
 
-    __shared__ uint32_t a_s[2][32][36];
+    /* Nibbles and scales stage separately so the nibble rows stay 16B
+     * aligned for ldmatrix: the four scale bytes at the head of every
+     * 36-byte block would otherwise skew every row to 4 mod 16. A
+     * 36-word stride is 144B, a multiple of 16, and still lands the 8
+     * rows of an ldmatrix matrix on distinct banks. */
+    __shared__ uint32_t a_q[2][32][36];
+    __shared__ uint32_t a_sc[2][32][4];
 
-    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) acc[i] = 0.0f;
 
-    const uint32_t tb = tok0 + warp * 8u;
+    /* a warp owns 16 tokens as two octets; one A fragment feeds both, so
+     * the ldmatrix and the weight tile amortize over twice the work */
+    const uint32_t tb = tok0 + warp * 16u;
     /* clamped, not NULL: B rides an always-valid row so the inner loop
      * carries no guard; out-of-range tokens only skip the store */
-    const uint32_t t_b = tb + g < n_tok ? tb + g : n_tok - 1u;
-    const char *yb = xq + (uint64_t)t_b * in_blocks * PULSAR_NVFP4_SB_BYTES;
+    const uint32_t t_b0 = tb + g < n_tok ? tb + g : n_tok - 1u;
+    const uint32_t t_b1 = tb + 8u + g < n_tok ? tb + 8u + g : n_tok - 1u;
+    const char *yb0 = xq + (uint64_t)t_b0 * in_blocks * PULSAR_NVFP4_SB_BYTES;
+    const char *yb1 = xq + (uint64_t)t_b1 * in_blocks * PULSAR_NVFP4_SB_BYTES;
 
 #define PULSAR_NVFP4_STAGE(buf, sb)                                            \
     do {                                                                       \
         for (uint32_t i = threadIdx.x; i < 32u * 36u; i += 256u) {             \
             const uint32_t r = i / 36u, wd = i - r * 36u;                      \
             const uint32_t rg = r0 + r < out_dim ? r0 + r : out_dim - 1u;      \
-            a_s[buf][r][wd] = *(const uint32_t *)(w + (uint64_t)rg * row_bytes \
+            const uint32_t v = *(const uint32_t *)(w + (uint64_t)rg * row_bytes \
                     + (uint64_t)(sb) * PULSAR_NVFP4_SB_BYTES + wd * 4u);       \
+            const uint32_t bk = wd / 9u, j = wd - bk * 9u;                     \
+            if (j == 0u) a_sc[buf][r][bk] = v;                                 \
+            else a_q[buf][r][bk * 8u + j - 1u] = v;                            \
         }                                                                      \
     } while (0)
 
@@ -4298,30 +4315,37 @@ __global__ static void matmul_nvfp4_a4_kernel(
     for (uint32_t sb = 0; sb < in_blocks; sb++) {
         const uint32_t cur = sb & 1u;
         if (sb + 1u < in_blocks) PULSAR_NVFP4_STAGE(cur ^ 1u, sb + 1u);
-        const char *ybs = yb + (uint64_t)sb * PULSAR_NVFP4_SB_BYTES;
+        const char *ybs0 = yb0 + (uint64_t)sb * PULSAR_NVFP4_SB_BYTES;
+        const char *ybs1 = yb1 + (uint64_t)sb * PULSAR_NVFP4_SB_BYTES;
 
         #pragma unroll
         for (uint32_t kb = 0; kb < 4u; kb++) {
             /* word 0 of a block is its 4 scale bytes, words 1..8 the
              * nibbles; reg0 covers k [8l,8l+8), reg2 the same 32 later */
-            const char *blk = ybs + kb * PULSAR_NVFP4_BLK_BYTES;
-            uint32_t b[2];
-            b[0] = *(const uint32_t *)(blk + 4u + l * 4u);
-            b[1] = *(const uint32_t *)(blk + 20u + l * 4u);
-            const uint32_t sbw = *(const uint32_t *)blk;
+            const char *blk0 = ybs0 + kb * PULSAR_NVFP4_BLK_BYTES;
+            const char *blk1 = ybs1 + kb * PULSAR_NVFP4_BLK_BYTES;
+            uint32_t b0[2], b1[2];
+            b0[0] = *(const uint32_t *)(blk0 + 4u + l * 4u);
+            b0[1] = *(const uint32_t *)(blk0 + 20u + l * 4u);
+            b1[0] = *(const uint32_t *)(blk1 + 4u + l * 4u);
+            b1[1] = *(const uint32_t *)(blk1 + 20u + l * 4u);
+            const uint32_t sbw0 = *(const uint32_t *)blk0;
+            const uint32_t sbw1 = *(const uint32_t *)blk1;
             #pragma unroll
             for (uint32_t h = 0; h < 2u; h++) {
-                const uint32_t rg = 16u * h + g;
+                /* all four A registers in one instruction instead of
+                 * four narrow smem loads: matrix m covers rows
+                 * 16h + 8*(m&1) + 0..7 at byte 16*(m>>1), which is
+                 * exactly the m16n8k64 A fragment */
                 uint32_t a[4];
-                a[0] = a_s[cur][rg][kb * 9u + 1u + l];
-                a[1] = a_s[cur][rg + 8u][kb * 9u + 1u + l];
-                a[2] = a_s[cur][rg][kb * 9u + 5u + l];
-                a[3] = a_s[cur][rg + 8u][kb * 9u + 5u + l];
+                ldmatrix_x4(a, &a_q[cur][16u * h + lr + 8u * (lm & 1u)]
+                                        [kb * 8u + 4u * (lm >> 1u)]);
                 /* row r's scales come from lane (r&7)*4 + (r>>3), i.e.
                  * this lane feeds row g + 8l and only l < 2 is read;
                  * l&1 keeps the index in range for the l >= 2 lanes */
-                const uint32_t saw = a_s[cur][16u * h + g + 8u * (l & 1u)][kb * 9u];
-                mma_nvfp4_16x8x64(&acc[4u * h], a, b, saw, sbw);
+                const uint32_t saw = a_sc[cur][16u * h + g + 8u * (l & 1u)][kb];
+                mma_nvfp4_16x8x64(&acc[8u * h], a, b0, saw, sbw0);
+                mma_nvfp4_16x8x64(&acc[8u * h + 4u], a, b1, saw, sbw1);
             }
         }
         __syncthreads();
@@ -4331,14 +4355,18 @@ __global__ static void matmul_nvfp4_a4_kernel(
     #pragma unroll
     for (uint32_t h = 0; h < 2u; h++) {
         const uint32_t rg0 = r0 + 16u * h + g, rg8 = rg0 + 8u;
-        const uint32_t t0 = tb + l * 2u, t1 = t0 + 1u;
-        if (t0 < n_tok) {
-            if (rg0 < out_dim) out[(uint64_t)t0 * out_dim + rg0] = acc[4u * h + 0u];
-            if (rg8 < out_dim) out[(uint64_t)t0 * out_dim + rg8] = acc[4u * h + 2u];
-        }
-        if (t1 < n_tok) {
-            if (rg0 < out_dim) out[(uint64_t)t1 * out_dim + rg0] = acc[4u * h + 1u];
-            if (rg8 < out_dim) out[(uint64_t)t1 * out_dim + rg8] = acc[4u * h + 3u];
+        #pragma unroll
+        for (uint32_t o = 0; o < 2u; o++) {
+            const uint32_t base = 8u * h + 4u * o;
+            const uint32_t t0 = tb + 8u * o + l * 2u, t1 = t0 + 1u;
+            if (t0 < n_tok) {
+                if (rg0 < out_dim) out[(uint64_t)t0 * out_dim + rg0] = acc[base + 0u];
+                if (rg8 < out_dim) out[(uint64_t)t0 * out_dim + rg8] = acc[base + 2u];
+            }
+            if (t1 < n_tok) {
+                if (rg0 < out_dim) out[(uint64_t)t1 * out_dim + rg0] = acc[base + 1u];
+                if (rg8 < out_dim) out[(uint64_t)t1 * out_dim + rg8] = acc[base + 3u];
+            }
         }
     }
 #else
@@ -4368,7 +4396,7 @@ extern "C" int pulsar_matmul_nvfp4_a4(
     if (in_dim % 256u) return cuda_ok(cudaErrorInvalidValue, "nvfp4 a4 in_dim%256");
     if (pulsar_device_cc_major() < 12)
         return cuda_ok(cudaErrorNotSupported, "nvfp4 a4 needs sm_120a");
-    dim3 grid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
+    dim3 grid((out_dim + 31u) / 32u, (n_tok + 127u) / 128u, 1);
     matmul_nvfp4_a4_kernel<<<grid, 256>>>(
             (float *)out_dev, (const char *)w_dev, (const char *)xq_dev,
             in_dim / 256u, out_dim, n_tok, row_bytes);

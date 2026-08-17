@@ -1902,9 +1902,10 @@ mod tests {
         }
         let out_dim = 16384u32;
         let in_dim = 4096u32;
-        let n_tok = 128u32;
         let blocks = (in_dim / 256) as usize;
         let rb = blocks * NVFP4_SB_BYTES;
+        for n_tok in [128u32, 512, 2048] {
+        eprintln!(" n_tok {n_tok}:");
 
         let mut host: Vec<u8> = (0..out_dim as usize * rb)
             .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
@@ -1953,6 +1954,7 @@ mod tests {
             let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
             let gflop = 2.0 * out_dim as f64 * in_dim as f64 * n_tok as f64 / 1e9;
             eprintln!("  {name}  {ms:8.3} ms  {:8.1} GFLOP/s", gflop / (ms * 1e-3));
+        }
         }
     }
 
