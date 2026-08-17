@@ -1393,6 +1393,9 @@ impl Model {
                     kernels::matmul_f32_off(&mut rt.beta, &gdn.ab_w, vh as usize * s.n_embd as usize * 4, &st.normed, s.n_embd, vh, t)?;
                     kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, vh)?;
                 }
+                if dbg && !packed {
+                    eprintln!("  GDNin il={il} g {:?} beta {:?}", rt.g.read_f32(2)?, rt.beta.read_f32(2)?);
+                }
                 let gs = rt.states[il].as_mut().ok_or("gdn state missing")?;
                 kernels::qwen35_conv_batch(&mut rt.conv_out, &rt.qkv, &gdn.conv, &mut gs.conv, cdh, s.ssm_conv_k, t)?;
                 kernels::qwen35_split_qkv(&mut rt.gq, &mut rt.gk, &mut rt.gv, &rt.conv_out, t, kdh, vdh)?;
@@ -1409,6 +1412,10 @@ impl Model {
                         vh, kh, s.ssm_state, t,
                     )?;
                 }
+            if dbg {
+                eprintln!("  GDNmid il={il} conv {:?} gq {:?} gv {:?} gdn_o {:?}",
+                    rt.conv_out.read_f32(2)?, rt.gq.read_f32(2)?, rt.gv.read_f32(2)?, rt.gdn_o.read_f32(2)?);
+            }
                 kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * vh, s.ssm_state, eps)?;
                 kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * vdh, 0.0, 1.0, 0)?;
                 if matches!(gdn.ssm_out, MatW::Kq(_)) {
@@ -1431,6 +1438,9 @@ impl Model {
             kernels::matmul_f32(&mut rt.g, &gdn.ab_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
             kernels::matmul_f32_off(&mut rt.beta, &gdn.ab_w, s.ssm_v_heads as usize * s.n_embd as usize * 4, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
             kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, s.ssm_v_heads)?;
+            if dbg {
+                eprintln!("  GDNin il={il} g {:?} beta {:?}", rt.g.read_f32(2)?, rt.beta.read_f32(2)?);
+            }
 
             // fast-rollback stash: the raw qkv rows + final coeffs are
             // all a state-only replay needs
@@ -1460,6 +1470,10 @@ impl Model {
                     rt.conv_out.read_f32(2)?, rt.gq.read_f32(2)?,
                     rt.g.read_f32(2)?, rt.beta.read_f32(2)?, rt.gdn_o.read_f32(2)?
                 );
+            }
+            if dbg {
+                eprintln!("  GDNmid il={il} conv {:?} gq {:?} gv {:?} gdn_o {:?}",
+                    rt.conv_out.read_f32(2)?, rt.gq.read_f32(2)?, rt.gv.read_f32(2)?, rt.gdn_o.read_f32(2)?);
             }
             kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * s.ssm_v_heads, s.ssm_state, eps)?;
             kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * value_dim, 0.0, 1.0, 0)?;
@@ -1610,6 +1624,16 @@ impl Model {
             }
         } else {
             return Err("qwen35 layer with neither attn nor gdn".into());
+        }
+        if dbg {
+            // the mixer's own contribution: a GDN layer reading ~0 here
+            // while the reference reads real values is the signature of
+            // a skipped/zeroed recurrent branch, not a numeric drift
+            eprintln!(
+                "  L2 il={il} kind={} attn_out {:?}",
+                if w.gdn.is_some() { "gdn" } else { "attn" },
+                st.attn_out.read_f32(2)?
+            );
         }
         kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, t * s.n_embd)?;
 
