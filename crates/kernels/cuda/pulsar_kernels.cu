@@ -4493,7 +4493,14 @@ __global__ static void nvfp4_from_q8K_kernel(
         const int a = qs[i] < 0 ? -(int)qs[i] : (int)qs[i];
         if (a > amax) amax = a;
     }
-    const uint8_t e = e4m3_encode(blk->d * (float)amax * (1.0f / 6.0f));
+    /* q8_K carries a SIGNED d: the quantizer uses iscale = -127/max over
+     * the signed extreme, so d is negative whenever the largest-magnitude
+     * value is positive. Scale off |d| and let the sign ride through inv
+     * below. Feeding the signed product to e4m3_encode returned 0 for
+     * about half of all blocks, zeroing them outright, which is what made
+     * W4A4 output degenerate. */
+    const float d = blk->d;
+    const uint8_t e = e4m3_encode(fabsf(d) * (float)amax * (1.0f / 6.0f));
     const uint32_t kb = (sub >> 2) & 3u, sq = sub & 3u;
     uint8_t *base = out
             + ((uint64_t)(t >> 3) * in_blocks + sb) * PULSAR_NVFP4_ACT_TILE
@@ -4502,7 +4509,7 @@ __global__ static void nvfp4_from_q8K_kernel(
     base[256u + r * 4u + sq] = e;
 
     const float dec = ue4m3_half(e) * 2.0f;
-    const float inv = dec > 0.0f ? blk->d / dec : 0.0f;
+    const float inv = dec > 0.0f ? d / dec : 0.0f;   /* signed on purpose */
     uint8_t *q = base + r * 32u + sq * 8u;
     #pragma unroll
     for (int i = 0; i < 8; i++)
@@ -4542,6 +4549,17 @@ static void *nvfp4_act_scratch(uint64_t bytes) {
 static bool nvfp4_a4_on() {
     static const bool on = getenv("PULSAR_FP4") != NULL;
     return on;
+}
+
+/* exposed for the activation error-budget selftest */
+extern "C" int pulsar_nvfp4_from_q8k(
+        void *out_dev, const void *xq_dev, uint32_t in_dim, uint32_t n_tok) {
+    if (in_dim == 0 || n_tok == 0) return 0;
+    const uint32_t n_sub = in_dim / 16u;
+    dim3 grid((n_sub + 255u) / 256u, (n_tok + 7u) & ~7u, 1);
+    nvfp4_from_q8K_kernel<<<grid, 256>>>(
+            (uint8_t *)out_dev, (const block_q8_K *)xq_dev, in_dim, n_sub, n_tok);
+    return cuda_ok(cudaGetLastError(), "nvfp4_from_q8k launch");
 }
 
 extern "C" int pulsar_quantize_nvfp4(

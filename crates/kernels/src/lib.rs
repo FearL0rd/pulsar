@@ -107,6 +107,7 @@ mod real {
         fn pulsar_router_select(selected: *mut c_void, weights: *mut c_void, logits: *const c_void, bias: *const c_void, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32, softmax_mode: u32, n_shexp: u32) -> i32;
         fn pulsar_quantize_q8_K(out: *mut c_void, x: *const c_void, in_dim: u32, n_rows: u32) -> i32;
         fn pulsar_quantize_nvfp4(out: *mut c_void, x: *const c_void, in_dim: u32, n_rows: u32) -> i32;
+        fn pulsar_nvfp4_from_q8k(out: *mut c_void, xq: *const c_void, in_dim: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_nvfp4_a4(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64) -> i32;
         fn pulsar_cc_major() -> i32;
         fn pulsar_moe_pair_swiglu(mid: *mut c_void, ptrs: *const c_void, weights: *const c_void, x: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32, act_op: u32) -> i32;
@@ -1186,6 +1187,12 @@ mod real {
         check(unsafe { pulsar_quantize_nvfp4(out.ptr_mut(), x.ptr(), in_dim, n_rows) }, "quantize_nvfp4")
     }
 
+    /// q8_K activations -> NVFP4, the route matmul_kq takes when
+    /// PULSAR_FP4 is set. Quantizes twice by construction.
+    pub fn nvfp4_from_q8k(out: &mut DeviceBuf, xq: &DeviceBuf, in_dim: u32, n_tok: u32) -> Result {
+        check(unsafe { pulsar_nvfp4_from_q8k(out.ptr_mut(), xq.ptr(), in_dim, n_tok) }, "nvfp4_from_q8k")
+    }
+
     /// W4A4 prefill GEMM on Blackwell tensor cores: NVFP4 on both sides
     /// with hardware per-16 block scaling and no dequantization at all.
     /// Requires sm_120a; see docs/blackwell-fp4-mma.md.
@@ -1944,6 +1951,126 @@ mod tests {
         // both sides sum the identical decoded values, so only f32
         // accumulation order differs; a layout bug measures in percent
         assert!(worst < 1e-4, "nvfp4 a4 gemm diverges from the decode: {worst}");
+    }
+
+    /// Where does the W4A4 error actually come from? Compares three
+    /// activation routes against an f32 reference over identical NVFP4
+    /// weights, so the fp4-activation cost is separated from the
+    /// double-quantization cost of going through q8_K.
+    ///
+    /// cargo test --release -p kernels nvfp4_activation_error -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic, requires a Blackwell CUDA device"]
+    fn nvfp4_activation_error() {
+        use super::*;
+        if cc_major() < 12 {
+            eprintln!("needs sm_120a, device is cc {}", cc_major());
+            return;
+        }
+        fn e2m1(c: u8) -> f32 {
+            const M: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+            let v = M[(c & 7) as usize];
+            if c & 8 != 0 { -v } else { v }
+        }
+        fn ue4m3(x: u8) -> f32 {
+            if x == 0 || x == 0x7F { return 0.0; }
+            let e = ((x >> 3) & 0xF) as i32;
+            let m = (x & 7) as f32;
+            if e == 0 { m * 2f32.powi(-9) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) }
+        }
+        fn decode(bytes: &[u8], n: usize) -> Vec<f32> {
+            let mut out = vec![0f32; n];
+            for sb in 0..n / 256 {
+                for b in 0..4 {
+                    let base = sb * 144 + b * 36;
+                    for sq in 0..4 {
+                        let sc = ue4m3(bytes[base + sq]);
+                        for i in 0..8 {
+                            let by = bytes[base + 4 + sq * 8 + i];
+                            out[sb * 256 + b * 64 + sq * 16 + i] = e2m1(by & 0xF) * sc;
+                            out[sb * 256 + b * 64 + sq * 16 + i + 8] = e2m1(by >> 4) * sc;
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        let in_dim = 2048u32;
+        let out_dim = 256u32;
+        let n_tok = 64u32;
+        let blocks = (in_dim / 256) as usize;
+        let rb = blocks * NVFP4_SB_BYTES;
+
+        let mut host: Vec<u8> = (0..out_dim as usize * rb)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        for b in 0..out_dim as usize * blocks * 4 {
+            for sq in 0..4 { host[b * 36 + sq] = 0x30 + ((b + sq) % 12) as u8; }
+        }
+        let mut w = DeviceBuf::alloc(host.len()).unwrap();
+        w.write(0, &host).unwrap();
+        let wdec = decode(&host, out_dim as usize * in_dim as usize);
+
+        // gaussian-ish activations: a flat ramp hides how badly fp4 handles
+        // the heavy tail that real hidden states have
+        let x: Vec<f32> = (0..(in_dim * n_tok) as usize)
+            .map(|i| {
+                let a = ((i * 2654435761usize) % 10007) as f32 / 10007.0 - 0.5;
+                let b = ((i * 40503usize) % 9973) as f32 / 9973.0 - 0.5;
+                (a + b) * 2.0
+            })
+            .collect();
+        let mut xf = DeviceBuf::alloc(x.len() * 4).unwrap();
+        xf.write(0, as_bytes(&x)).unwrap();
+
+        let mut want = vec![0f32; (n_tok * out_dim) as usize];
+        for t in 0..n_tok as usize {
+            for r in 0..out_dim as usize {
+                let mut acc = 0f64;
+                for k in 0..in_dim as usize {
+                    acc += (wdec[r * in_dim as usize + k] * x[t * in_dim as usize + k]) as f64;
+                }
+                want[t * out_dim as usize + r] = acc as f32;
+            }
+        }
+        let rms_ref = (want.iter().map(|v| (v * v) as f64).sum::<f64>() / want.len() as f64).sqrt();
+
+        let rel = |got: &[f32]| -> f64 {
+            let e = got.iter().zip(&want).map(|(g, w)| ((g - w) as f64).powi(2)).sum::<f64>();
+            (e / got.len() as f64).sqrt() / rms_ref
+        };
+
+        let mut out = DeviceBuf::alloc((n_tok * out_dim) as usize * 4).unwrap();
+        let abytes = nvfp4_act_bytes(in_dim, n_tok);
+
+        // A: f32 -> NVFP4 directly
+        let mut a4 = DeviceBuf::alloc(abytes).unwrap();
+        quantize_nvfp4(&mut a4, &xf, in_dim, n_tok).unwrap();
+        matmul_nvfp4_a4(&mut out, &w, &a4, in_dim, out_dim, n_tok, rb as u64).unwrap();
+        sync().unwrap();
+        let ea = rel(&out.read_f32((n_tok * out_dim) as usize).unwrap());
+
+        // B: f32 -> q8_K -> NVFP4, what matmul_kq does under PULSAR_FP4
+        let mut x8 = DeviceBuf::alloc(n_tok as usize * blocks * Q8_K_BLOCK_BYTES).unwrap();
+        quantize_q8_k(&mut x8, &xf, in_dim, n_tok).unwrap();
+        let mut b4 = DeviceBuf::alloc(abytes).unwrap();
+        nvfp4_from_q8k(&mut b4, &x8, in_dim, n_tok).unwrap();
+        matmul_nvfp4_a4(&mut out, &w, &b4, in_dim, out_dim, n_tok, rb as u64).unwrap();
+        sync().unwrap();
+        let eb = rel(&out.read_f32((n_tok * out_dim) as usize).unwrap());
+
+        // C: q8_K activations through the int8 mma, the shipping path
+        matmul_kq(&mut out, &w, &x8, in_dim, out_dim, n_tok, rb as u64, QUANT_NVFP4).unwrap();
+        sync().unwrap();
+        let ec = rel(&out.read_f32((n_tok * out_dim) as usize).unwrap());
+
+        eprintln!("activation error vs f32 reference (relative RMS):");
+        eprintln!("  A  f32 -> nvfp4        {ea:.4}");
+        eprintln!("  B  f32 -> q8_K -> nvfp4 {eb:.4}");
+        eprintln!("  C  q8_K, int8 mma      {ec:.4}   <- shipping path");
+        eprintln!("  fp4 activation cost over int8: {:.1}x", ea / ec);
+        eprintln!("  double-quantization cost:      {:.2}x", eb / ea);
     }
 
     /// cargo test --release -p kernels nvfp4_a4_bench -- --ignored --nocapture
