@@ -1350,6 +1350,13 @@ impl Model {
         }
 
         kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, t, eps)?;
+        if std::env::var("PULSAR_DEBUG_L2").ok().as_deref() == Some("1") && il == 0 {
+            let deep = (s.n_embd as usize / 2) * 4;
+            let tail = ((t as usize - 1) * s.n_embd as usize) * 4;
+            eprintln!("  Anorm il={il} t={t} A[0] {:?} A[mid] {:?} A[lastrow] {:?}",
+                st.normed.read_f32(2)?, st.normed.read_f32_at(deep, 2)?,
+                st.normed.read_f32_at(tail, 2)?);
+        }
         // PULSAR_DEBUG_L2=1 traces layer 0 only (the Laguna-era probe);
         // =all traces EVERY layer, which is what a multi-device split
         // needs: diff the per-layer lines of a split run against a
@@ -1388,7 +1395,15 @@ impl Model {
                 if dbg {
                     // does the TpLink hand card B the SAME activations A
                     // computed? A's normed printed by the L2 probe above.
-                    eprintln!("  TPlink il={il} B.normed {:?}", tb.normed.read_f32(2)?);
+                    // check DEEP into the buffer, not just the head: a
+                    // truncated/partial transfer matches at [0] and
+                    // diverges later, which is exactly the signature we
+                    // are chasing.
+                    let deep = (s.n_embd as usize / 2) * 4;
+                    let tail = ((t as usize - 1) * s.n_embd as usize) * 4;
+                    eprintln!("  TPlink il={il} B[0] {:?} B[mid] {:?} B[lastrow] {:?}",
+                        tb.normed.read_f32(2)?, tb.normed.read_f32_at(deep, 2)?,
+                        tb.normed.read_f32_at(tail, 2)?);
                 }
                 if matches!(bw.wqkv, MatW::Kq(_)) {
                     kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, t)?;
@@ -1427,6 +1442,10 @@ impl Model {
                     // first UPPER head: the only apples-to-apples compare.
                     // B's v-block starts at 2*kdh = key_dim floats in.
                     let bv = key_dim as usize * 4;
+                    // sanity: B's q-block row 0 IS global row kh, so this
+                    // must equal the plain path's rt.qkv at kh. If it does
+                    // not, the probe offsets are wrong, not card B.
+                    eprintln!("  GDNbq il={il} Bq0 {:?}", tb.qkv.read_f32(4)?);
                     eprintln!("  GDNb il={il} Bqkv_v {:?}", tb.qkv.read_f32_at(bv, 8)?);
                 }
                 kernels::gqa_head_rms_norm(&mut tb.gdn_o, Some(&bw.ssm_norm), t * vh, s.ssm_state, eps)?;
@@ -1528,6 +1547,8 @@ impl Model {
             }
             if dbg {
                 let pv = (2 * key_dim + value_dim / 2) as usize * 4;
+                eprintln!("  GDNpq il={il} Pq_kh {:?}",
+                    rt.qkv.read_f32_at((key_dim / 2) as usize * 4, 4)?);
                 eprintln!("  GDNp il={il} Pqkv_v {:?}", rt.qkv.read_f32_at(pv, 8)?);
             }
             if dbg {
