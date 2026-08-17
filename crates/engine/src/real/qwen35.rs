@@ -121,6 +121,11 @@ struct DenseBank {
     /// one past this bank's last layer (exclusive); banks tile the
     /// non-primary layer ranges in order
     end: usize,
+    /// handoff ordering. ev_p lives on the primary and gates the inbound
+    /// copy; ev_b lives on this bank's device and gates the outbound one.
+    /// An event can only be recorded on the device it was created on.
+    ev_p: kernels::XEvent,
+    ev_b: kernels::XEvent,
     dev: i32,
     /// first layer owned by dev (layers split contiguously)
     first: usize,
@@ -198,10 +203,16 @@ impl DenseBank {
         let q8k = |n: usize| {
             DeviceBuf::alloc(n / kernels::Q8_K_BLOCK_ELEMS * kernels::Q8_K_BLOCK_BYTES)
         };
+        kernels::set_device(primary)?;
+        let ev_p = kernels::XEvent::new()?;
+        kernels::set_device(dev)?;
+        let ev_b = kernels::XEvent::new()?;
         let b = DenseBank {
             dev,
             first,
             end,
+            ev_p,
+            ev_b,
             cur: f32s(T_MAX * n_embd)?,
             normed: f32s(T_MAX * n_embd)?,
             attn_out: f32s(T_MAX * n_embd)?,
@@ -1109,17 +1120,27 @@ impl Model {
                 // cheap next to a layer range and keeps every span's
                 // buffers on the card that runs it.
                 let bytes = (t * s.n_embd) as usize * 4;
-                kernels::copy_across(&mut b.cur, &st.cur, bytes)?;
-                b.swap(st, rt);
+                // Async handoff. Each copy is issued on the CONSUMER's
+                // stream after waiting on the producer's event, so the
+                // consumer's own prior reads of the destination are
+                // ordered before the overwrite. The host no longer blocks
+                // at a bank boundary, which is what pinned all three
+                // cards into running one after another.
+                b.ev_p.record()?;
                 kernels::set_device(b.dev)?;
+                b.ev_p.wait()?;
+                kernels::copy_across_async(&mut b.cur, &st.cur, bytes)?;
+                b.swap(st, rt);
                 self.eval_qwen35_span(st, rt, bfirst, bend, pos, t)?;
                 // hop 2 back: after the swap b.cur is the bank-side buffer
                 // holding the final residual
                 let b = &mut banks[bi];
                 b.swap(st, rt);
-                kernels::copy_across(&mut st.cur, &b.cur, bytes)?;
+                b.ev_b.record()?;
+                kernels::set_device(kernels::primary_device())?;
+                b.ev_b.wait()?;
+                kernels::copy_across_async(&mut st.cur, &b.cur, bytes)?;
                 if bi + 1 < n_banks {
-                    kernels::set_device(kernels::primary_device())?;
                     continue;
                 }
                 // dflash second-span captures: bounce to the primary while

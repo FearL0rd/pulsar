@@ -897,6 +897,40 @@ mod real {
     /// Blocking cudaMemcpy: legacy-stream ordered on the current device,
     /// so issue it with the producer's device current and the consumer
     /// device's later launches see the data.
+    /// An event for ordering work across cards. Recordable only on the
+    /// device that was current when it was created; waiting on it from
+    /// another device's stream is legal (and is the whole point).
+    pub struct XEvent(*mut c_void);
+    unsafe impl Send for XEvent {}
+    impl XEvent {
+        pub fn new() -> Result<XEvent> {
+            const DISABLE_TIMING: u32 = 2;
+            let mut e: *mut c_void = std::ptr::null_mut();
+            check_rt(unsafe { cudaEventCreateWithFlags(&mut e, DISABLE_TIMING) }, "xevent create")?;
+            Ok(XEvent(e))
+        }
+        pub fn record(&self) -> Result {
+            check_rt(unsafe { cudaEventRecord(self.0, STREAM_PER_THREAD) }, "xevent record")
+        }
+        pub fn wait(&self) -> Result {
+            check_rt(unsafe { cudaStreamWaitEvent(STREAM_PER_THREAD, self.0, 0) }, "xevent wait")
+        }
+    }
+
+    /// Async cross-device copy on the CURRENT device's stream. Issue it on
+    /// the CONSUMER's stream after waiting on the producer's event: that
+    /// orders the consumer's own prior reads of dst before the overwrite,
+    /// which a copy issued on the producer's stream would race. The point
+    /// of async here is that the host stops blocking at every bank
+    /// boundary, which is what serialized the three cards.
+    pub fn copy_across_async(dst: &mut DeviceBuf, src: &DeviceBuf, bytes: usize) -> Result {
+        assert!(bytes <= dst.bytes() && bytes <= src.bytes());
+        check_rt(
+            unsafe { cudaMemcpyAsync(dst.ptr_mut(), src.ptr(), bytes, MEMCPY_DEFAULT, STREAM_PER_THREAD) },
+            "copy across async",
+        )
+    }
+
     pub fn copy_across(dst: &mut DeviceBuf, src: &DeviceBuf, bytes: usize) -> Result {
         assert!(bytes <= dst.bytes() && bytes <= src.bytes());
         check_rt(
