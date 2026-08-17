@@ -30,7 +30,7 @@ if [ $# -ge 1 ]; then
     # census ratchet regression (2083a6a): a short run on a mature census
     # must not raise its max count - the seed+delta ratchet raised it every
     # run, which slowly skewed tier ranking toward long-cached slabs
-    if [ -f "${MODEL}.warm" ]; then
+    if [ -s "${MODEL}.warm" ]; then
         census_max() {
             python3 -c '
 import struct, sys

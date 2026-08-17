@@ -1513,6 +1513,17 @@ impl Model {
                     kernels::quantize_q8_k(&mut tb.midq, &tb.gdn_tmp, vdh, t)?;
                 }
                 matw(&mut tb.out, &bw.ssm_out, &tb.gdn_tmp, &tb.midq, vdh, s.n_embd, t)?;
+                if il == 0 && pos == 0 && t > 1 {
+                    if let Ok(dir) = std::env::var("PULSAR_DUMP_GDN") {
+                        eprintln!("DUMP_GDN firing il=0 pos=0 t={t}");
+                        kernels::sync()?;
+                        dump_f32(&format!("{dir}/tp_b_gdn.bin"), &tb.gdn_tmp.read_f32((t * vdh) as usize)?);
+                        let mut mb = vec![0u8; (t * vdh / 256) as usize * 292];
+                        tb.midq.read(0, &mut mb)?;
+                        let _ = std::fs::write(format!("{dir}/tp_b_midq.bin"), &mb);
+                        dump_f32(&format!("{dir}/tp_b_part.bin"), &tb.out.read_f32((t * s.n_embd) as usize)?);
+                    }
+                }
                 tb.lo.send(&tb.out, (t * s.n_embd) as usize * 4)?;
                 kernels::set_device(kernels::primary_device())?;
                 // A's half, overlapping with B's chain
@@ -1555,6 +1566,17 @@ impl Model {
                     kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, vdh, t)?;
                 }
                 matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, vdh, s.n_embd, t)?;
+                if il == 0 && pos == 0 && t > 1 {
+                    if let Ok(dir) = std::env::var("PULSAR_DUMP_GDN") {
+                        eprintln!("DUMP_GDN firing il=0 pos=0 t={t}");
+                        kernels::sync()?;
+                        dump_f32(&format!("{dir}/tp_a_gdn.bin"), &rt.gdn_tmp.read_f32((t * vdh) as usize)?);
+                        let mut mb = vec![0u8; (t * vdh / 256) as usize * 292];
+                        st.midq.read(0, &mut mb)?;
+                        let _ = std::fs::write(format!("{dir}/tp_a_midq.bin"), &mb);
+                        dump_f32(&format!("{dir}/tp_a_part.bin"), &st.attn_out.read_f32((t * s.n_embd) as usize)?);
+                    }
+                }
                 if dbg {
                     eprintln!("  TPpartA il={il} Apart {:?} z {:?} gdn_tmp {:?}",
                         st.attn_out.read_f32(2)?, rt.z.read_f32(2)?, rt.gdn_tmp.read_f32(2)?);
@@ -1631,6 +1653,15 @@ impl Model {
             kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * value_dim, 0.0, 1.0, 0)?;
             if matches!(gdn.ssm_out, MatW::Kq(_)) {
                 kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, value_dim, t)?;
+            }
+            if il == 0 && pos == 0 && t > 1 {
+                if let Ok(dir) = std::env::var("PULSAR_DUMP_GDN") {
+                    kernels::sync()?;
+                    dump_f32(&format!("{dir}/plain_gdn.bin"), &rt.gdn_tmp.read_f32((t * value_dim) as usize)?);
+                    let mut mb = vec![0u8; (t * value_dim / 256) as usize * 292];
+                    st.midq.read(0, &mut mb)?;
+                    let _ = std::fs::write(format!("{dir}/plain_midq.bin"), &mb);
+                }
             }
             if std::env::var("PULSAR_DEBUG_L2").ok().as_deref() == Some("1") && il == 0 {
                 eprintln!("  PLAINmid il={il} z {:?} gdn_tmp {:?}",
@@ -2163,4 +2194,10 @@ pub fn generate_dflash(
         }
     }
     Ok(committed)
+}
+
+/* env-gated dump for the TP shard hunt (PULSAR_DUMP_GDN=dir); inert otherwise */
+fn dump_f32(path: &str, v: &[f32]) {
+    let b: &[u8] = unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), v.len() * 4) };
+    let _ = std::fs::write(path, b);
 }

@@ -2690,6 +2690,40 @@ mod real {
         }
     }
 
+    /// MatW with an arbitrary set of INPUT column ranges repacked
+    /// contiguously per output row (GDN TP: the v heads a card owns are
+    /// interleaved, not a contiguous half). Ranges are in input values,
+    /// quant-block aligned by construction (multiples of ssm_state).
+    fn matw_col_ranges(file: &VFile, g: &Gguf, name: &str, cols: &[(u64, u64)]) -> Result<MatW> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        let in_dim = t.dims[0] as u64;
+        let native = MatW::keep_native(t);
+        let (bytes, rb, quant) = if native {
+            read_kq_bytes(file, g, name)?
+        } else {
+            let b = read_tensor_bytes(file, g, name)?;
+            (b, in_dim / 32 * 34, 0)
+        };
+        let rb = rb as usize;
+        // value index -> byte offset inside a row; exact for block-aligned
+        // ranges (256-value superblocks for K-quants, 32 for q8_0)
+        let bo = |v: u64| -> usize { (v as u128 * rb as u128 / in_dim as u128) as usize };
+        let hb: usize = cols.iter().map(|&(a, b)| bo(b) - bo(a)).sum();
+        let n = bytes.len() / rb;
+        let mut sl = Vec::with_capacity(n * hb);
+        for r in 0..n {
+            let row = &bytes[r * rb..(r + 1) * rb];
+            for &(a, b) in cols {
+                sl.extend_from_slice(&row[bo(a)..bo(b)]);
+            }
+        }
+        if native {
+            Ok(MatW::Kq(KqW { w: DeviceBuf::from_bytes(&sl)?, row_bytes: hb as u64, quant }))
+        } else {
+            Ok(MatW::Q8(DeviceBuf::from_bytes(&sl)?))
+        }
+    }
+
     /// K-quant tensor -> resident device bytes + the matmul_kq metadata.
     /// Reads RAW file bytes: read_tensor_bytes would requant K-quants to
     /// q8_0 (1.9x the VRAM and the wrong layout for matmul_kq).
@@ -4101,11 +4135,31 @@ mod real {
                                 // qkv row layout: [q key | k key | v value].
                                 let kd = (shape.ssm_k_heads * shape.ssm_state) as u64;
                                 let vd = (shape.ssm_v_heads * shape.ssm_state) as u64;
-                                let (kh, vh2) = (kd / 2, vd / 2);
+                                let kh = kd / 2;
                                 let vheads = shape.ssm_v_heads as u64;
+                                let hk = shape.ssm_k_heads as u64;
+                                let sd = shape.ssm_state as u64;
+                                let rep = vheads / hk;
+                                let khh = hk / 2;
+                                let vsel_of = |side: u64| -> Vec<(u64, u64)> {
+                                    (0..rep)
+                                        .map(|r| ((r * hk + side * khh) * sd, (r * hk + (side + 1) * khh) * sd))
+                                        .collect()
+                                };
+                                let hsel_of = |side: u64| -> Vec<(u64, u64)> {
+                                    (0..rep).map(|r| (r * hk + side * khh, r * hk + (side + 1) * khh)).collect()
+                                };
+                                let qkv_of = |side: u64, vsel: &[(u64, u64)]| -> Vec<(u64, u64)> {
+                                    let mut v = vec![
+                                        (side * kh, (side + 1) * kh),
+                                        (kd + side * kh, kd + (side + 1) * kh),
+                                    ];
+                                    v.extend(vsel.iter().map(|&(a, b)| (2 * kd + a, 2 * kd + b)));
+                                    v
+                                };
                                 let ck = shape.ssm_conv_k as usize;
                                 let ne = shape.n_embd as usize;
-                                let mk = |ranges: &[(u64, u64)], vr: (u64, u64), hr: (u64, u64), second: bool| -> Result<Qwen35Gdn> {
+                                let mk = |ranges: &[(u64, u64)], vsel: &[(u64, u64)], hsel: &[(u64, u64)]| -> Result<Qwen35Gdn> {
                                     let alpha = read_any_f32(&file, &gguf, &t("ssm_alpha.weight"))?;
                                     let beta = read_any_f32(&file, &gguf, &t("ssm_beta.weight"))?;
                                     let av = read_any_f32(&file, &gguf, &t("ssm_a"))?;
@@ -4115,7 +4169,6 @@ mod real {
                                     for &(r0, r1) in ranges {
                                         conv_sl.extend_from_slice(&convv[r0 as usize * ck..r1 as usize * ck]);
                                     }
-                                    let (h0, h1) = (hr.0 as usize, hr.1 as usize);
                                     Ok(Qwen35Gdn {
                                         wqkv: {
                                             let w = matw_row_ranges(&file, &gguf, &t("attn_qkv.weight"), ranges)?;
@@ -4137,29 +4190,42 @@ mod real {
                                             }
                                             w
                                         },
-                                        wz: matw_row_ranges(&file, &gguf, &t("attn_gate.weight"), &[vr])?,
+                                        wz: matw_row_ranges(&file, &gguf, &t("attn_gate.weight"), vsel)?,
                                         conv: DeviceBuf::from_f32(&conv_sl)?,
                                         ab_w: {
-                                            let mut ab = alpha[h0 * ne..h1 * ne].to_vec();
-                                            ab.extend_from_slice(&beta[h0 * ne..h1 * ne]);
+                                            let mut ab: Vec<f32> = Vec::new();
+                                            for &(h0, h1) in hsel {
+                                                ab.extend_from_slice(&alpha[h0 as usize * ne..h1 as usize * ne]);
+                                            }
+                                            for &(h0, h1) in hsel {
+                                                ab.extend_from_slice(&beta[h0 as usize * ne..h1 as usize * ne]);
+                                            }
                                             DeviceBuf::from_f32(&ab)?
                                         },
-                                        a: DeviceBuf::from_f32(&av[h0..h1])?,
-                                        dt_bias: DeviceBuf::from_f32(&dtv[h0..h1])?,
+                                        a: {
+                                            let mut v: Vec<f32> = Vec::new();
+                                            for &(h0, h1) in hsel {
+                                                v.extend_from_slice(&av[h0 as usize..h1 as usize]);
+                                            }
+                                            DeviceBuf::from_f32(&v)?
+                                        },
+                                        dt_bias: {
+                                            let mut v: Vec<f32> = Vec::new();
+                                            for &(h0, h1) in hsel {
+                                                v.extend_from_slice(&dtv[h0 as usize..h1 as usize]);
+                                            }
+                                            DeviceBuf::from_f32(&v)?
+                                        },
                                         ssm_norm: upload(&file, &gguf, &t("ssm_norm.weight"))?,
-                                        ssm_out: matw_col_half(&file, &gguf, &t("ssm_out.weight"), second)?,
+                                        ssm_out: matw_col_ranges(&file, &gguf, &t("ssm_out.weight"), vsel)?,
                                     })
                                 };
-                                let a_half = mk(
-                                    &[(0, kh), (kd, kd + kh), (2 * kd, 2 * kd + vh2)],
-                                    (0, vh2), (0, vheads / 2), false,
-                                )?;
+                                let va = vsel_of(0);
+                                let a_half = mk(&qkv_of(0, &va), &va, &hsel_of(0))?;
                                 let cur_dev = kernels::get_device();
                                 kernels::set_device(dev_b)?;
-                                *tp_gdn_stash.borrow_mut() = Some(mk(
-                                    &[(kh, kd), (kd + kh, 2 * kd), (2 * kd + vh2, 2 * kd + vd)],
-                                    (vh2, vd), (vheads / 2, vheads), true,
-                                )?);
+                                let vb = vsel_of(1);
+                                *tp_gdn_stash.borrow_mut() = Some(mk(&qkv_of(1, &vb), &vb, &hsel_of(1))?);
                                 kernels::set_device(cur_dev)?;
                                 Some(a_half)
                             } else {

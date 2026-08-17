@@ -2073,6 +2073,97 @@ mod tests {
         eprintln!("  double-quantization cost:      {:.2}x", eb / ea);
     }
 
+    /// TP shard contract: matmul_kq over a matw_col_half-style shard
+    /// (first half of every row's bytes, row_bytes halved, in_dim halved)
+    /// must equal matmul_kq over the full row with the upper half of the
+    /// activations zeroed. n_tok 1 / 8 / 64 cover the dot, token-tile
+    /// and GEMM dispatch paths. If this fails, the sliced-row_bytes
+    /// kernel path is the TP bug; if it passes, the fault is in how the
+    /// engine builds the shard at load.
+    ///
+    /// cargo test --release -p kernels nvfp4_col_shard -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn nvfp4_col_shard_matches_full() {
+        use super::*;
+        let in_dim = 6144u32; // ssm_out's real value_dim
+        let half = in_dim / 2;
+        let out_dim = 64u32;
+        let blocks = (in_dim / 256) as usize; // 24 superblocks per row
+        let rb = blocks * NVFP4_SB_BYTES; // 3456
+        let hb = rb / 2; // 1728, superblock-aligned
+
+        let mut host: Vec<u8> = (0..out_dim as usize * rb)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        for b in 0..out_dim as usize * blocks * 4 {
+            for sq in 0..4 {
+                host[b * 36 + sq] = 0x30 + ((b + sq) % 12) as u8;
+            }
+        }
+        let mut w_full = DeviceBuf::alloc(host.len()).unwrap();
+        w_full.write(0, &host).unwrap();
+        // matw_col_half, verbatim: first hb bytes of every row, contiguous
+        let mut sl = Vec::with_capacity(out_dim as usize * hb);
+        for r in 0..out_dim as usize {
+            sl.extend_from_slice(&host[r * rb..r * rb + hb]);
+        }
+        let mut w_half = DeviceBuf::alloc(sl.len()).unwrap();
+        w_half.write(0, &sl).unwrap();
+
+        for &n_tok in &[1u32, 8, 64] {
+            let x: Vec<f32> = (0..(in_dim * n_tok) as usize)
+                .map(|i| {
+                    if (i as u32 % in_dim) >= half {
+                        0.0
+                    } else {
+                        ((i * 2654435761usize) % 10007) as f32 / 10007.0 - 0.5
+                    }
+                })
+                .collect();
+            let xh: Vec<f32> = (0..n_tok as usize)
+                .flat_map(|t| {
+                    let b = t * in_dim as usize;
+                    x[b..b + half as usize].to_vec()
+                })
+                .collect();
+
+            let mut xf = DeviceBuf::alloc(x.len() * 4).unwrap();
+            xf.write(0, as_bytes(&x)).unwrap();
+            let mut xq = DeviceBuf::alloc(n_tok as usize * blocks * Q8_K_BLOCK_BYTES).unwrap();
+            quantize_q8_k(&mut xq, &xf, in_dim, n_tok).unwrap();
+
+            let mut xfh = DeviceBuf::alloc(xh.len() * 4).unwrap();
+            xfh.write(0, as_bytes(&xh)).unwrap();
+            let mut xqh = DeviceBuf::alloc(n_tok as usize * (blocks / 2) * Q8_K_BLOCK_BYTES).unwrap();
+            quantize_q8_k(&mut xqh, &xfh, half, n_tok).unwrap();
+
+            let n_out = (n_tok * out_dim) as usize;
+            let mut out_f = DeviceBuf::alloc(n_out * 4).unwrap();
+            matmul_kq(&mut out_f, &w_full, &xq, in_dim, out_dim, n_tok, rb as u64, QUANT_NVFP4).unwrap();
+            let mut out_h = DeviceBuf::alloc(n_out * 4).unwrap();
+            matmul_kq(&mut out_h, &w_half, &xqh, half, out_dim, n_tok, hb as u64, QUANT_NVFP4).unwrap();
+            sync().unwrap();
+
+            let a = out_f.read_f32(n_out).unwrap();
+            let b = out_h.read_f32(n_out).unwrap();
+            let mut worst = 0f32;
+            let mut wi = 0usize;
+            for i in 0..n_out {
+                let d = (a[i] - b[i]).abs();
+                if d > worst {
+                    worst = d;
+                    wi = i;
+                }
+            }
+            eprintln!(
+                "n_tok {n_tok:>2}: max |full - shard| = {worst:.3e} at [{wi}] (full {} shard {})",
+                a[wi], b[wi]
+            );
+            assert!(worst < 1e-4, "n_tok {n_tok}: shard diverges from full at [{wi}]");
+        }
+    }
+
     /// cargo test --release -p kernels nvfp4_a4_bench -- --ignored --nocapture
     ///
     /// The int8 mma path and the FP4 path over the IDENTICAL weight
