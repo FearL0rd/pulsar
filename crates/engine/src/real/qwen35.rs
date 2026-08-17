@@ -126,6 +126,9 @@ struct DenseBank {
     /// An event can only be recorded on the device it was created on.
     ev_p: kernels::XEvent,
     ev_b: kernels::XEvent,
+    /// fires when this bank's INBOUND copy has finished reading the
+    /// primary's residual, so the primary can overwrite it
+    ev_in: kernels::XEvent,
     dev: i32,
     /// first layer owned by dev (layers split contiguously)
     first: usize,
@@ -207,12 +210,14 @@ impl DenseBank {
         let ev_p = kernels::XEvent::new()?;
         kernels::set_device(dev)?;
         let ev_b = kernels::XEvent::new()?;
+        let ev_in = kernels::XEvent::new()?;
         let b = DenseBank {
             dev,
             first,
             end,
             ev_p,
             ev_b,
+            ev_in,
             cur: f32s(T_MAX * n_embd)?,
             normed: f32s(T_MAX * n_embd)?,
             attn_out: f32s(T_MAX * n_embd)?,
@@ -1130,16 +1135,35 @@ impl Model {
                 kernels::set_device(b.dev)?;
                 b.ev_p.wait()?;
                 kernels::copy_across_async(&mut b.cur, &st.cur, bytes)?;
+                // the copy READS the primary's residual from this bank's
+                // stream; without the old blocking copy-back nothing else
+                // stops the next chunk's embed from overwriting it
+                b.ev_in.record()?;
                 b.swap(st, rt);
                 self.eval_qwen35_span(st, rt, bfirst, bend, pos, t)?;
                 // hop 2 back: after the swap b.cur is the bank-side buffer
                 // holding the final residual
                 let b = &mut banks[bi];
                 b.swap(st, rt);
-                b.ev_b.record()?;
-                kernels::set_device(kernels::primary_device())?;
-                b.ev_b.wait()?;
-                kernels::copy_across_async(&mut st.cur, &b.cur, bytes)?;
+                // The last bank's residual is only read on the primary when
+                // this chunk wants logits (rows > 0). For every other chunk
+                // the copy is dead work AND the thing that pins card 0: it
+                // puts a wait-on-bank-event into the PRIMARY stream, so the
+                // next chunk's embed cannot start until the banks finish.
+                // Dropping it lets card 0 run ahead, which is the whole
+                // point, since chunk i+1 layer 0 consumes its own token
+                // embeddings and not this residual.
+                if bi + 1 < n_banks || rows > 0 {
+                    b.ev_b.record()?;
+                    kernels::set_device(kernels::primary_device())?;
+                    b.ev_b.wait()?;
+                    kernels::copy_across_async(&mut st.cur, &b.cur, bytes)?;
+                } else {
+                    kernels::set_device(kernels::primary_device())?;
+                }
+                // wait only for the handoff copy, never for the span: that
+                // is what keeps card 0 free to start the next chunk
+                banks[bi].ev_in.wait()?;
                 if bi + 1 < n_banks {
                     continue;
                 }
