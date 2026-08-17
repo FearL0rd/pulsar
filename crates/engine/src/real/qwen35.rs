@@ -1097,7 +1097,7 @@ impl Model {
         let n0 = banks.first().map_or(self.layers.len(), |b| b.first);
         let mut pos = pos0;
         let mut last_t = 0u32;
-        let mut run = |st: &mut State, rt: &mut Qwen35Rt, chunk: &[u32], pos: u32| -> Result {
+        let mut run = |st: &mut State, rt: &mut Qwen35Rt, chunk: &[u32], pos: u32, last: bool| -> Result {
             let t = chunk.len() as u32;
             let ids: Vec<i32> = chunk.iter().map(|&x| x as i32).collect();
             st.tok.write(0, kernels::as_bytes(&ids))?;
@@ -1145,15 +1145,20 @@ impl Model {
                 // holding the final residual
                 let b = &mut banks[bi];
                 b.swap(st, rt);
-                // The last bank's residual is only read on the primary when
-                // this chunk wants logits (rows > 0). For every other chunk
+                // The last bank residual is read on the primary only for
+                // the FINAL chunk of the call: by the head when logits are
+                // wanted, and by the MTP draft head, which builds its input
+                // from that hidden state even when rows == 0. Gating on
+                // rows alone silently starved the draft and dropped
+                // acceptance 83% -> 69% while greedy output stayed correct,
+                // because the target still verifies. For every other chunk
                 // the copy is dead work AND the thing that pins card 0: it
                 // puts a wait-on-bank-event into the PRIMARY stream, so the
                 // next chunk's embed cannot start until the banks finish.
                 // Dropping it lets card 0 run ahead, which is the whole
                 // point, since chunk i+1 layer 0 consumes its own token
                 // embeddings and not this residual.
-                if bi + 1 < n_banks || rows > 0 {
+                if bi + 1 < n_banks || last {
                     b.ev_b.record()?;
                     kernels::set_device(kernels::primary_device())?;
                     b.ev_b.wait()?;
@@ -1195,8 +1200,9 @@ impl Model {
             }
             Ok(())
         };
-        for chunk in tokens.chunks(T_MAX) {
-            run(st, rt, chunk, pos)?;
+        let n_chunks = tokens.chunks(T_MAX).count();
+        for (ci, chunk) in tokens.chunks(T_MAX).enumerate() {
+            run(st, rt, chunk, pos, ci + 1 == n_chunks)?;
             pos += chunk.len() as u32;
             last_t = chunk.len() as u32;
         }
