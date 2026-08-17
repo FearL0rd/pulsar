@@ -3328,18 +3328,113 @@ mod real {
                         n0 -= 1;
                     }
                 }
-                if let Some(n) = std::env::var("PULSAR_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+                // PULSAR_SPLIT=<n> pins the primary's layer count;
+                // PULSAR_SPLIT=<n0>,<n1>,... pins EVERY card's count
+                // (primary first, then secondaries fastest-first). The
+                // list form exists because the auto plan sizes by WEIGHT
+                // bytes only - it cannot see ctx, which is a State
+                // parameter chosen after load - so it packs the fewest
+                // cards and then KV OOMs at long ctx. Spreading layers
+                // wider spreads their KV with them.
+                let split_env = std::env::var("PULSAR_SPLIT").ok();
+                let split_list: Vec<usize> = split_env
+                    .as_deref()
+                    .map(|v| v.split(',').filter_map(|x| x.trim().parse::<usize>().ok()).collect())
+                    .unwrap_or_default();
+                if let Some(&n) = split_list.first() {
                     n0 = n.min(lbytes.len());
                 }
-                for d in layer_dev.iter_mut().skip(n0) {
-                    *d = second;
+                // Spread the remainder over EVERY secondary, fastest
+                // first, each filled to its own free VRAM. Two-card was
+                // the old shape and it stranded a third card entirely;
+                // rigs running pulsar are heterogeneous, and a slow card
+                // still contributes capacity (its layers' KV allocates
+                // there too, which is what raises the context ceiling).
+                // Layers run sequentially within a token, so filling the
+                // fast cards first minimizes sum(bytes/bw), same
+                // reasoning as the primary fill above.
+                let mut secs: Vec<i32> = (0..kernels::device_count())
+                    .filter(|&d| d != primary)
+                    .collect();
+                secs.sort_by(|&a, &b| {
+                    kernels::vram_bandwidth(b)
+                        .partial_cmp(&kernels::vram_bandwidth(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut i = n0;
+                let n_sec = secs.len();
+                for (si, d) in secs.iter().copied().enumerate() {
+                    if i >= lbytes.len() {
+                        break;
+                    }
+                    let free = kernels::mem_info(d).map(|(f, _)| f as u64).unwrap_or(0);
+                    let reserve = 2u64 << 30;
+                    let mut take = 0usize;
+                    let mut used = 0u64;
+                    while i + take < lbytes.len()
+                        && used + lbytes[i + take] + reserve <= free
+                    {
+                        used += lbytes[i + take];
+                        take += 1;
+                    }
+                    if let Some(&n) = split_list.get(si + 1) {
+                        take = n.min(lbytes.len() - i);
+                    } else if si + 1 == n_sec {
+                        // last card swallows any remainder: leaving layers
+                        // unassigned would silently keep them on an already
+                        // full primary and die at cudaMalloc instead
+                        take = lbytes.len() - i;
+                    }
+                    for k in 0..take {
+                        layer_dev[i + k] = d;
+                    }
+                    if take > 0 {
+                        let b: u64 = lbytes[i..i + take].iter().sum();
+                        eprintln!(
+                            "pulsar: dense split: layers {}..{} on device {d} ({:.1}GiB)",
+                            i,
+                            i + take,
+                            b as f64 / GIB
+                        );
+                    }
+                    i += take;
                 }
-                let b1: u64 = lbytes[n0..].iter().sum();
+                // DenseBank (real/qwen35.rs) holds exactly ONE secondary:
+                // it takes dev = layer_dev(first non-primary layer) and
+                // runs every remaining layer there, so a plan touching two
+                // secondaries launches kernels on the wrong device and dies
+                // at cudaDeviceSynchronize. Collapse any such plan onto the
+                // first secondary until the forward grows a bank per device.
+                // ponytail: this is the guard, not the fix - the fix is a
+                // Vec<DenseBank> with a hop at each ownership boundary,
+                // which is what a 3+ card rig needs to spread KV.
+                let used: Vec<i32> = {
+                    let mut u: Vec<i32> = Vec::new();
+                    for &d in layer_dev.iter() {
+                        if d != primary && !u.contains(&d) {
+                            u.push(d);
+                        }
+                    }
+                    u
+                };
+                if used.len() > 1 {
+                    eprintln!(
+                        "pulsar: dense split spans {} secondaries but the forward supports 1; collapsing onto device {}",
+                        used.len(),
+                        used[0]
+                    );
+                    for d in layer_dev.iter_mut() {
+                        if *d != primary {
+                            *d = used[0];
+                        }
+                    }
+                }
+                let b0: u64 = lbytes[..n0].iter().sum();
                 eprintln!(
-                    "pulsar: dense split: layers 0..{n0} on device {primary}, {n0}..{} on device {second} ({:.1}GiB)",
-                    lbytes.len(),
-                    b1 as f64 / GIB
+                    "pulsar: dense split: layers 0..{n0} on device {primary} ({:.1}GiB)",
+                    b0 as f64 / GIB
                 );
+                let _ = second;
             }
 
             // Mla: spend a VRAM budget on the two big per-layer attn
