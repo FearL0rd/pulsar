@@ -1374,6 +1374,12 @@ impl Model {
                         vh, kh, s.ssm_state, t,
                     )?;
                 }
+                if dbg {
+                    // B-side head 0 == global head vh == the plain path's
+                    // first UPPER head: the only apples-to-apples compare
+                    eprintln!("  GDNb il={il} Bh0 gdn_o {:?} gv {:?}",
+                        tb.gdn_o.read_f32(2)?, tb.gv.read_f32(2)?);
+                }
                 kernels::gqa_head_rms_norm(&mut tb.gdn_o, Some(&bw.ssm_norm), t * vh, s.ssm_state, eps)?;
                 kernels::swiglu(&mut tb.gdn_tmp, &tb.z, &tb.gdn_o, t * vdh, 0.0, 1.0, 0)?;
                 if matches!(bw.ssm_out, MatW::Kq(_)) {
@@ -1472,8 +1478,14 @@ impl Model {
                 );
             }
             if dbg {
-                eprintln!("  GDNmid il={il} conv {:?} gq {:?} gv {:?} gdn_o {:?}",
-                    rt.conv_out.read_f32(2)?, rt.gq.read_f32(2)?, rt.gv.read_f32(2)?, rt.gdn_o.read_f32(2)?);
+                // head 0 AND the first UPPER head: head 0 lives on card A
+                // in every config, so only the upper-head values can show
+                // a split-vs-TP divergence (ssm_out mixes all heads, which
+                // is why attn_out differs while head 0 matches)
+                let up = (s.ssm_v_heads / 2 * s.ssm_state) as usize * 4;
+                eprintln!("  GDNmid il={il} h0 gdn_o {:?} gv {:?} | hUP gdn_o {:?} gv {:?}",
+                    rt.gdn_o.read_f32(2)?, rt.gv.read_f32(2)?,
+                    rt.gdn_o.read_f32_at(up, 2)?, rt.gv.read_f32_at(up, 2)?);
             }
             kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * s.ssm_v_heads, s.ssm_state, eps)?;
             kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * value_dim, 0.0, 1.0, 0)?;
