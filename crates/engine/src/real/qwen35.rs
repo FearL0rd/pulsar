@@ -1427,9 +1427,7 @@ impl Model {
                     // first UPPER head: the only apples-to-apples compare.
                     // B's v-block starts at 2*kdh = key_dim floats in.
                     let bv = key_dim as usize * 4;
-                    eprintln!("  GDNb il={il} Bqkv_v {:?} Bconv_v {:?} Bgv {:?} Bgdn_o {:?}",
-                        tb.qkv.read_f32_at(bv, 2)?, tb.conv_out.read_f32_at(bv, 2)?,
-                        tb.gv.read_f32(2)?, tb.gdn_o.read_f32(2)?);
+                    eprintln!("  GDNb il={il} Bqkv_v {:?}", tb.qkv.read_f32_at(bv, 8)?);
                 }
                 kernels::gqa_head_rms_norm(&mut tb.gdn_o, Some(&bw.ssm_norm), t * vh, s.ssm_state, eps)?;
                 kernels::swiglu(&mut tb.gdn_tmp, &tb.z, &tb.gdn_o, t * vdh, 0.0, 1.0, 0)?;
@@ -1530,8 +1528,7 @@ impl Model {
             }
             if dbg {
                 let pv = (2 * key_dim + value_dim / 2) as usize * 4;
-                eprintln!("  GDNp il={il} Pqkv_v {:?} Pconv_v {:?}",
-                    rt.qkv.read_f32_at(pv, 2)?, rt.conv_out.read_f32_at(pv, 2)?);
+                eprintln!("  GDNp il={il} Pqkv_v {:?}", rt.qkv.read_f32_at(pv, 8)?);
             }
             if dbg {
                 // head 0 AND the first UPPER head: head 0 lives on card A
