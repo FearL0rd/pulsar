@@ -5548,8 +5548,14 @@ mod real {
             // kv heads), so the deadlock cause is absent and quantized KV
             // is what makes long contexts fit: f32 costs 64KB/pos/card on
             // Qwen3.8-27B, fp8 ~16KB.
-            let kv_dense =
-                s.family == Family::Qwen35 && s.n_expert == 1 && m.tp.is_none();
+            // The deadlock this guards against was diagnosed before the
+            // multi-bank rewrite. PULSAR_KV_DENSE=1 lifts it for testing:
+            // fp8 KV is worth 4x the attention bandwidth (which prefill is
+            // still bound by) and 4x the context ceiling.
+            let kv_dense = s.family == Family::Qwen35
+                && s.n_expert == 1
+                && m.tp.is_none()
+                && std::env::var("PULSAR_KV_DENSE").is_err();
             // Exhaustive: whether a family can honor PULSAR_KV is a property
             // of its cache layout, and the wrong answer here is not a slow
             // path but a hang (see the qwen35-dense note above). A new family
