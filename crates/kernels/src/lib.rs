@@ -1632,16 +1632,28 @@ mod tests {
         let n_tok = 70u32; // >= 32 takes the gemm; 70 exercises the token tail
         let blocks = (in_dim / 256) as usize;
         for &(quant, bpb, d_off, name) in
-            &[(QUANT_Q4_K, 144usize, 0usize, "q4_K"), (QUANT_Q6_K, 210, 208, "q6_K")]
+            &[(QUANT_Q4_K, 144usize, 0usize, "q4_K"), (QUANT_Q6_K, 210, 208, "q6_K"),
+              (QUANT_NVFP4, 144, 0, "nvfp4")]
         {
         let rb = blocks * bpb;
         let wbytes = out_dim as usize * rb;
         let mut host: Vec<u8> = (0..wbytes).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect();
         // pin every block's f16 scale fields to finite values
         for b in 0..out_dim as usize * blocks {
-            host[b * bpb + d_off..b * bpb + d_off + 2].copy_from_slice(&0x3400u16.to_le_bytes()); // d = 0.25
-            if quant == QUANT_Q4_K {
-                host[b * bpb + 2..b * bpb + 4].copy_from_slice(&0x3000u16.to_le_bytes()); // dmin = 0.125
+            if quant == QUANT_NVFP4 {
+                // 4 sub-blocks of 36B; bytes 0..4 of each are UE4M3
+                // scales, and 0 / 0x7F both mean "zero block" - pin a
+                // finite one or the test compares zeros to zeros.
+                for sb in 0..4 {
+                    for k in 0..4 {
+                        host[b * bpb + sb * 36 + k] = 0x40;
+                    }
+                }
+            } else {
+                host[b * bpb + d_off..b * bpb + d_off + 2].copy_from_slice(&0x3400u16.to_le_bytes()); // d = 0.25
+                if quant == QUANT_Q4_K {
+                    host[b * bpb + 2..b * bpb + 4].copy_from_slice(&0x3000u16.to_le_bytes()); // dmin = 0.125
+                }
             }
         }
         let mut w = DeviceBuf::alloc(wbytes).unwrap();

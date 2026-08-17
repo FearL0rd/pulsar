@@ -4022,6 +4022,109 @@ __global__ static void matmul_kq_gemm_mma_kernel(
 #endif
 }
 
+
+/* NVFP4 flavor of the prefill GEMM. Layout: 144B per 256-value
+ * superblock = 4 blocks x 36B, each block holding 4 UE4M3 scale bytes
+ * then 32 nibble bytes; within a 16-value sub-block the low nibbles are
+ * values 0..7 and the high nibbles 8..15. The doubled-e2m1 codebook
+ * (mxfp4_lookup4) decodes straight to int8 and ue4m3_half carries the
+ * compensating 0.5, so this rides the same per-16-scale frame as q6_K
+ * with no min term. */
+__global__ static void matmul_kq_gemm_nvfp4(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+    __shared__ int8_t wq_s[PULSAR_GEMM_BM * PULSAR_GEMM_WS];
+    __shared__ int8_t yq_s[PULSAR_GEMM_BN * PULSAR_GEMM_YS];
+    __shared__ float wsc_s[PULSAR_GEMM_BM][16];
+    __shared__ float yd_s[PULSAR_GEMM_BN];
+
+    const uint32_t tx = threadIdx.x;
+    const uint32_t ty = threadIdx.y;
+    const uint32_t tid = ty * 64u + tx;
+    const uint32_t row0 = blockIdx.x * PULSAR_GEMM_BM;
+    const uint32_t tok0 = blockIdx.y * PULSAR_GEMM_BN;
+    const uint32_t tok = tok0 + tx;
+
+    float acc[8];
+    #pragma unroll
+    for (int r = 0; r < 8; r++) acc[r] = 0.0f;
+
+    for (uint32_t b = 0; b < in_blocks; b++) {
+        {
+            const uint32_t r = tid >> 3;
+            const uint32_t j5 = tid & 7u;
+            const uint32_t rg = row0 + r < out_dim ? row0 + r : out_dim - 1u;
+            /* thread j5 -> block nb, sub-block pair sp: 2 subs x 2 halves */
+            const uint32_t nb = j5 >> 1, sp = j5 & 1u;
+            const char *bp = w + (uint64_t)rg * row_bytes + (uint64_t)b * 144u
+                    + (uint64_t)nb * 36u;
+            #pragma unroll
+            for (uint32_t si = 0; si < 2u; si++) {
+                const uint32_t sub = sp * 2u + si;
+                uint8_t e;
+                memcpy(&e, bp + sub, 1);
+                wsc_s[r][nb * 4u + sub] = ue4m3_half(e);
+                #pragma unroll
+                for (uint32_t h = 0; h < 2u; h++) {
+                    const uint32_t v = *(const uint32_t *)(bp + 4u + sub * 8u + h * 4u);
+                    const int32_t lo = mxfp4_lookup4(v & 0x0f0f0f0fu);
+                    const int32_t hi = mxfp4_lookup4((v >> 4) & 0x0f0f0f0fu);
+                    int8_t *dst = wq_s + r * PULSAR_GEMM_WS + nb * 64u + sub * 16u + h * 4u;
+                    *(int32_t *)dst = lo;
+                    *(int32_t *)(dst + 8) = hi;
+                }
+            }
+        }
+        {
+            const uint32_t t = tid >> 2;
+            const uint32_t q = tid & 3u;
+            const uint32_t tg = tok0 + t < n_tok ? tok0 + t : n_tok - 1u;
+            const block_q8_K *yb = xq + (uint64_t)tg * in_blocks + b;
+            const uint8_t *src = (const uint8_t *)yb->qs + 64u * q;
+            int8_t *dst = yq_s + t * PULSAR_GEMM_YS + 64u * q;
+            #pragma unroll
+            for (int i = 0; i < 64; i += 4)
+                *(uint32_t *)(dst + i) = *(const uint32_t *)(src + i);
+            if (q == 0u) yd_s[t] = yb->d;
+        }
+        __syncthreads();
+
+        const int8_t *yrow = yq_s + tx * PULSAR_GEMM_YS;
+        const float ydv = yd_s[tx];
+        #pragma unroll
+        for (uint32_t k = 0; k < 16u; k++) {
+            int yw[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                yw[i] = *(const int32_t *)(yrow + 16u * k + 4u * i);
+            #pragma unroll
+            for (int r = 0; r < 8; r++) {
+                const uint32_t rl = ty * 8u + r;
+                const int8_t *wr_ = wq_s + rl * PULSAR_GEMM_WS + 16u * k;
+                int sg = 0;
+                #pragma unroll
+                for (int i = 0; i < 4; i++)
+                    sg = __dp4a(*(const int32_t *)(wr_ + 4 * i), yw[i], sg);
+                acc[r] += ydv * wsc_s[rl][k] * (float)sg;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tok < n_tok) {
+        #pragma unroll
+        for (int r = 0; r < 8; r++) {
+            const uint32_t rg = row0 + ty * 8u + r;
+            if (rg < out_dim) out[(uint64_t)tok * out_dim + rg] = acc[r];
+        }
+    }
+}
+
 extern "C" int pulsar_matmul_kq(
         void *out_dev,
         const void *w_dev,
@@ -4040,8 +4143,21 @@ extern "C" int pulsar_matmul_kq(
      * weight read per 64 tokens instead of per 16. PULSAR_NO_GEMM=1
      * falls back to the grouped path (uncached read: it is one launch). */
     if (n_tok >= 32u &&
-        (quant == PULSAR_QUANT_Q4_K || quant == PULSAR_QUANT_Q6_K) &&
+        (quant == PULSAR_QUANT_Q4_K || quant == PULSAR_QUANT_Q6_K
+         || quant == PULSAR_QUANT_NVFP4) &&
         !getenv("PULSAR_NO_GEMM")) {
+        /* nvfp4 has no mma flavor yet: the mma path keys off
+         * UNPACK::chunk16 policies (unpack_q4_K/unpack_q6_K) and there
+         * is no unpack_nvfp4. Take the dp4a gemm for it. */
+        if (quant == PULSAR_QUANT_NVFP4) {
+            dim3 ggrid((out_dim + PULSAR_GEMM_BM - 1u) / PULSAR_GEMM_BM,
+                       (n_tok + PULSAR_GEMM_BN - 1u) / PULSAR_GEMM_BN, 1);
+            dim3 gblock(64, 4, 1);
+            matmul_kq_gemm_nvfp4<<<ggrid, gblock>>>(
+                    (float *)out_dev, (const char *)w_dev,
+                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+            return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_nvfp4 launch");
+        }
         if (pulsar_device_cc_major() >= 8 && !getenv("PULSAR_NO_MMA")) {
             dim3 mgrid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
             if (quant == PULSAR_QUANT_Q4_K)
