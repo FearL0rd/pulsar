@@ -1555,7 +1555,14 @@ impl Model {
                     kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, vdh, t)?;
                 }
                 matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, vdh, s.n_embd, t)?;
+                if dbg {
+                    eprintln!("  TPpartA il={il} Apart {:?} z {:?} gdn_tmp {:?}",
+                        st.attn_out.read_f32(2)?, rt.z.read_f32(2)?, rt.gdn_tmp.read_f32(2)?);
+                }
                 tb.lo.recv(&mut tb.recv, (t * s.n_embd) as usize * 4)?;
+                if dbg {
+                    eprintln!("  TPpartB il={il} Bpart {:?}", tb.recv.read_f32(2)?);
+                }
                 kernels::add_assign(&mut st.attn_out, &tb.recv, t * s.n_embd)?;
             } else {
             // ---- Gated DeltaNet (recurrences loop inside the launches)
@@ -1624,6 +1631,26 @@ impl Model {
             kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * value_dim, 0.0, 1.0, 0)?;
             if matches!(gdn.ssm_out, MatW::Kq(_)) {
                 kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, value_dim, t)?;
+            }
+            if std::env::var("PULSAR_DEBUG_L2").ok().as_deref() == Some("1") && il == 0 {
+                eprintln!("  PLAINmid il={il} z {:?} gdn_tmp {:?}",
+                    rt.z.read_f32(2)?, rt.gdn_tmp.read_f32(2)?);
+            }
+            // debug: zero the upper head half so the plain path computes
+            // exactly what card A is supposed to contribute under TP
+            if std::env::var("PULSAR_DEBUG_ZERO_UPPER").is_ok() {
+                let vd = value_dim as usize;
+                let n = t as usize * vd;
+                let mut v = rt.gdn_tmp.read_f32(n)?;
+                for tok in 0..t as usize {
+                    for i in (vd / 2)..vd {
+                        v[tok * vd + i] = 0.0;
+                    }
+                }
+                rt.gdn_tmp.write(0, kernels::as_bytes(&v))?;
+                if matches!(gdn.ssm_out, MatW::Kq(_)) {
+                    kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, value_dim, t)?;
+                }
             }
             matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, value_dim, s.n_embd, t)?;
             }
