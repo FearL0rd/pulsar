@@ -974,7 +974,11 @@ mod real {
     /// t, embedding of t+1) through one extra transformer layer.
     struct MtpLayer {
         layer: LayerW,
-        eh_proj: DeviceBuf, // q8_0 [n_embd][2*n_embd]
+        /// [n_embd][2*n_embd] in whatever the file ships. NVFP4 ggufs
+        /// (Qwen3.8 nextn, ggml type 40) kept this native, and reading
+        /// those 36-byte blocks as q8_0's 34-byte ones made EVERY draft
+        /// logit NaN -> argmax 0 -> 0% acceptance and a 3x slowdown.
+        eh_proj: MatW,
         enorm: DeviceBuf,
         hnorm: DeviceBuf,
         head_norm: DeviceBuf,
@@ -4383,7 +4387,7 @@ mod real {
                     }
                     let m = MtpLayer {
                         layer,
-                        eh_proj: upload(&file, &gguf, &nextn("eh_proj"))?,
+                        eh_proj: MatW::load(&file, &gguf, &nextn("eh_proj"))?,
                         enorm: upload(&file, &gguf, &nextn("enorm"))?,
                         hnorm: upload(&file, &gguf, &nextn("hnorm"))?,
                         head_norm: upload(&file, &gguf, &nextn("shared_head_norm"))?,
@@ -4881,6 +4885,7 @@ mod real {
         mtp_e: DeviceBuf,
         mtp_h: DeviceBuf,
         mtp_x: DeviceBuf,
+        mtp_xq: DeviceBuf,
         mtp_hidden: DeviceBuf,
         /// true-hidden anchor saved across a draft chain (the chain
         /// self-feeds approximate hiddens into mtp_hidden; the batched
@@ -6273,6 +6278,13 @@ mod real {
                 mtp_e: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
                 mtp_h: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
                 mtp_x: f32s(if m.mtp.is_some() { mb * 2 * s.n_embd } else { 1 })?,
+                // q8_K activations for a native-quant eh_proj
+                mtp_xq: DeviceBuf::alloc(if m.mtp.is_some() {
+                    (mb * 2 * s.n_embd) as usize / kernels::Q8_K_BLOCK_ELEMS
+                        * kernels::Q8_K_BLOCK_BYTES
+                } else {
+                    1
+                })?,
                 mtp_hidden: {
                     let mut b = f32s(if m.mtp.is_some() { s.n_embd } else { 1 })?;
                     // read before first write (position 0 has no prior
@@ -8315,7 +8327,13 @@ mod real {
                 kernels::copy_d2d(&mut st.mtp_x, i * 2 * row, &st.mtp_e, i * row, row)?;
                 kernels::copy_d2d(&mut st.mtp_x, i * 2 * row + row, &st.mtp_h, i * row, row)?;
             }
-            kernels::matmul_q8_0(&mut st.cur, &mtp.eh_proj, &st.mtp_x, 2 * s.n_embd, s.n_embd, n_tok)?;
+            match &mtp.eh_proj {
+                MatW::Q8(b) => kernels::matmul_q8_0(&mut st.cur, b, &st.mtp_x, 2 * s.n_embd, s.n_embd, n_tok)?,
+                MatW::Kq(k) => {
+                    kernels::quantize_q8_k(&mut st.mtp_xq, &st.mtp_x, 2 * s.n_embd, n_tok)?;
+                    kernels::matmul_kq(&mut st.cur, &k.w, &st.mtp_xq, 2 * s.n_embd, s.n_embd, n_tok, k.row_bytes, k.quant)?
+                }
+            }
             self.mtp_eval_layer(st, n_tok, pos0, primary)
         }
 
@@ -8378,7 +8396,13 @@ mod real {
             kernels::rms_norm(&mut st.mtp_h, &st.mtp_hidden, &mtp.hnorm, s.n_embd, 1, s.rms_eps)?;
             kernels::copy_d2d(&mut st.mtp_x, 0, &st.mtp_e, 0, row)?;
             kernels::copy_d2d(&mut st.mtp_x, row, &st.mtp_h, 0, row)?;
-            kernels::matmul_q8_0(&mut st.cur, &mtp.eh_proj, &st.mtp_x, 2 * s.n_embd, s.n_embd, 1)?;
+            match &mtp.eh_proj {
+                MatW::Q8(b) => kernels::matmul_q8_0(&mut st.cur, b, &st.mtp_x, 2 * s.n_embd, s.n_embd, 1)?,
+                MatW::Kq(k) => {
+                    kernels::quantize_q8_k(&mut st.mtp_xq, &st.mtp_x, 2 * s.n_embd, 1)?;
+                    kernels::matmul_kq(&mut st.cur, &k.w, &st.mtp_xq, 2 * s.n_embd, s.n_embd, 1, k.row_bytes, k.quant)?
+                }
+            }
             self.mtp_eval_layer(st, 1, pos, primary)
         }
     }
