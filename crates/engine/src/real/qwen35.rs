@@ -1385,6 +1385,11 @@ impl Model {
                 tb.lx.send(&st.normed, (t * s.n_embd) as usize * 4)?;
                 kernels::set_device(tb.dev)?;
                 tb.lx.recv(&mut tb.normed, (t * s.n_embd) as usize * 4)?;
+                if dbg {
+                    // does the TpLink hand card B the SAME activations A
+                    // computed? A's normed printed by the L2 probe above.
+                    eprintln!("  TPlink il={il} B.normed {:?}", tb.normed.read_f32(2)?);
+                }
                 if matches!(bw.wqkv, MatW::Kq(_)) {
                     kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, t)?;
                 }
