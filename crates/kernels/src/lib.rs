@@ -1887,6 +1887,75 @@ mod tests {
         assert!(worst < 1e-4, "nvfp4 a4 gemm diverges from the decode: {worst}");
     }
 
+    /// cargo test --release -p kernels nvfp4_a4_bench -- --ignored --nocapture
+    ///
+    /// The int8 mma path and the FP4 path over the IDENTICAL weight
+    /// bytes, so the only difference measured is how they are consumed.
+    #[test]
+    #[ignore = "perf probe, requires a Blackwell CUDA device"]
+    fn nvfp4_a4_bench() {
+        use super::*;
+        use std::time::Instant;
+        if cc_major() < 12 {
+            eprintln!("nvfp4 a4 bench: needs sm_120a, device is cc {}", cc_major());
+            return;
+        }
+        let out_dim = 16384u32;
+        let in_dim = 4096u32;
+        let n_tok = 128u32;
+        let blocks = (in_dim / 256) as usize;
+        let rb = blocks * NVFP4_SB_BYTES;
+
+        let mut host: Vec<u8> = (0..out_dim as usize * rb)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        for b in 0..out_dim as usize * blocks * 4 {
+            for sc in 0..4 {
+                host[b * 36 + sc] = 0x30 + ((b + sc) % 12) as u8;
+            }
+        }
+        let mut w = DeviceBuf::alloc(host.len()).unwrap();
+        w.write(0, &host).unwrap();
+
+        let x: Vec<f32> = (0..(in_dim * n_tok) as usize)
+            .map(|i| ((i * 37) % 97) as f32 * 0.01 - 0.5)
+            .collect();
+        let mut xf = DeviceBuf::alloc(x.len() * 4).unwrap();
+        xf.write(0, as_bytes(&x)).unwrap();
+
+        let mut x8 = DeviceBuf::alloc(n_tok as usize * blocks * Q8_K_BLOCK_BYTES).unwrap();
+        let mut x4 = DeviceBuf::alloc(n_tok as usize * rb).unwrap();
+        let mut out = DeviceBuf::alloc((n_tok * out_dim) as usize * 4).unwrap();
+
+        let iters = 50;
+        for (name, fp4) in [("int8 mma (q8_K acts)", false), ("fp4  mma (nvfp4 acts)", true)] {
+            // warm up and include the activation quantize, which the
+            // engine pays once per matmul either way
+            for _ in 0..3 {
+                if fp4 {
+                    quantize_nvfp4(&mut x4, &xf, in_dim, n_tok).unwrap();
+                    matmul_nvfp4_a4(&mut out, &w, &x4, in_dim, out_dim, n_tok, rb as u64).unwrap();
+                } else {
+                    quantize_q8_k(&mut x8, &xf, in_dim, n_tok).unwrap();
+                    matmul_kq(&mut out, &w, &x8, in_dim, out_dim, n_tok, rb as u64, QUANT_NVFP4).unwrap();
+                }
+            }
+            sync().unwrap();
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                if fp4 {
+                    matmul_nvfp4_a4(&mut out, &w, &x4, in_dim, out_dim, n_tok, rb as u64).unwrap();
+                } else {
+                    matmul_kq(&mut out, &w, &x8, in_dim, out_dim, n_tok, rb as u64, QUANT_NVFP4).unwrap();
+                }
+            }
+            sync().unwrap();
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            let gflop = 2.0 * out_dim as f64 * in_dim as f64 * n_tok as f64 / 1e9;
+            eprintln!("  {name}  {ms:8.3} ms  {:8.1} GFLOP/s", gflop / (ms * 1e-3));
+        }
+    }
+
     /// cargo test --release -p kernels kq_gemm_bench -- --ignored --nocapture
     #[test]
     #[ignore = "perf probe, requires a CUDA device"]
