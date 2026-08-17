@@ -3873,6 +3873,66 @@ __global__ static void matmul_kq_gemm_q6K(
 }
 
 
+
+/* Octet-major q8_K activations for the prefill GEMM.
+ *
+ * The GEMM's B fragment has lane (g, tg) reading token tb+g at chunk
+ * offset tg*4, so one load reaches 8 different token rows a whole q8_K
+ * row apart (in_blocks * 292 bytes) and touches 8 cache lines. The FP4
+ * GEMM had exactly this defect and fixing it there was worth 1.47x,
+ * more than ldmatrix and wider tiles combined.
+ *
+ * This lays a warp's 8 tokens side by side: per (octet, superblock),
+ * 16 chunks of [8 tokens x 16 bytes] followed by the 8 f32 scales. A
+ * warp's whole B read for one chunk is then 128 contiguous bytes, one
+ * cache line instead of eight. Pure data movement, so the arithmetic
+ * and the output are unchanged. */
+#define PULSAR_OCT_TILE 2080u   /* 16*128 qs + 8*4 d */
+
+__global__ static void q8K_to_octet_kernel(
+        char *out, const block_q8_K *xq, uint32_t in_blocks, uint32_t n_tok) {
+    const uint32_t sb = blockIdx.x, oct = blockIdx.y;
+    char *dst = out + ((uint64_t)oct * in_blocks + sb) * PULSAR_OCT_TILE;
+    for (uint32_t i = threadIdx.x; i < 8u * 64u; i += 256u) {
+        const uint32_t r = i >> 6, w = i & 63u;
+        const uint32_t tk = oct * 8u + r;
+        const block_q8_K *blk = xq + (uint64_t)(tk < n_tok ? tk : n_tok - 1u) * in_blocks + sb;
+        const int32_t v = *(const int32_t *)(blk->qs + w * 4u);
+        /* qs[w*4] belongs to chunk w>>2, quad w&3 */
+        *(int32_t *)(dst + (w >> 2) * 128u + r * 16u + (w & 3u) * 4u) = v;
+    }
+    if (threadIdx.x < 8u) {
+        const uint32_t tk = oct * 8u + threadIdx.x;
+        *(float *)(dst + 2048u + threadIdx.x * 4u) =
+                (xq + (uint64_t)(tk < n_tok ? tk : n_tok - 1u) * in_blocks + sb)->d;
+    }
+}
+
+static void *g_oct_scratch[16];
+static uint64_t g_oct_cap[16];
+
+static void *oct_scratch(uint64_t bytes) {
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return NULL;
+    if (bytes <= g_oct_cap[dev]) return g_oct_scratch[dev];
+    /* cudaMalloc is illegal mid graph-capture and pulsar captures the
+     * forward; grow only outside capture, with a floor so it happens once */
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &cap) != cudaSuccess ||
+        cap != cudaStreamCaptureStatusNone) {
+        return NULL;
+    }
+    const uint64_t floor_bytes = 128u << 20;
+    if (bytes < floor_bytes) bytes = floor_bytes;
+    if (g_oct_scratch[dev]) (void)cudaFree(g_oct_scratch[dev]);
+    g_oct_scratch[dev] = NULL;
+    g_oct_cap[dev] = 0;
+    if (!cuda_ok(cudaMalloc(&g_oct_scratch[dev], bytes), "oct scratch")) return NULL;
+    g_oct_cap[dev] = bytes;
+    return g_oct_scratch[dev];
+}
+
 /* tensor-core flavor of the prefill GEMM (sm_80+). Reuses the MoE MMA
  * machinery - the UNPACK::chunk16 dequant policies and the m16n8k16
  * fragment mapping - minus the pair/gather bookkeeping: B columns are
@@ -3913,7 +3973,8 @@ __global__ static void matmul_kq_gemm_mma_kernel(
         uint32_t in_blocks,
         uint32_t out_dim,
         uint32_t n_tok,
-        uint64_t row_bytes) {
+        uint64_t row_bytes,
+        const char *yoct) {   /* octet-major B, NULL = read q8_K rows */
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     const uint32_t r0 = blockIdx.x * 32u;
     const uint32_t tok0 = blockIdx.y * 64u;
@@ -3976,8 +4037,15 @@ __global__ static void matmul_kq_gemm_mma_kernel(
         const char *ybs = yb + (uint64_t)sb * sizeof(block_q8_K);
         const char *yc0s = yc0 ? yc0 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
         const char *yc1s = yc1 ? yc1 + (uint64_t)sb * sizeof(block_q8_K) : NULL;
-        const float d0 = yc0s ? ((const block_q8_K *)yc0s)->d : 0.0f;
-        const float d1 = yc1s ? ((const block_q8_K *)yc1s)->d : 0.0f;
+        /* octet tile: the warp's 8 tokens laid side by side, so the B
+         * read below is one cache line rather than eight */
+        const char *obs = yoct
+                ? yoct + ((uint64_t)(tb >> 3) * in_blocks + sb) * PULSAR_OCT_TILE
+                : NULL;
+        const float d0 = obs ? *(const float *)(obs + 2048u + tg * 8u)
+                             : (yc0s ? ((const block_q8_K *)yc0s)->d : 0.0f);
+        const float d1 = obs ? *(const float *)(obs + 2048u + tg * 8u + 4u)
+                             : (yc1s ? ((const block_q8_K *)yc1s)->d : 0.0f);
 
         /* ncu: MIO-queue stalls were 35% of warp wait when this loop
          * was narrow 32-bit smem loads. Scales come 4 chunks per
@@ -4000,7 +4068,9 @@ __global__ static void matmul_kq_gemm_mma_kernel(
             #pragma unroll
             for (uint32_t chi = 0; chi < 4u; chi++) {
                 const uint32_t ch = ch4 * 4u + chi;
-                const int32_t b = *(const int32_t *)(ybs + 4u + ch * 16u + tg * 4u);
+                const int32_t b = obs
+                        ? *(const int32_t *)(obs + ch * 128u + g * 16u + tg * 4u)
+                        : *(const int32_t *)(ybs + 4u + ch * 16u + tg * 4u);
                 if (UNPACK::HAS_MIN) {
                     const float bs0 = yc0s ? (float)((const int16_t *)(yc0s + 4u + 256u))[ch] * d0 : 0.0f;
                     const float bs1 = yc1s ? (float)((const int16_t *)(yc1s + 4u + 256u))[ch] * d1 : 0.0f;
@@ -4496,6 +4566,21 @@ extern "C" int pulsar_matmul_nvfp4_a4(
     return cuda_ok(cudaGetLastError(), "matmul_nvfp4_a4 launch");
 }
 
+
+/* Builds (or reuses) the octet-major activation tile for this call.
+ * Returns NULL when the scratch cannot be grown right now, which just
+ * means the GEMM reads q8_K rows the old way. */
+static const char *gemm_octet_tile(const void *xq_dev, uint32_t in_blocks, uint32_t n_tok) {
+    if (getenv("PULSAR_NO_OCT")) return NULL;
+    const uint32_t n_oct = (n_tok + 7u) >> 3;
+    void *tile = oct_scratch((uint64_t)n_oct * in_blocks * PULSAR_OCT_TILE);
+    if (!tile) return NULL;
+    dim3 cg(in_blocks, n_oct, 1);
+    q8K_to_octet_kernel<<<cg, 256>>>(
+            (char *)tile, (const block_q8_K *)xq_dev, in_blocks, n_tok);
+    return (const char *)tile;
+}
+
 extern "C" int pulsar_matmul_kq(
         void *out_dev,
         const void *w_dev,
@@ -4541,10 +4626,11 @@ extern "C" int pulsar_matmul_kq(
         }
         if (quant == PULSAR_QUANT_NVFP4 && pulsar_device_cc_major() >= 8
             && !getenv("PULSAR_NO_MMA")) {
+            const char *yoct = gemm_octet_tile(xq_dev, in_blocks, n_tok);
             dim3 mgrid((out_dim + 31u) / 32u, (n_tok + 63u) / 64u, 1);
             matmul_kq_gemm_mma_kernel<unpack_nvfp4><<<mgrid, 256>>>(
                     (float *)out_dev, (const char *)w_dev,
-                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, yoct);
             return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_mma nvfp4 launch");
         }
         if (quant == PULSAR_QUANT_NVFP4) {
@@ -4561,11 +4647,11 @@ extern "C" int pulsar_matmul_kq(
             if (quant == PULSAR_QUANT_Q4_K)
                 matmul_kq_gemm_mma_kernel<unpack_q4_K><<<mgrid, 256>>>(
                         (float *)out_dev, (const char *)w_dev,
-                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, NULL);
             else
                 matmul_kq_gemm_mma_kernel<unpack_q6_K><<<mgrid, 256>>>(
                         (float *)out_dev, (const char *)w_dev,
-                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+                        (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes, NULL);
             return cuda_ok(cudaGetLastError(), "matmul_kq_gemm_mma launch");
         }
         dim3 ggrid((out_dim + PULSAR_GEMM_BM - 1u) / PULSAR_GEMM_BM,
