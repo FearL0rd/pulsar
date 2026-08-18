@@ -2321,6 +2321,24 @@ struct wdot_nvfp4 {
         const int sb = __dp4a(p.vb, *(const int32_t *)(yb->qs + p.off + 8), 0);
         return p.dl * yb->d * (float)(sa + sb);
     }
+    /* The activation words a lane touches are fixed by the LANE, not by
+     * the weight row (see prepare: off is a pure function of lane), so a
+     * warp holding several rows can load them once and reuse. */
+    struct Act { int32_t a, b; float d; };
+    __device__ __forceinline__ static uint32_t act_off(uint32_t lane) {
+        const uint32_t nb = lane >> 3, sub = (lane >> 1) & 3u, h = lane & 1u;
+        return nb * 64 + sub * 16 + h * 4;
+    }
+    __device__ __forceinline__ static Act act(const block_q8_K *y, uint32_t off) {
+        Act a;
+        a.a = *(const int32_t *)(y->qs + off);
+        a.b = *(const int32_t *)(y->qs + off + 8);
+        a.d = y->d;
+        return a;
+    }
+    __device__ __forceinline__ static float apply_act(const Prep &p, const Act &y) {
+        return p.dl * y.d * (float)(__dp4a(p.va, y.a, 0) + __dp4a(p.vb, y.b, 0));
+    }
     __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
         return apply(prepare(row, b, lane), xq, b, lane);
     }
@@ -3602,6 +3620,86 @@ __global__ static void matmul_kqw_tokens_kernel(
     }
 }
 
+
+/* Row-tiled token kernel: each warp owns R rows for all TT tokens.
+ * One-row-per-warp made every warp re-read the same staged activation
+ * words for its single row, and ncu had that kernel at L1 94% / DRAM
+ * 28% - starved on load-store throughput, not on memory. Hoisting the
+ * activation into registers once per (block, token) and reusing it
+ * across R rows cuts the shared traffic per weight byte by R while the
+ * weight reads, which are the traffic we actually want, stay put. */
+template <typename WDOT, int TT, int R>
+__global__ static void matmul_kqw_rows_kernel(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row0 = (blockIdx.x * blockDim.y + threadIdx.y) * (uint32_t)R;
+    constexpr uint32_t QW = sizeof(block_q8_K) / 4u;
+    __shared__ uint32_t xs[TT * QW];
+    const uint32_t tid = threadIdx.y * blockDim.x + lane;
+    const uint32_t nthr = blockDim.y * blockDim.x;
+
+    /* clamp out-of-range rows onto the last one: the staging loop below
+     * has __syncthreads(), so no warp may return early */
+    const char *wr[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        const uint32_t rr = (row0 + (uint32_t)r) < out_dim ? (row0 + (uint32_t)r) : (out_dim - 1u);
+        wr[r] = w + (uint64_t)rr * row_bytes;
+    }
+    float acc[R][TT];
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int t = 0; t < TT; t++) acc[r][t] = 0.0f;
+
+    const uint32_t off = WDOT::act_off(lane);
+    for (uint32_t b = 0; b < in_blocks; b++) {
+        const uint32_t total = n_tok * QW;
+        for (uint32_t i = tid; i < total; i += nthr) {
+            const uint32_t t = i / QW;
+            xs[i] = ((const uint32_t *)(xq + (uint64_t)t * in_blocks + b))[i - t * QW];
+        }
+        __syncthreads();
+        typename WDOT::Act ya[TT];
+        #pragma unroll
+        for (int t = 0; t < TT; t++) {
+            if ((uint32_t)t >= n_tok) break;
+            ya[t] = WDOT::act((const block_q8_K *)xs + t, off);
+        }
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            const typename WDOT::Prep p = WDOT::prepare(wr[r], b, lane);
+            #pragma unroll
+            for (int t = 0; t < TT; t++) {
+                if ((uint32_t)t >= n_tok) break;
+                acc[r][t] += WDOT::apply_act(p, ya[t]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        #pragma unroll
+        for (int t = 0; t < TT; t++) {
+            if ((uint32_t)t >= n_tok) break;
+            float a = acc[r][t];
+            #pragma unroll
+            for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+                a += __shfl_xor_sync(0xffffffffu, a, mask);
+            }
+            if (lane == 0 && (row0 + (uint32_t)r) < out_dim) {
+                out[(uint64_t)t * out_dim + row0 + (uint32_t)r] = a;
+            }
+        }
+    }
+}
+
 /* Token-tiled variant: one warp owns a row for ALL TT tokens, so the
  * row bytes are read once (L1-hot across the register token loop)
  * instead of once per token - on a 248k-row lm head the legacy grid
@@ -4780,7 +4878,35 @@ case PULSAR_QUANT_IQ4_XS: PULSAR_KQW_T(wdot_iq4_xs);
          * matmul_kqw_kernel<wdot_nvfp4>. That made a 2-token
          * speculative verify cost ~2 forwards, which is why MTP could
          * not profit even at 88% draft acceptance. */
-        case PULSAR_QUANT_NVFP4: PULSAR_KQW_T(wdot_nvfp4);
+        case PULSAR_QUANT_NVFP4: {
+            /* NVFP4 is the decode hot path (63% of GPU time on an MTP
+             * run), so it takes the row-tiled kernel: R rows per warp
+             * amortize the staged activation loads that the profiler
+             * showed this kernel starving on. PULSAR_ROWTILE=<1|2|4>
+             * overrides; 1 restores the one-row-per-warp kernel. */
+            /* R=2 measured best: 53.2 tok/s vs 50.4 at R=1 and 50.8 at
+             * R=4, where the acc[R][TT] register file starts costing
+             * more occupancy than the reuse buys back. */
+            uint32_t rt = 2u;
+            if (const char *e = getenv("PULSAR_ROWTILE")) {
+                const uint32_t v = (uint32_t)atoi(e);
+                if (v == 1u || v == 2u || v == 4u) rt = v;
+            }
+            if (rt > 1u && n_tok <= 4u) {
+                const uint32_t per = 4u * rt; /* 4 row-warps per block */
+                dim3 rgrid((out_dim + per - 1u) / per, 1, 1);
+                if (rt == 2u)
+                    matmul_kqw_rows_kernel<wdot_nvfp4, 4, 2><<<rgrid, block>>>(
+                            (float *)out_dev, (const char *)w_dev,
+                            (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+                else
+                    matmul_kqw_rows_kernel<wdot_nvfp4, 4, 4><<<rgrid, block>>>(
+                            (float *)out_dev, (const char *)w_dev,
+                            (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+                return cuda_ok(cudaGetLastError(), "matmul_kqw_rows launch");
+            }
+            PULSAR_KQW_T(wdot_nvfp4);
+        }
         default: break;
         }
         #undef PULSAR_KQW_T
