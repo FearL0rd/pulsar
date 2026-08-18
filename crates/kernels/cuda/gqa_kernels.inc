@@ -430,7 +430,7 @@ __global__ static void gqa_attention_kernel(
  * spills the accumulators to local memory. */
 #define GQA_SPLIT_MIN_ROWS 4096u
 #define GQA_SPLIT_MAX_TOK  4u
-#define GQA_SPLIT_ROWS     2048u
+#define GQA_SPLIT_ROWS     512u
 #define GQA_SPLIT_MAX      64u
 
 template <Kvf KVF, uint32_t T, uint32_t DPT>
@@ -660,6 +660,18 @@ static uint32_t gqa_tile_q() {
     return tq;
 }
 
+/* Split-slice rows at runtime (PULSAR_SPLIT_ROWS): token fusion cut the
+ * split grid by n_tok, so slice size decides whether the SMs stay fed at
+ * a given depth. */
+static uint32_t gqa_split_rows_env() {
+    static const uint32_t v = [] {
+        const char *e = getenv("PULSAR_SPLIT_ROWS");
+        const uint32_t r = e ? (uint32_t)atoi(e) : GQA_SPLIT_ROWS;
+        return r >= 256u ? r : GQA_SPLIT_ROWS;
+    }();
+    return v;
+}
+
 static bool gqa_tile_off() {
     static const bool off = getenv("PULSAR_NO_ATTN_TILE") != NULL;
     return off;
@@ -884,7 +896,8 @@ static int gqa_attention_dispatch(
     uint32_t rows_eff = pos0 + n_tok;
     if (window != 0u && rows_eff > window) rows_eff = window;
     if (!rel && n_tok <= GQA_SPLIT_MAX_TOK && rows_eff >= GQA_SPLIT_MIN_ROWS && head_dim <= 512u) {
-        uint32_t n_split = (rows_eff + GQA_SPLIT_ROWS - 1u) / GQA_SPLIT_ROWS;
+        const uint32_t srows = gqa_split_rows_env();
+        uint32_t n_split = (rows_eff + srows - 1u) / srows;
         if (n_split > GQA_SPLIT_MAX) n_split = GQA_SPLIT_MAX;
         if (n_split >= 2u) {
             uint64_t bytes = (uint64_t)n_tok * n_head * n_split * ((uint64_t)head_dim + 2u) * 4u;
