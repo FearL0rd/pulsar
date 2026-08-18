@@ -184,8 +184,10 @@ extern "C" int pulsar_dsv4_attention(
         const void *pi_dev) {
     if (!out_dev || !q_dev || !raw_dev || !sinks_dev || n_head == 0 ||
         head_dim == 0 || head_dim > 512u || (n_comp > 0 && !comp_dev) ||
-        kvq > 5u || turbo > 1u || (turbo && !pi_dev) ||
-        (kvq >= 4u && head_dim % 32u != 0) || (turbo && kvq != 4u && kvq != 5u)) {
+        kvq > 10u || turbo > 1u || (turbo && !pi_dev) ||
+        (kvq >= 4u && kvq <= 7u && head_dim % 32u != 0) ||
+        (kvq >= 8u && head_dim % 128u != 0) ||
+        (turbo && kvq < 4u)) {
         return 0;
     }
     #define DSV4_ATTN_LAUNCH(K, T)                                            \
@@ -202,12 +204,19 @@ extern "C" int pulsar_dsv4_attention(
             case 3u: DSV4_ATTN_LAUNCH(3u, 0u); break;
             case 4u: DSV4_ATTN_LAUNCH(4u, 0u); break;
             case 5u: DSV4_ATTN_LAUNCH(5u, 0u); break;
+            /* codes 6-10 are intrinsically rotated (FWHT R at encode);
+             * only the turbo arm restores via Pi^T */
             default: return 0;
         }
     } else {
         switch (kvq) {
             case 4u: DSV4_ATTN_LAUNCH(4u, 1u); break;
             case 5u: DSV4_ATTN_LAUNCH(5u, 1u); break;
+            case 6u: DSV4_ATTN_LAUNCH(6u, 1u); break;
+            case 7u: DSV4_ATTN_LAUNCH(7u, 1u); break;
+            case 8u: DSV4_ATTN_LAUNCH(8u, 1u); break;
+            case 9u: DSV4_ATTN_LAUNCH(9u, 1u); break;
+            case 10u: DSV4_ATTN_LAUNCH(10u, 1u); break;
             default: return 0;
         }
     }
@@ -618,8 +627,10 @@ extern "C" int pulsar_dsv4_comp_step(
     if (!state_kv_dev || !state_sc_dev || !kv_cur_dev || !sc_cur_dev ||
         !ape_dev || !norm_dev || width == 0 || head_dim == 0 ||
         head_dim > 512u || ratio == 0 || (emit && !cache_row_dev) ||
-        kvq > 5u || turbo > 1u || (turbo && !pi_dev) ||
-        (kvq >= 4u && head_dim % 32u != 0) || (turbo && kvq != 4u && kvq != 5u)) {
+        kvq > 10u || turbo > 1u || (turbo && !pi_dev) ||
+        (kvq >= 4u && kvq <= 7u && head_dim % 32u != 0) ||
+        (kvq >= 8u && head_dim % 128u != 0) ||
+        (turbo && kvq < 4u)) {
         return 0;
     }
     #define DSV4_COMP_LAUNCH(K, T)                                             \
@@ -644,6 +655,11 @@ extern "C" int pulsar_dsv4_comp_step(
         switch (kvq) {
             case 4u: DSV4_COMP_LAUNCH(4u, 1u); break;
             case 5u: DSV4_COMP_LAUNCH(5u, 1u); break;
+            case 6u: DSV4_COMP_LAUNCH(6u, 1u); break;
+            case 7u: DSV4_COMP_LAUNCH(7u, 1u); break;
+            case 8u: DSV4_COMP_LAUNCH(8u, 1u); break;
+            case 9u: DSV4_COMP_LAUNCH(9u, 1u); break;
+            case 10u: DSV4_COMP_LAUNCH(10u, 1u); break;
             default: return 0;
         }
     }
@@ -668,7 +684,9 @@ extern "C" int pulsar_dsv4_f16_round(void *x_dev, uint32_t n) {
  * The Dsv4 cache rows are one flat 512-wide latent per position, so every
  * pulsar codec applies directly (same layouts as gqa_kernels.inc):
  * KVQ 0=f32, 1=fp8 (e4m3 + f32 tail scale), 2=fp16, 3=int8 (f32 tail
- * scale), 4=q8_0, 5=q4_0 (per-32-block f16 d, stride via kv_row_stride).
+ * scale), 4=q8_0, 5=q4_0 (per-32-block f16 d, stride via kv_row_stride),
+ * 6=turbo3 / 7=turbo2 (per-128-group norm, midpoint codes), 8/9/10 =
+ * turbo3/2/1_tcq (per-128-group trellis codes; K book, alpha baked).
  * TURBO pre-rotates the row by Pi (row -> Pi*row) before quant so block
  * quant sees spread-out outliers; the templated attention kernel undoes it
  * with Pi^T once on the normalized output (Pi orthonormal: Pi^T = Pi^-1). */
@@ -717,7 +735,7 @@ __device__ static void dsv4_quant_row_serial(
             }
             memcpy(out + head_dim, &scale, 4);
         }
-    } else { /* q8_0 (4) / q4_0 (5): per-32-wide-block f16 d */
+    } else if (KVQ == 4u || KVQ == 5u) { /* q8_0 / q4_0: per-32-wide-block f16 d */
         const uint32_t n_blocks = head_dim / 32u;
         char *dstb = (char *)dst;
         for (uint32_t b = 0; b < n_blocks; b++) {
@@ -748,6 +766,158 @@ __device__ static void dsv4_quant_row_serial(
                 }
             }
         }
+    } else if (KVQ == 6u || KVQ == 7u) {
+        /* turbo3 (6) / turbo2 (7): per-128-group L2 norm -> normalize ->
+         * midpoint quantize -> recon-norm-corrected fp16 norm shared by the
+         * four 32-wide sub-blocks (base is already Pi-rotated: for these
+         * codes Pi is the block-diagonal FWHT rotation R). */
+        const uint32_t per_blk = KVQ == 6u ? 14u : 10u;
+        for (uint32_t g = 0; g < head_dim / 128u; g++) {
+            const float *xg = base + g * 128u;
+            float nsq = 0.0f;
+            for (uint32_t j = 0; j < 128u; j++) { const float v = xg[j]; nsq += v * v; }
+            const float grp_norm = sqrtf(nsq);
+            const float inv = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+            float recon_sq = 0.0f;
+            for (uint32_t b = 0; b < 4u; b++) {
+                char *bb = (char *)dst + (uint64_t)g * (per_blk * 4u) + b * per_blk;
+                uint8_t qs[8] = {0}, signs[4] = {0};
+                for (uint32_t j = 0; j < 32u; j++) {
+                    const float v = xg[b * 32u + j] * inv;
+                    if (KVQ == 6u) {
+                        const uint32_t idx =
+                            v < d_turbo_mid_3bit[0] ? 0u :
+                            v < d_turbo_mid_3bit[1] ? 1u :
+                            v < d_turbo_mid_3bit[2] ? 2u :
+                            v < d_turbo_mid_3bit[3] ? 3u :
+                            v < d_turbo_mid_3bit[4] ? 4u :
+                            v < d_turbo_mid_3bit[5] ? 5u :
+                            v < d_turbo_mid_3bit[6] ? 6u : 7u;
+                        qs[j >> 2] |= (uint8_t)((idx & 3u) << ((j & 3u) * 2u));
+                        if (idx & 4u) signs[j >> 3] |= (uint8_t)(1u << (j & 7u));
+                        const float c = d_turbo_centroids_3bit[idx];
+                        recon_sq += c * c;
+                    } else {
+                        const uint32_t idx =
+                            v < d_turbo_mid_2bit[0] ? 0u :
+                            v < d_turbo_mid_2bit[1] ? 1u :
+                            v < d_turbo_mid_2bit[2] ? 2u : 3u;
+                        qs[j >> 2] |= (uint8_t)(idx << ((j & 3u) * 2u));
+                        const float c = d_turbo_centroids_2bit[idx];
+                        recon_sq += c * c;
+                    }
+                }
+                memcpy(bb + 2u, qs, 8u);
+                if (KVQ == 6u) memcpy(bb + 10u, signs, 4u);
+            }
+            const float recon = sqrtf(recon_sq);
+            const float corrected = recon > 1e-10f ? grp_norm / recon : grp_norm;
+            for (uint32_t b = 0; b < 4u; b++)
+                *(__half *)((char *)dst + (uint64_t)g * (per_blk * 4u) + b * per_blk) =
+                    __float2half(corrected);
+        }
+    } else {
+        /* TCQ (8=turbo3_tcq, 9=turbo2_tcq, 10=turbo1_tcq): serial Viterbi
+         * over the trained trellis, one 128-group per pass. Trellis:
+         * state' = (state >> k) | (out << st_bits-k); 512 states at k=3,
+         * 256 at k=2/k=1. qs packs an init prefix then one out symbol per
+         * step, LSB-first — decode reads a flat k*t window. The fused K==V
+         * row encodes with the K book (alpha 1.0), matching both decoders.
+         * Scratch is __shared__ (per block, this serial thread the only
+         * user — comp_step's pooled[] is a distinct static allocation). */
+        __shared__ float vcost[512];
+        __shared__ float vcost_b[512];
+        __shared__ float vpm[128];
+        __shared__ uint8_t vbt[128u * 128u];
+        __shared__ float vxn[128];
+        __shared__ uint8_t vout[128];
+        const uint32_t k_bits = KVQ == 8u ? 3u : (KVQ == 9u ? 2u : 1u);
+        const uint32_t st_bits = KVQ == 8u ? 9u : 8u;
+        const uint32_t n_pred = 1u << k_bits;
+        const uint32_t n_low = KVQ == 10u ? 128u : 64u;
+        const uint32_t n_states = KVQ == 8u ? 512u : 256u;
+        const uint32_t stride = KVQ == 8u ? 52u : (KVQ == 9u ? 36u : 20u);
+        const uint32_t qs_bytes = KVQ == 8u ? 49u : (KVQ == 9u ? 33u : 17u);
+        const uint32_t init_bits = KVQ == 10u ? 7u : 6u;
+        const float *cb = KVQ == 8u ? d_turbo3_tcq_codebook
+                      : KVQ == 9u ? d_turbo2_tcq_codebook
+                                  : d_turbo1_tcq_codebook;
+        for (uint32_t g = 0; g < head_dim / 128u; g++) {
+            const float *xg = base + g * 128u;
+            float nsq = 0.0f;
+            for (uint32_t j = 0; j < 128u; j++) { vxn[j] = xg[j]; nsq += vxn[j] * vxn[j]; }
+            const float grp_norm = sqrtf(nsq);
+            const float inv = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+            for (uint32_t j = 0; j < 128u; j++) vxn[j] *= inv;
+            for (uint32_t s = 0; s < n_states; s++) vcost[s] = 0.0f;
+            float *rd = vcost, *wr = vcost_b;
+            for (uint32_t t = 0; t < 128u; t++) {
+                const float xt = vxn[t];
+                uint8_t *btrow = vbt + t * 128u;
+                /* states sharing low (st_bits-k) bits have the same 1<<k
+                 * predecessor candidates; one min per clique (buun's
+                 * pred_min phase, serialized). */
+                for (uint32_t low = 0; low < n_low; low++) {
+                    const uint32_t base_prev = low << k_bits;
+                    float best = rd[base_prev];
+                    uint32_t best_p = 0u;
+                    for (uint32_t p = 1; p < n_pred; p++) {
+                        const float c = rd[base_prev | p];
+                        if (c < best) { best = c; best_p = p; }
+                    }
+                    vpm[low] = best;
+                    btrow[low] = (uint8_t)best_p;
+                }
+                for (uint32_t s = 0; s < n_states; s++) {
+                    const float dist = xt - cb[s];
+                    wr[s] = vpm[s & (n_low - 1u)] + dist * dist;
+                }
+                float *sw = rd; rd = wr; wr = sw;
+            }
+            float best = rd[0];
+            uint32_t state = 0u;
+            for (uint32_t s = 1; s < n_states; s++)
+                if (rd[s] < best) { best = rd[s]; state = s; }
+            for (int t = 127; t >= 0; t--) {
+                vout[t] = (uint8_t)(state >> (st_bits - k_bits));
+                const uint32_t p = vbt[(uint32_t)t * 128u + (state & (n_low - 1u))];
+                state = ((state & (n_low - 1u)) << k_bits) | p;
+            }
+            const uint32_t init_state = state;
+            uint32_t st = init_state;
+            float recon_sq = 0.0f;
+            for (uint32_t t = 0; t < 128u; t++) {
+                st = (st >> k_bits) | ((uint32_t)vout[t] << (st_bits - k_bits));
+                const float c = cb[st];
+                recon_sq += c * c;
+            }
+            const float recon = sqrtf(recon_sq);
+            float corrected = recon > 1e-10f ? grp_norm / recon : grp_norm;
+            /* buun bakes alpha into the stored norm for turbo3/2_tcq (K=1.0,
+             * V=1.04) and skips it for turbo1_tcq; kept verbatim. */
+            if (KVQ == 8u || KVQ == 9u) corrected *= d_tcq_norm_alpha;
+            const uint32_t init_word = (init_state >> k_bits) & ((1u << init_bits) - 1u);
+            char *gb = (char *)dst + (uint64_t)g * stride;
+            *(__half *)gb = __float2half(corrected);
+            uint8_t *qs = (uint8_t *)(gb + 2u);
+            for (uint32_t by = 0; by < qs_bytes; by++) {
+                uint8_t packed = 0u;
+                for (uint32_t bit = 0; bit < 8u; bit++) {
+                    const uint32_t pos = by * 8u + bit;
+                    uint32_t v = 0u;
+                    if (pos < init_bits) {
+                        v = (init_word >> pos) & 1u;
+                    } else {
+                        const uint32_t sb = pos - init_bits;
+                        const uint32_t sym = sb / k_bits;
+                        if (sym < 128u) v = (vout[sym] >> (sb % k_bits)) & 1u;
+                    }
+                    packed |= (uint8_t)(v << bit);
+                }
+                qs[by] = packed;
+            }
+            qs[qs_bytes] = 0u; /* pad byte, zeroed for determinism */
+        }
     }
 }
 
@@ -776,8 +946,10 @@ extern "C" int pulsar_dsv4_kv_store(
         void *dst_dev, const void *src_dev, uint32_t head_dim,
         uint32_t kvq, uint32_t turbo, const void *pi_dev) {
     if (!dst_dev || !src_dev || head_dim == 0 || head_dim > 512u ||
-        kvq > 5u || turbo > 1u || (turbo && !pi_dev) ||
-        (kvq >= 4u && head_dim % 32u != 0) || (turbo && kvq != 4u && kvq != 5u)) {
+        kvq > 10u || turbo > 1u || (turbo && !pi_dev) ||
+        (kvq >= 4u && kvq <= 7u && head_dim % 32u != 0) ||
+        (kvq >= 8u && head_dim % 128u != 0) ||
+        (turbo && kvq < 4u)) {
         return 0;
     }
     #define DSV4_KV_LAUNCH(K, T)                                                \
@@ -797,6 +969,11 @@ extern "C" int pulsar_dsv4_kv_store(
         switch (kvq) {
             case 4u: DSV4_KV_LAUNCH(4u, 1u); break;
             case 5u: DSV4_KV_LAUNCH(5u, 1u); break;
+            case 6u: DSV4_KV_LAUNCH(6u, 1u); break;
+            case 7u: DSV4_KV_LAUNCH(7u, 1u); break;
+            case 8u: DSV4_KV_LAUNCH(8u, 1u); break;
+            case 9u: DSV4_KV_LAUNCH(9u, 1u); break;
+            case 10u: DSV4_KV_LAUNCH(10u, 1u); break;
             default: return 0;
         }
     }
@@ -1076,17 +1253,31 @@ extern "C" int pulsar_dsv4_selftest(void) {
         cudaMalloc(&dpi, (size_t)hd * hd * 4);
         cudaMemcpy(dsrc, row, hd * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dpi, pi, (size_t)hd * hd * 4, cudaMemcpyHostToDevice);
-        const uint32_t cases_q[7][2] = {
+        const uint32_t cases_q[12][2] = {
             {0u, 0u}, {1u, 0u}, {2u, 0u}, {3u, 0u},
             {4u, 0u}, {4u, 1u}, {5u, 1u},
+            {6u, 1u}, {7u, 1u}, {8u, 1u}, {9u, 1u}, {10u, 1u},
         };
-        for (uint32_t c = 0; c < 7 && ok; c++) {
+        double row_l2 = 0.0;
+        for (uint32_t i = 0; i < hd; i++) row_l2 += (double)row[i] * row[i];
+        row_l2 = sqrt(row_l2);
+        /* host copies of the decode books (fetched from the device tables so
+         * the selftest can never drift from the kernels) */
+        float h_c3[8], h_c2[4];
+        cudaMemcpyFromSymbol(h_c3, d_turbo_centroids_3bit, sizeof(h_c3));
+        cudaMemcpyFromSymbol(h_c2, d_turbo_centroids_2bit, sizeof(h_c2));
+        for (uint32_t c = 0; c < 12 && ok; c++) {
             const uint32_t kvq = cases_q[c][0], turbo = cases_q[c][1];
             /* host mirror of kv_row_stride (the device fn is __device__) */
             const uint64_t stride = kvq == 1u || kvq == 3u ? (uint64_t)hd + 4u
                 : kvq == 2u ? (uint64_t)hd * 2u
                 : kvq == 4u ? ((uint64_t)hd / 32u) * 34u
                 : kvq == 5u ? ((uint64_t)hd / 32u) * 18u
+                : kvq == 6u ? ((uint64_t)hd / 32u) * 14u
+                : kvq == 7u ? ((uint64_t)hd / 32u) * 10u
+                : kvq == 8u ? ((uint64_t)hd / 128u) * 52u
+                : kvq == 9u ? ((uint64_t)hd / 128u) * 36u
+                : kvq == 10u ? ((uint64_t)hd / 128u) * 20u
                 : (uint64_t)hd * 4u;
             cudaMalloc(&ddst, stride);
             ok &= pulsar_dsv4_kv_store(ddst, dsrc, hd, kvq, turbo, dpi);
@@ -1108,7 +1299,7 @@ extern "C" int pulsar_dsv4_selftest(void) {
                 float scl;
                 memcpy(&scl, stored + hd, 4);
                 for (uint32_t d = 0; d < hd; d++) dec[d] = (float)(int8_t)stored[d] * scl;
-            } else {
+            } else if (kvq == 4u || kvq == 5u) {
                 /* q8_0 / q4_0 blocks */
                 for (uint32_t d = 0; d < hd; d++) {
                     const uint32_t b = d >> 5, i = d & 31u;
@@ -1120,6 +1311,40 @@ extern "C" int pulsar_dsv4_selftest(void) {
                         const int sh = ((i >> 4) & 1u) << 2;
                         dec[d] = dlt * (float)(((bb[2u + bytei] >> sh) & 15) - 8);
                     }
+                }
+            } else if (kvq == 6u || kvq == 7u) {
+                /* turbo3 / turbo2 blocks (mirror of the gqa decode) */
+                for (uint32_t d = 0; d < hd; d++) {
+                    const uint32_t b = d >> 5, j = d & 31u;
+                    const char *bb = (const char *)stored + (uint64_t)b * (kvq == 6u ? 14u : 10u);
+                    const float norm = __half2float(*(const __half *)bb);
+                    const uint8_t *qs = (const uint8_t *)bb + 2u;
+                    const uint32_t low2 = (qs[j >> 2] >> ((j & 3u) << 1)) & 0x3u;
+                    if (kvq == 6u) {
+                        const uint32_t hi1 = (qs[8u + (j >> 3)] >> (j & 7u)) & 1u;
+                        dec[d] = h_c3[low2 | (hi1 << 2)] * norm;
+                    } else {
+                        dec[d] = h_c2[low2] * norm;
+                    }
+                }
+            } else {
+                /* TCQ flat-window read (mirror of gqa_kdot) */
+                float hcb[512];
+                if (kvq == 8u) cudaMemcpyFromSymbol(hcb, d_turbo3_tcq_codebook, 512u * 4u);
+                else if (kvq == 9u) cudaMemcpyFromSymbol(hcb, d_turbo2_tcq_codebook, 256u * 4u);
+                else cudaMemcpyFromSymbol(hcb, d_turbo1_tcq_codebook, 256u * 4u);
+                const uint32_t tstride = kvq == 8u ? 52u : (kvq == 9u ? 36u : 20u);
+                const uint32_t k_bits = kvq == 8u ? 3u : (kvq == 9u ? 2u : 1u);
+                const uint32_t tmask = kvq == 8u ? 0x1FFu : 0xFFu;
+                for (uint32_t d = 0; d < hd; d++) {
+                    const uint32_t g = d >> 7, t = d & 127u;
+                    const char *bb = (const char *)stored + (uint64_t)g * tstride;
+                    const float norm = __half2float(*(const __half *)bb);
+                    const uint8_t *qs = (const uint8_t *)bb + 2u;
+                    const uint32_t bp = t * k_bits;
+                    const uint16_t raw =
+                        (uint16_t)qs[bp >> 3] | ((uint16_t)qs[(bp >> 3) + 1u] << 8);
+                    dec[d] = hcb[(raw >> (bp & 7u)) & tmask] * norm;
                 }
             }
             if (turbo) {
@@ -1142,9 +1367,26 @@ extern "C" int pulsar_dsv4_selftest(void) {
             /* q4_0 under turbo has the coarsest honest step (d/8.5), and
              * rotating concentrates values so the post-rot amax (hence d)
              * exceeds the pre-rot nrm the tolerance keys on - widen it so
-             * the round-trip gate reflects codec error, not a Pi-scale bug. */
-            if (err > (double)(kvq == 0u ? 1.0e-5 : kvq == 2u ? 2.0e-3
-                        : (kvq == 5u && turbo) ? 3.0 : 0.20) * (nrm + 1.0e-3)) {
+             * the round-trip gate reflects codec error, not a Pi-scale bug.
+             * Codes 6-10 error scales with the per-128-group norm (hence
+             * ||row||_2), not the max-abs: gate err/||row||_2 against the
+             * centroid-spread ratios (sim p99 ~0.036 for 3-bit, ~0.066 for
+             * 2-bit, wider for the trellis codes). Catches gross encode/
+             * decode mismatches, not quant precision. */
+            double tol;
+            if (kvq == 0u) tol = 1.0e-5;
+            else if (kvq == 2u) tol = 2.0e-3;
+            else if (kvq == 5u && turbo) tol = 3.0;
+            else tol = 0.20;
+            if (kvq >= 6u) {
+                const double gate = (kvq == 6u ? 0.06 : kvq == 7u ? 0.10 :
+                                     kvq == 8u ? 0.07 : kvq == 9u ? 0.11 : 0.18) * row_l2;
+                if (err > gate) {
+                    fprintf(stderr, "dsv4 selftest: kv_store round-trip kvq=%u turbo=%u max abs err %.3e (gate %.3e)\n",
+                            kvq, turbo, err, gate);
+                    ok = 0;
+                }
+            } else if (err > tol * (nrm + 1.0e-3)) {
                 fprintf(stderr, "dsv4 selftest: kv_store round-trip kvq=%u turbo=%u max abs err %.3e\n",
                         kvq, turbo, err);
                 ok = 0;

@@ -111,9 +111,11 @@ usage: pulsar-serve -m MODEL.gguf [options]
 endpoints: web UI at /, OpenAI API at /v1 (chat/completions, models)
 
 environment:
-  PULSAR_KV=f32|int8|fp8|fp16|q8_0|q4_0|turbo8|turbo4
+  PULSAR_KV=f32|int8|fp8|fp16|q8_0|q4_0|turbo8|turbo4|
+            turbo3|turbo2|turbo3_tcq|turbo2_tcq|turbo1_tcq
                        KV cache format (default: f32, auto-quantizes when
-                       a big context would starve the expert cache)
+                       a big context would starve the expert cache;
+                       turbo2/turbo3 + tcq codecs are dsv4-only)
   PULSAR_MTP=1         enable the gguf's nextn head, when it has one
   PULSAR_DFLASH=PATH   dflash/dspark draft gguf for speculative decode
   PULSAR_OFFLINE=1     never touch the network
@@ -765,8 +767,9 @@ fn run() -> engine::Result {
                 ("POST", "/kv") => {
                     let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                     let want = req["format"].as_str().unwrap_or("auto").to_string();
-                    const KV_FORMATS: [&str; 9] =
-                        ["auto", "f32", "fp8", "fp16", "int8", "q8_0", "q4_0", "turbo4", "turbo8"];
+                    const KV_FORMATS: [&str; 14] =
+                        ["auto", "f32", "fp8", "fp16", "int8", "q8_0", "q4_0",
+                        "turbo4", "turbo8", "turbo3", "turbo2", "turbo3_tcq", "turbo2_tcq", "turbo1_tcq"];
                     if !KV_FORMATS.contains(&want.as_str()) {
                         respond_json(&mut stream, 400, &serde_json::json!({"error": {"message":
                             format!("unknown KV format {want} (one of {KV_FORMATS:?})")}}))

@@ -55,9 +55,11 @@ diagnostics:
                        target_layers (dsv4 only)
 
 environment:
-  PULSAR_KV=f32|int8|fp8|fp16|q8_0|q4_0|turbo8|turbo4
+  PULSAR_KV=f32|int8|fp8|fp16|q8_0|q4_0|turbo8|turbo4|
+            turbo3|turbo2|turbo3_tcq|turbo2_tcq|turbo1_tcq
                        KV cache format (default: f32, auto-quantizes when
-                       a big context would starve the expert cache)
+                       a big context would starve the expert cache;
+                       turbo2/turbo3 + tcq codecs are dsv4-only)
   PULSAR_MTP=1         enable the gguf's nextn head, when it has one
   PULSAR_DFLASH=PATH   dflash/dspark draft gguf for speculative decode
   PULSAR_PROFILE=1     per-stage timing report

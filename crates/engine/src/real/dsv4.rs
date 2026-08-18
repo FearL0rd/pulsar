@@ -23,6 +23,11 @@ const fn kv_row(hd: usize, kvq: u32) -> usize {
         2 => hd * 2,          // fp16
         4 => (hd / 32) * 34,  // q8_0: 34 B / 32 elems
         5 => (hd / 32) * 18,  // q4_0: 18 B / 32 elems
+        6 => (hd / 32) * 14,  // turbo3: f16 norm + 8B qs + 4B signs / 32 elems
+        7 => (hd / 32) * 10,  // turbo2: f16 norm + 8B qs / 32 elems
+        8 => (hd / 128) * 52, // turbo3_tcq: f16 norm + 49B packed / 128 elems
+        9 => (hd / 128) * 36, // turbo2_tcq: f16 norm + 33B packed / 128 elems
+        10 => (hd / 128) * 20, // turbo1_tcq: f16 norm + 17B packed / 128 elems
         _ => hd * 4,
     }
 }

@@ -5028,7 +5028,9 @@ mod real {
         pub skip_logit_read: bool,
         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
-        /// 5=q4_0. All lossy formats opt-in via PULSAR_KV=<fmt>; the
+        /// 5=q4_0, 6=turbo3, 7=turbo2, 8=turbo3_tcq, 9=turbo2_tcq,
+        /// 10=turbo1_tcq. Codes 6-10 are dsv4-only (rotated centroids /
+        /// trellis). All lossy formats opt-in via PULSAR_KV=<fmt>; the
         /// default f32 path keeps bit-exact guarantees. Dsv4's fused
         /// latent rows (raw ring + compressed) ride the same kvq field as
         /// a single flat head.
@@ -5448,6 +5450,11 @@ mod real {
                     (3, _) => "int8",
                     (4, _) => if self.kvq_rot { "turbo8" } else { "q8_0" },
                     (5, _) => if self.kvq_rot { "turbo4" } else { "q4_0" },
+                    (6, _) => "turbo3",
+                    (7, _) => "turbo2",
+                    (8, _) => "turbo3_tcq",
+                    (9, _) => "turbo2_tcq",
+                    (10, _) => "turbo1_tcq",
                     _ => "f32",
                 },
                 kv_compact: self.kvq != 0 || self.kvq_lat != 0,
@@ -5729,12 +5736,15 @@ mod real {
             //   int8 -> int8 + per-row scale(stride head_dim+4,  ~4.0x)
             //   q8_0 -> 32-wide blocks f16 d + 32 i8 (stride head_dim/32*34)
             //   q4_0 -> 32-wide blocks f16 d + 16 nibbles (stride head_dim/32*18)
+            //   turbo3/turbo2 / *_tcq -> dsv4-only sub-4-bit rotated centroids
             // MLA keeps its compact latent cache as-is.
             // turbo<4|8> / rotq<4|8> = q4_0/q8_0 with a fixed orthogonal
             // rotation folded into K (pre-append) and Q (pre-attention).
             // Rotation spreads per-32-block outliers across the block so no
             // single lane dominates blockmax `d` — see TurboQuant. Decode-
             // invariant: (Q@Πᵀ)·(K@Πᵀ)ᵀ = Q@Kᵀ since ΠᵀΠ=I. V is untouched.
+            // turbo3/2 + tcq force rotation too: Π is the codec's own
+            // block-diagonal FWHT, not the MGS matrix used by turbo4/8.
             //
             // qwen35-dense (n_expert==1) runs the dense-split path, which does
             // not support the quantized KV layout - applying it deadlocked the
@@ -5840,6 +5850,15 @@ mod real {
                     Some("q4_0") | Some("q4") => (5, false),
                     Some("turbo8") | Some("rotq8") | Some("turboq8") => (4, true),
                     Some("turbo4") | Some("rotq4") | Some("turboq4") => (5, true),
+                    // buun turbo2/3 + trellis variants: intrinsically rotated
+                    // (the encoder quantizes FWHT-rotated 128-groups), so all
+                    // five force rotation on — Π is the codec's own R, see the
+                    // pi build below.
+                    Some("turbo3") => (6, true),
+                    Some("turbo2") => (7, true),
+                    Some("turbo3_tcq") => (8, true),
+                    Some("turbo2_tcq") => (9, true),
+                    Some("turbo1_tcq") => (10, true),
                     None
                         // A too-big f32 KV never OOMs on a streaming model -
                         // it silently eats the expert cache instead (measured:
@@ -5868,7 +5887,17 @@ mod real {
                 // the guard keeps it from breaking silently if that changes.
                 // Dsv4's q reads as [n_head][head_dim] (no qrot/qk_low split),
                 // so it deliberately skips this guard and keeps rotation.
-                if rot && s.qk_dim() > s.head_dim && matches!(s.family, Family::Gqa | Family::Qwen35) {
+                // codes 6-10 (turbo2/3 + trellis) have encode arms only in
+                // the dsv4 store/comp paths; the GQA append switch would
+                // fall through to a plain f32 append and overflow the
+                // smaller rows, so they are dsv4-only.
+                if q >= 6 && s.family != Family::Dsv4 {
+                    eprintln!(
+                        "pulsar: PULSAR_KV={} ignored - turbo2/turbo3 and the tcq codecs are dsv4-only; using f32 KV",
+                        kv_req.as_deref().unwrap_or(""),
+                    );
+                    (0, false)
+                } else if rot && s.qk_dim() > s.head_dim && matches!(s.family, Family::Gqa | Family::Qwen35) {
                     eprintln!(
                         "pulsar: PULSAR_KV={} rotation disabled - qk_dim {} exceeds head_dim {} (split-rope q stride); falling back to plain block-KV",
                         kv_req.as_deref().unwrap_or(""),
@@ -5915,6 +5944,15 @@ mod real {
                 2 => hd * 2,          // pure fp16
                 4 => (hd / 32) * 34,  // q8_0: 34 B / 32 elems
                 5 => (hd / 32) * 18,  // q4_0: 18 B / 32 elems
+                // buun turbo blocks: f16 norm + packed codes, 4 sub-blocks
+                // per 128-group sharing the corrected group norm
+                6 => (hd / 32) * 14,  // turbo3: 2+8+4 B / 32 elems
+                7 => (hd / 32) * 10,  // turbo2: 2+8 B / 32 elems
+                // trellis: f16 norm + 6/6/7 init bits + 128 symbols of 3/2/1
+                // bits, one packed qs per 128-group
+                8 => (hd / 128) * 52, // turbo3_tcq: 3+49 B / 128 elems
+                9 => (hd / 128) * 36, // turbo2_tcq: 2+33 B / 128 elems
+                10 => (hd / 128) * 20, // turbo1_tcq: 2+17 B / 128 elems
                 _ => hd * 4,
             };
             // fp8 latent rows carry one f32 scale at the tail, mirroring
@@ -5985,7 +6023,12 @@ mod real {
                     2 => "fp16",
                     3 => "int8",
                     4 => if kvq_rot { "turbo8" } else { "q8_0" },
-                    _ => if kvq_rot { "turbo4" } else { "q4_0" },
+                    5 => if kvq_rot { "turbo4" } else { "q4_0" },
+                    6 => "turbo3",
+                    7 => "turbo2",
+                    8 => "turbo3_tcq",
+                    9 => "turbo2_tcq",
+                    _ => "turbo1_tcq",
                 };
                 // Dsv4's full is already ring+comp across all layers (its
                 // kcache=raw ring, vcache=compressed rows are distinct data,
@@ -6001,13 +6044,22 @@ mod real {
                     packed as f64 / GIB,
                     s.n_exec_layer,
                 );
-                // q8_0/q4_0 kernels require 32-wide blocks; a non-multiple head_dim
-                // makes the append guard return 0 silently (cache stays uninitialized).
-                if matches!(kvq, 4 | 5) {
+                // q8_0/q4_0/turbo2/turbo3 kernels require 32-wide sub-blocks
+                // and the trellis codecs 128-wide groups; a non-multiple
+                // head_dim makes the append guard return 0 silently (cache
+                // stays uninitialized).
+                if matches!(kvq, 4..=7) {
                     eprintln!(
                         "pulsar: block-KV head_dim={} ({}divisible by 32)",
                         s.head_dim,
                         if s.head_dim.is_multiple_of(32) { "" } else { "NOT " }
+                    );
+                }
+                if matches!(kvq, 8..=10) {
+                    eprintln!(
+                        "pulsar: block-KV head_dim={} ({}divisible by 128)",
+                        s.head_dim,
+                        if s.head_dim.is_multiple_of(128) { "" } else { "NOT " }
                     );
                 }
                 if kvq_rot {
@@ -6267,45 +6319,121 @@ mod real {
             let pi = if kvq_rot {
                 let hd = s.head_dim as usize;
                 let n = hd * hd;
-                let mut g = 0x9E3779B97F4A7C15u64;
-                let mut rng = || {
-                    // xorshift64 on the fixed seed — only need a spread of
-                    // directions; orthogonality comes from MGS, not the RNG.
-                    g ^= g << 13;
-                    g ^= g >> 7;
-                    g ^= g << 17;
-                    ((g % 1_000_000) as f64 / 1_000_000.0 - 0.5) * 2.0
-                };
                 let mut m = vec![0.0f32; n];
-                for i in 0..hd {
-                    for j in 0..hd {
-                        m[i * hd + j] = rng() as f32;
-                    }
-                }
-                // Modified Gram-Schmidt: orthonormalize rows in place.
-                for i in 0..hd {
-                    let (si, ei) = (i * hd, (i + 1) * hd);
-                    for k in 0..i {
-                        let (sk, ek) = (k * hd, (k + 1) * hd);
-                        let dot = m[si..ei]
-                            .iter()
-                            .zip(&m[sk..ek])
-                            .map(|(a, b)| a * b)
-                            .sum::<f32>();
-                        for j in 0..hd {
-                            m[si + j] -= dot * m[sk + j];
+                if kvq >= 6 {
+                    // turbo3/turbo2 and the tcq trellis codecs are
+                    // intrinsically rotated: their CUDA encoders quantize
+                    // FWHT-rotated 128-groups and the decode codebooks live
+                    // in rotated space, so Π must be the codec's own
+                    // R = diag(s2)·FWHT₁₂₈·diag(s1)/√128 (buun seed-42 sign
+                    // tables, transcribed verbatim), block-diagonal per
+                    // 128-group. Built by pushing each unit vector through
+                    // the same xor-butterfly the reference kernel runs, so
+                    // there is no closed-form Hadamard indexing to get
+                    // wrong. R is orthogonal by construction; the shared
+                    // verify below still catches f32 drift.
+                    const WHT_SIGNS1: [f32; 128] = [
+                        -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0,
+                        -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                        1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0,
+                        1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0,
+                        -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0,
+                        -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0,
+                        1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0,
+                        1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0,
+                        -1.0, -1.0, 1.0, -1.0, -1.0, -1.0, 1.0, -1.0,
+                        -1.0, -1.0, 1.0, -1.0, -1.0, -1.0, 1.0, 1.0,
+                        1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0,
+                        1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0,
+                        -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0,
+                        1.0, 1.0, 1.0, 1.0, -1.0, 1.0, -1.0, 1.0,
+                        1.0, -1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0,
+                        -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0,
+                    ];
+                    const WHT_SIGNS2: [f32; 128] = [
+                        1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0,
+                        1.0, -1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0,
+                        1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0,
+                        1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, 1.0,
+                        1.0, 1.0, -1.0, -1.0, -1.0, 1.0, -1.0, -1.0,
+                        -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0,
+                        1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0,
+                        -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0,
+                        1.0, -1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0,
+                        -1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0,
+                        -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0,
+                        -1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0,
+                        1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0,
+                        -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0,
+                        -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0,
+                        1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0,
+                    ];
+                    for blk in 0..hd / 128 {
+                        let o = blk * 128;
+                        for col in 0..128usize {
+                            let mut x = [0.0f32; 128];
+                            x[col] = WHT_SIGNS1[col];
+                            // xor-mask butterfly h=1,2,…,64 — the same
+                            // pairing as the reference kernel's shuffle
+                            // butterflies, each {j, j^h} pair once.
+                            let mut h = 1usize;
+                            while h < 128 {
+                                for j in 0..128 {
+                                    let k = j ^ h;
+                                    if k > j {
+                                        let (a, b) = (x[j], x[k]);
+                                        x[j] = a + b;
+                                        x[k] = a - b;
+                                    }
+                                }
+                                h <<= 1;
+                            }
+                            for j in 0..128 {
+                                m[(o + j) * hd + (o + col)] =
+                                    WHT_SIGNS2[j] * x[j] * 0.08838834764831845f32;
+                            }
                         }
                     }
-                    let norm = m[si..ei].iter().map(|x| x * x).sum::<f32>().sqrt();
-                    if norm < 1e-6 {
-                        // Degenerate (vanishingly unlikely at f32 from a fixed
-                        // seed); nudge row i to e_i to keep Π invertible.
+                } else {
+                    let mut g = 0x9E3779B97F4A7C15u64;
+                    let mut rng = || {
+                        // xorshift64 on the fixed seed — only need a spread of
+                        // directions; orthogonality comes from MGS, not the RNG.
+                        g ^= g << 13;
+                        g ^= g >> 7;
+                        g ^= g << 17;
+                        ((g % 1_000_000) as f64 / 1_000_000.0 - 0.5) * 2.0
+                    };
+                    for i in 0..hd {
                         for j in 0..hd {
-                            m[si + j] = if j == i { 1.0 } else { 0.0 };
+                            m[i * hd + j] = rng() as f32;
                         }
-                    } else {
-                        for j in 0..hd {
-                            m[si + j] /= norm;
+                    }
+                    // Modified Gram-Schmidt: orthonormalize rows in place.
+                    for i in 0..hd {
+                        let (si, ei) = (i * hd, (i + 1) * hd);
+                        for k in 0..i {
+                            let (sk, ek) = (k * hd, (k + 1) * hd);
+                            let dot = m[si..ei]
+                                .iter()
+                                .zip(&m[sk..ek])
+                                .map(|(a, b)| a * b)
+                                .sum::<f32>();
+                            for j in 0..hd {
+                                m[si + j] -= dot * m[sk + j];
+                            }
+                        }
+                        let norm = m[si..ei].iter().map(|x| x * x).sum::<f32>().sqrt();
+                        if norm < 1e-6 {
+                            // Degenerate (vanishingly unlikely at f32 from a fixed
+                            // seed); nudge row i to e_i to keep Π invertible.
+                            for j in 0..hd {
+                                m[si + j] = if j == i { 1.0 } else { 0.0 };
+                            }
+                        } else {
+                            for j in 0..hd {
+                                m[si + j] /= norm;
+                            }
                         }
                     }
                 }
