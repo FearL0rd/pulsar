@@ -48,6 +48,11 @@ mod real {
         };
     }
 
+    /// OR into  to permit W4A4 at that call site (NVFP4 only).
+    /// The calibrated recipe applies fp4 activations to the FFN and the
+    /// full-attention projections, never to linear_attn/GDN, lm_head or
+    /// the MTP block.
+    pub const QUANT_A4_OK: u32 = 0x8000_0000;
     pub const QUANT_Q2_K: u32 = 0;
     pub const QUANT_IQ2_XXS: u32 = 1;
     pub const QUANT_Q4_K: u32 = 2;

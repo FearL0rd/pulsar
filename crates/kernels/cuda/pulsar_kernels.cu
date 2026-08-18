@@ -4333,6 +4333,8 @@ __global__ static void matmul_kq_gemm_nvfp4(
  * activations into the SAME block format makes both operands raw 32-bit
  * loads and no nibble shuffle is needed on either side. Measured 419
  * TOPS here against 105 for the int8 m16n8k16 path this replaces. */
+/* high bit of the quant word: caller permits W4A4 at this call site */
+#define PULSAR_QUANT_A4_OK 0x80000000u
 #define PULSAR_NVFP4_SB_BYTES  144u   /* 256 values: 4 blocks x 36B */
 #define PULSAR_NVFP4_BLK_BYTES  36u   /* 64 values: 4 scales + 32 nibble */
 /* Activations use the same 4-bit encoding but an octet-major tile: per
@@ -4644,6 +4646,15 @@ static void *nvfp4_act_scratch(uint64_t bytes) {
     return g_nvfp4_act[dev];
 }
 
+/* W4A4 is per CALL SITE, not global. The calibrated NVFP4 checkpoint
+ * this recipe comes from (qwen38-ara, compressed-tensors
+ * nvfp4-pack-quantized) excludes lm_head, the whole MTP block and EVERY
+ * linear_attn layer from quantization, leaving only the FFN and the
+ * full-attention projections in fp4. Gated DeltaNet carries a recurrent
+ * state across the sequence, so activation noise there accumulates
+ * instead of averaging out - which is exactly what a blanket
+ * PULSAR_FP4=1 did to our output. The caller ORs PULSAR_QUANT_A4_OK
+ * into  on the sites the recipe allows. */
 static bool nvfp4_a4_on() {
     static const bool on = getenv("PULSAR_FP4") != NULL;
     return on;
@@ -4733,6 +4744,8 @@ extern "C" int pulsar_matmul_kq(
     if (in_dim == 0 || in_dim % PULSAR_QK_K != 0 || out_dim == 0 || n_tok == 0 || row_bytes == 0) {
         return 0;
     }
+    const bool a4_ok = (quant & PULSAR_QUANT_A4_OK) != 0u;
+    quant &= ~PULSAR_QUANT_A4_OK;
     const uint32_t in_blocks = in_dim / PULSAR_QK_K;
     dim3 block(32, 4, 1);
     /* wide prefill batches on q4_K take the shared-memory GEMM: one
@@ -4747,7 +4760,7 @@ extern "C" int pulsar_matmul_kq(
          * instead of 16. Measured 2.79x on the GEMM in isolation.
          * Opt-in via PULSAR_FP4 because it puts activations in fp4 too
          * (W4A4), which changes numerics by construction. */
-        if (quant == PULSAR_QUANT_NVFP4 && pulsar_device_cc_major() >= 12
+        if (quant == PULSAR_QUANT_NVFP4 && a4_ok && pulsar_device_cc_major() >= 12
             && nvfp4_a4_on()) {
             const uint32_t rows = (n_tok + 7u) & ~7u;
             const uint64_t abytes = (uint64_t)rows * in_blocks * PULSAR_NVFP4_SB_BYTES;
@@ -4834,7 +4847,8 @@ extern "C" int pulsar_matmul_kq(
                     (float *)out_dev + (uint64_t)base * out_dim,
                     w_dev,
                     (const block_q8_K *)xq_dev + (uint64_t)base * in_blocks_g,
-                    in_dim, out_dim, cnt, row_bytes, quant)) {
+                    in_dim, out_dim, cnt, row_bytes,
+                    quant | (a4_ok ? PULSAR_QUANT_A4_OK : 0u))) {
                 return 0;
             }
         }

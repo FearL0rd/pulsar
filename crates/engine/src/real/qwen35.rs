@@ -1946,27 +1946,27 @@ impl Model {
                     kernels::set_device(c.dev)?;
                     c.lx.recv(&mut c.xq, xb)?;
                     let w = c.width;
-                    kernels::matmul_kq(&mut c.gate, &cw.gate.w, &c.xq, s.n_embd, w, t, cw.gate.row_bytes, cw.gate.quant)?;
-                    kernels::matmul_kq(&mut c.up, &cw.up.w, &c.xq, s.n_embd, w, t, cw.up.row_bytes, cw.up.quant)?;
+                    kernels::matmul_kq(&mut c.gate, &cw.gate.w, &c.xq, s.n_embd, w, t, cw.gate.row_bytes, cw.gate.quant | kernels::QUANT_A4_OK)?;
+                    kernels::matmul_kq(&mut c.up, &cw.up.w, &c.xq, s.n_embd, w, t, cw.up.row_bytes, cw.up.quant | kernels::QUANT_A4_OK)?;
                     kernels::swiglu(&mut c.mid, &c.gate, &c.up, t * w, 0.0, 1.0, 0)?;
                     kernels::quantize_q8_k(&mut c.midq, &c.mid, w, t)?;
-                    kernels::matmul_kq(&mut c.out, &cw.down.w, &c.midq, w, s.n_embd, t, cw.down.row_bytes, cw.down.quant)?;
+                    kernels::matmul_kq(&mut c.out, &cw.down.w, &c.midq, w, s.n_embd, t, cw.down.row_bytes, cw.down.quant | kernels::QUANT_A4_OK)?;
                     c.lo.send(&c.out, t as usize * s.n_embd as usize * 4)?;
                     kernels::set_device(tb.dev)?;
                 }
-                kernels::matmul_kq(&mut tb.gate, &bw.gate.w, &tb.xq, s.n_embd, hb, t, bw.gate.row_bytes, bw.gate.quant)?;
-                kernels::matmul_kq(&mut tb.up, &bw.up.w, &tb.xq, s.n_embd, hb, t, bw.up.row_bytes, bw.up.quant)?;
+                kernels::matmul_kq(&mut tb.gate, &bw.gate.w, &tb.xq, s.n_embd, hb, t, bw.gate.row_bytes, bw.gate.quant | kernels::QUANT_A4_OK)?;
+                kernels::matmul_kq(&mut tb.up, &bw.up.w, &tb.xq, s.n_embd, hb, t, bw.up.row_bytes, bw.up.quant | kernels::QUANT_A4_OK)?;
                 kernels::swiglu(&mut tb.mid, &tb.gate, &tb.up, t * hb, 0.0, 1.0, 0)?;
                 kernels::quantize_q8_k(&mut tb.midq, &tb.mid, hb, t)?;
-                kernels::matmul_kq(&mut tb.out, &bw.down.w, &tb.midq, hb, s.n_embd, t, bw.down.row_bytes, bw.down.quant)?;
+                kernels::matmul_kq(&mut tb.out, &bw.down.w, &tb.midq, hb, s.n_embd, t, bw.down.row_bytes, bw.down.quant | kernels::QUANT_A4_OK)?;
                 tb.lo.send(&tb.out, t as usize * s.n_embd as usize * 4)?;
                 kernels::set_device(primary)?;
                 // A's half runs while B's chain + copies are in flight
-                kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, half, t, gate.row_bytes, gate.quant)?;
-                kernels::matmul_kq(&mut st.up_act, &up.w, &st.xq, s.n_embd, half, t, up.row_bytes, up.quant)?;
+                kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, half, t, gate.row_bytes, gate.quant | kernels::QUANT_A4_OK)?;
+                kernels::matmul_kq(&mut st.up_act, &up.w, &st.xq, s.n_embd, half, t, up.row_bytes, up.quant | kernels::QUANT_A4_OK)?;
                 kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * half, 0.0, 1.0, 0)?;
                 kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, half, t)?;
-                kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, half, s.n_embd, t, down.row_bytes, down.quant)?;
+                kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, half, s.n_embd, t, down.row_bytes, down.quant | kernels::QUANT_A4_OK)?;
                 tb.lo.recv(&mut tb.recv, t as usize * s.n_embd as usize * 4)?;
                 kernels::add_assign(&mut st.ffn_out, &tb.recv, t * s.n_embd)?;
                 if let Some(c) = rt.tpc.as_mut() {
@@ -1982,8 +1982,8 @@ impl Model {
             }
             // dense 27B: resident K-quant triple, no experts, no syncs
             kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
-            kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, s.n_ff_exp, t, gate.row_bytes, gate.quant)?;
-            kernels::matmul_kq(&mut st.up_act, &up.w, &st.xq, s.n_embd, s.n_ff_exp, t, up.row_bytes, up.quant)?;
+            kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, s.n_ff_exp, t, gate.row_bytes, gate.quant | kernels::QUANT_A4_OK)?;
+            kernels::matmul_kq(&mut st.up_act, &up.w, &st.xq, s.n_embd, s.n_ff_exp, t, up.row_bytes, up.quant | kernels::QUANT_A4_OK)?;
             kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * s.n_ff_exp, 0.0, 1.0, 0)?;
             kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, s.n_ff_exp, t)?;
             kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, s.n_ff_exp, s.n_embd, t, down.row_bytes, down.quant)?;
