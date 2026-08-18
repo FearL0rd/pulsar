@@ -298,6 +298,24 @@ impl DenseBank {
 /// the primary runs its own half, and out carries B's partial down
 /// output back through recv (allocated on the PRIMARY) for the add.
 /// T_MAX rows like every other qwen35 scratch.
+/// Third card's FFN-only scratch. It never runs GDN or attention, so it
+/// carries no recurrent state, no KV and no position cells: just the
+/// activation it receives, its slice of the FFN, and the partial it
+/// sends back.
+struct FfnBank {
+    dev: i32,
+    width: u32,
+    xq: DeviceBuf,
+    gate: DeviceBuf,
+    up: DeviceBuf,
+    mid: DeviceBuf,
+    midq: DeviceBuf,
+    out: DeviceBuf,
+    recv: DeviceBuf,
+    lx: kernels::TpLink,
+    lo: kernels::TpLink,
+}
+
 struct TpBank {
     dev: i32,
     xq: DeviceBuf,
@@ -364,6 +382,8 @@ pub(super) struct Qwen35Rt {
     graphs_on: bool,
     /// FFN tensor-parallel scratch on the second card (PULSAR_TP)
     tpb: Option<TpBank>,
+    /// third card's FFN-only shard (PULSAR_TP with 3+ devices)
+    tpc: Option<FfnBank>,
     qkv: DeviceBuf,      // [T][conv_dim] raw projection
     conv_out: DeviceBuf, // [T][conv_dim] conv+silu, layout [q|k|v] per row
     z: DeviceBuf,        // [T][value_dim]
@@ -502,8 +522,38 @@ impl Qwen35Rt {
             }
             None => None,
         };
+        let tpc = match &m.tp_c {
+            Some(c) => {
+                let q8k = |n: usize| {
+                    n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
+                };
+                let w = c.width as usize;
+                // lx records on the primary (it sends), lo on the third
+                // card, so each link is created with its device current
+                let lx = kernels::TpLink::new(T_MAX * q8k(s.n_embd as usize))?;
+                let recv = f32s(T_MAX * s.n_embd as usize)?;
+                kernels::set_device(c.dev)?;
+                let b = FfnBank {
+                    dev: c.dev,
+                    width: c.width,
+                    xq: DeviceBuf::alloc(T_MAX * q8k(s.n_embd as usize))?,
+                    gate: f32s(T_MAX * w)?,
+                    up: f32s(T_MAX * w)?,
+                    mid: f32s(T_MAX * w)?,
+                    midq: DeviceBuf::alloc(T_MAX * q8k(w))?,
+                    out: f32s(T_MAX * s.n_embd as usize)?,
+                    recv,
+                    lx,
+                    lo: kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?,
+                };
+                kernels::set_device(primary)?;
+                Some(b)
+            }
+            None => None,
+        };
         Ok(Qwen35Rt {
             banks,
+            tpc,
             graphs: std::collections::HashMap::new(),
             graphs_on,
             tpb,
@@ -1878,8 +1928,32 @@ impl Model {
                 tb.lx.send(&st.xq, xb)?;
                 kernels::set_device(tb.dev)?;
                 tb.lx.recv(&mut tb.xq, xb)?;
-                // half is A's share of the FFN rows, hb is B's
-                let hb = s.n_ff_exp - half;
+                // half is A's share of the FFN rows, hb is B's, and the
+                // third card (when present) takes what is left. C is
+                // issued FIRST so its hop overlaps B's chain instead of
+                // queueing behind it.
+                let hc = rt.tpc.as_ref().map_or(0, |c| c.width);
+                let hb = s.n_ff_exp - half - hc;
+                if let (Some(c), Some(cw)) = (rt.tpc.as_mut(), self.tp_ffn3(il)) {
+                    let xb = t as usize
+                        * (s.n_embd as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
+                        * kernels::Q8_K_BLOCK_BYTES;
+                    // st.xq lives on the primary and lx's event was
+                    // created there: an event only records on its own
+                    // device's streams, and card B is current here
+                    kernels::set_device(primary)?;
+                    c.lx.send(&st.xq, xb)?;
+                    kernels::set_device(c.dev)?;
+                    c.lx.recv(&mut c.xq, xb)?;
+                    let w = c.width;
+                    kernels::matmul_kq(&mut c.gate, &cw.gate.w, &c.xq, s.n_embd, w, t, cw.gate.row_bytes, cw.gate.quant)?;
+                    kernels::matmul_kq(&mut c.up, &cw.up.w, &c.xq, s.n_embd, w, t, cw.up.row_bytes, cw.up.quant)?;
+                    kernels::swiglu(&mut c.mid, &c.gate, &c.up, t * w, 0.0, 1.0, 0)?;
+                    kernels::quantize_q8_k(&mut c.midq, &c.mid, w, t)?;
+                    kernels::matmul_kq(&mut c.out, &cw.down.w, &c.midq, w, s.n_embd, t, cw.down.row_bytes, cw.down.quant)?;
+                    c.lo.send(&c.out, t as usize * s.n_embd as usize * 4)?;
+                    kernels::set_device(tb.dev)?;
+                }
                 kernels::matmul_kq(&mut tb.gate, &bw.gate.w, &tb.xq, s.n_embd, hb, t, bw.gate.row_bytes, bw.gate.quant)?;
                 kernels::matmul_kq(&mut tb.up, &bw.up.w, &tb.xq, s.n_embd, hb, t, bw.up.row_bytes, bw.up.quant)?;
                 kernels::swiglu(&mut tb.mid, &tb.gate, &tb.up, t * hb, 0.0, 1.0, 0)?;
@@ -1895,6 +1969,10 @@ impl Model {
                 kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, half, s.n_embd, t, down.row_bytes, down.quant)?;
                 tb.lo.recv(&mut tb.recv, t as usize * s.n_embd as usize * 4)?;
                 kernels::add_assign(&mut st.ffn_out, &tb.recv, t * s.n_embd)?;
+                if let Some(c) = rt.tpc.as_mut() {
+                    c.lo.recv(&mut c.recv, t as usize * s.n_embd as usize * 4)?;
+                    kernels::add_assign(&mut st.ffn_out, &c.recv, t * s.n_embd)?;
+                }
                 kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
                 if prof {
                     kernels::sync()?;

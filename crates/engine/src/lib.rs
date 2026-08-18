@@ -1057,6 +1057,7 @@ mod real {
         /// FFN tensor-parallel shards on the second card (PULSAR_TP=1,
         /// dense qwen35); None everywhere else
         pub(crate) tp: Option<TpW>,
+        pub(crate) tp_c: Option<TpCW>,
     }
 
     /// deepseek4 output_hc_*: collapse the final HC streams before
@@ -2615,6 +2616,17 @@ mod real {
         gdn: Option<Qwen35Gdn>,
         attn: Option<Qwen35Attn>,
     }
+    /// Third-card FFN peer (PULSAR_TP with 3+ devices). The GDN and
+    /// attention halves stay on the A/B pair: only the FFN is split
+    /// three ways, because it is the largest single weight block per
+    /// layer and one code path, so the extra card's bandwidth joins the
+    /// decode weight read without a third GDN state or KV shard.
+    pub(crate) struct TpCW {
+        pub(crate) dev: i32,
+        pub(crate) width: u32,
+        ffn: Vec<Option<TpFfnW>>,
+    }
+
     pub(crate) struct TpW {
         pub(crate) dev: i32,
         /// per-card ffn width = n_ff_exp / 2
@@ -2972,6 +2984,10 @@ mod real {
         pub(crate) fn tp_attn(&self, il: usize) -> Option<&Qwen35Attn> {
             self.tp.as_ref()?.layers.get(il)?.as_ref()?.attn.as_ref()
         }
+        /// Third-card FFN shard for exec layer `il` (PULSAR_TP, 3+ cards).
+        pub(crate) fn tp_ffn3(&self, il: usize) -> Option<&TpFfnW> {
+            self.tp_c.as_ref()?.ffn.get(il)?.as_ref()
+        }
         pub fn load(path: &Path) -> Result<Model> {
             let (shards, gguf) = parse_header(path)?;
             let file = VFile::open(&shards)?;
@@ -3202,6 +3218,7 @@ mod real {
             // this is most of TP's win at none of the KV/GDN sharding
             // cost; attention stays whole on the primary, and the dense
             // split is skipped (all layers owned by the primary).
+            let mut tp3_cfg: Option<(i32, u32, u32)> = None;
             let tp_cfg: Option<(i32, u32)> = if qwen35_dense
                 && kernels::device_count() > 1
                 && std::env::var("PULSAR_TP").ok().as_deref() == Some("1")
@@ -3246,15 +3263,53 @@ mod real {
                 // -> 46.2 tok/s from one block of skew)
                 let half = ((n_ff as f64 * frac / qk as f64).round() as u32 * qk)
                     .clamp(n_ff / 4 / qk * qk, n_ff * 3 / 4 / qk * qk);
-                eprintln!(
-                    "pulsar: FFN tensor parallel on devices {primary}+{dev_b} ({half}/{} split, {:.0}/{:.0} GB/s)",
-                    n_ff - half, ba, bb
-                );
-                Some((dev_b, half))
+                // Third card joins the FFN split when one exists and is
+                // not being used for a PP tail. Shares stay proportional
+                // to read bandwidth across all three.
+                let third_ffn: Option<(i32, u32, u32)> = if std::env::var("PULSAR_TP3").ok().as_deref() == Some("off") {
+                    None
+                } else {
+                    (0..kernels::device_count())
+                        .filter(|&d| d != primary && d != dev_b)
+                        .max_by(|&a, &b| {
+                            kernels::vram_bandwidth(a)
+                                .partial_cmp(&kernels::vram_bandwidth(b))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .and_then(|d3| {
+                            let b3 = kernels::vram_bandwidth(d3);
+                            if b3 <= 0.0 || ba <= 0.0 || bb <= 0.0 {
+                                return None;
+                            }
+                            let tot = ba + bb + b3;
+                            let blocks = n_ff / qk;
+                            let wa = ((blocks as f64 * ba / tot).round() as u32).max(1);
+                            let wb = ((blocks as f64 * bb / tot).round() as u32).max(1);
+                            if wa + wb >= blocks {
+                                return None;
+                            }
+                            Some((d3, wa * qk, wb * qk))
+                        })
+                };
+                if let Some((d3, wa, wb)) = third_ffn {
+                    eprintln!(
+                        "pulsar: FFN tensor parallel on devices {primary}+{dev_b}+{d3} ({wa}/{wb}/{} split, {:.0}/{:.0}/{:.0} GB/s)",
+                        n_ff - wa - wb, ba, bb, kernels::vram_bandwidth(d3)
+                    );
+                } else {
+                    eprintln!(
+                        "pulsar: FFN tensor parallel on devices {primary}+{dev_b} ({half}/{} split, {:.0}/{:.0} GB/s)",
+                        n_ff - half, ba, bb
+                    );
+                }
+                tp3_cfg = third_ffn;
+                Some((dev_b, third_ffn.map_or(half, |(_, wa, _)| wa)))
             } else {
                 None
             };
             let tp_ffn_stash: std::cell::RefCell<Option<TpFfnW>> = std::cell::RefCell::new(None);
+            let tp_ffn3_stash: std::cell::RefCell<Option<TpFfnW>> = std::cell::RefCell::new(None);
+            let mut tp3_layers: Vec<Option<TpFfnW>> = Vec::new();
             let tp_gdn_stash: std::cell::RefCell<Option<Qwen35Gdn>> = std::cell::RefCell::new(None);
             let tp_attn_stash: std::cell::RefCell<Option<Qwen35Attn>> = std::cell::RefCell::new(None);
             let mut layer_dev = vec![primary; shape.n_exec_layer as usize];
@@ -3769,20 +3824,29 @@ mod real {
                         let (db, drb, dq) = read_kq_bytes(&file, &gguf, &t("ffn_down.weight"))?;
                         let gsplit = half as usize * grb as usize;
                         let usplit = half as usize * urb as usize;
+                        // B's share ends where C's begins (C absent -> B
+                        // takes the remainder, the 2-card case)
+                        let wb = tp3_cfg.map(|(_, _, wb)| wb as usize);
+                        let gsplit2 = wb.map_or(gb.len(), |w| gsplit + w * grb as usize);
+                        let usplit2 = wb.map_or(ub.len(), |w| usplit + w * urb as usize);
                         // down: the contraction dim halves, so every
                         // output row contributes its first half of
                         // quant blocks to A and the rest to B
                         let drb = drb as usize;
                         // same cut as gate/up, in bytes: exact because
-                        // `half` is a whole number of quant blocks
-                        let dh = half as usize * drb / shape.n_ff_exp as usize;
+                        // every share is a whole number of quant blocks
+                        let n_ff_u = shape.n_ff_exp as usize;
+                        let dh = half as usize * drb / n_ff_u;
+                        let dh2 = wb.map_or(drb, |w| dh + w * drb / n_ff_u);
                         let n_out = db.len() / drb;
                         let mut da = Vec::with_capacity(n_out * dh);
-                        let mut dbb = Vec::with_capacity(n_out * dh);
+                        let mut dbb = Vec::with_capacity(n_out * (dh2 - dh));
+                        let mut dcc = Vec::with_capacity(n_out * (drb - dh2));
                         for r in 0..n_out {
                             let row = &db[r * drb..(r + 1) * drb];
                             da.extend_from_slice(&row[..dh]);
-                            dbb.extend_from_slice(&row[dh..]);
+                            dbb.extend_from_slice(&row[dh..dh2]);
+                            dcc.extend_from_slice(&row[dh2..]);
                         }
                         let kq = |bytes: &[u8], rb: u64, q: u32| -> Result<KqW> {
                             Ok(KqW { w: DeviceBuf::from_bytes(bytes)?, row_bytes: rb, quant: q })
@@ -3794,12 +3858,20 @@ mod real {
                         };
                         kernels::set_device(dev_b)?;
                         *tp_ffn_stash.borrow_mut() = Some(TpFfnW {
-                            gate: kq(&gb[gsplit..], grb, gq)?,
-                            up: kq(&ub[usplit..], urb, uq)?,
-                            // B's rows are the REMAINDER, which is only
-                            // dh wide when the split is even
-                            down: kq(&dbb, (drb - dh) as u64, dq)?,
+                            gate: kq(&gb[gsplit..gsplit2], grb, gq)?,
+                            up: kq(&ub[usplit..usplit2], urb, uq)?,
+                            // B's rows are its OWN span, which is only dh
+                            // wide when the split is even
+                            down: kq(&dbb, (dh2 - dh) as u64, dq)?,
                         });
+                        if let Some((d3, _, _)) = tp3_cfg {
+                            kernels::set_device(d3)?;
+                            *tp_ffn3_stash.borrow_mut() = Some(TpFfnW {
+                                gate: kq(&gb[gsplit2..], grb, gq)?,
+                                up: kq(&ub[usplit2..], urb, uq)?,
+                                down: kq(&dcc, (drb - dh2) as u64, dq)?,
+                            });
+                        }
                         kernels::set_device(cur)?;
                         a
                     } else {
@@ -4469,6 +4541,7 @@ mod real {
                 kernels::set_device(layer_dev[il as usize])?;
                 layers.push(load_layer(il, &mut attn_vram_budget, &mut no_budget)?);
                 if tp_cfg.is_some() {
+                    tp3_layers.push(tp_ffn3_stash.borrow_mut().take());
                     let f = tp_ffn_stash.borrow_mut().take();
                     let g2 = tp_gdn_stash.borrow_mut().take();
                     let at = tp_attn_stash.borrow_mut().take();
@@ -4665,6 +4738,11 @@ mod real {
                 dsv4_out,
                 dspark,
                 tp: tp_cfg.map(|(dev, half)| TpW { dev, half, layers: tp_layers, head: tp_head }),
+                tp_c: tp3_cfg.map(|(dev, _, _)| TpCW {
+                    dev,
+                    width: shape.n_ff_exp - tp_cfg.map_or(0, |(_, h)| h) - tp3_cfg.map_or(0, |(_, _, wb)| wb),
+                    ffn: tp3_layers,
+                }),
             })
         }
     }
