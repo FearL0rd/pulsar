@@ -92,6 +92,7 @@ mod real {
         fn pulsar_q8_0_matmul_banked(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_bank: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_f32(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_kq(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
+        fn pulsar_bw_read(buf: *mut c_void, bytes: u64, sink: *mut c_void) -> i32;
         fn pulsar_idx_rope0(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> i32;
         fn pulsar_idx_store_k(raw_k: *const c_void, w: *const c_void, b: *const c_void, cache: *mut c_void, pos0: u32, n_tok: u32, cache_cap: u32, head_dim: u32, rot_dim: u32, n_ctx_orig: u32, eps: f32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, fp8: u32) -> i32;
         fn pulsar_idx_score_one(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, n_rows: u32, n_head: u32, head_dim: u32, scale: f32, fp8: u32) -> i32;
@@ -355,7 +356,11 @@ mod real {
     /// the current device; returns 0.0 on any probe failure so a broken
     /// card ranks last instead of erroring placement.
     pub fn vram_bandwidth(dev: i32) -> f64 {
-        const MB64: usize = 64 << 20;
+        // 512MB, not 64MB: Ada/Blackwell L2 runs to 32MB, so a 64MB
+        // buffer is served largely from cache and every card reports the
+        // same ~390 GB/s regardless of its actual DRAM rate. Sized to
+        // dwarf any L2 on this generation.
+        const MB64: usize = 512 << 20;
         const D2D_KIND: i32 = 3;
         let cur = get_device();
         if set_device(dev).is_err() {
@@ -365,15 +370,16 @@ mod real {
         let mut b = std::ptr::null_mut();
         let mut best = 0f64;
         if unsafe { cudaMalloc(&mut a, MB64) } == 0 {
-            if unsafe { cudaMalloc(&mut b, MB64) } == 0 {
-                // one warmup, then best of 3 timed synchronous copies
-                unsafe { cudaMemcpy(b, a, MB64, D2D_KIND) };
+            if unsafe { cudaMalloc(&mut b, 16) } == 0 {
+                // one warmup, then best of 3 timed streaming reads
+                unsafe { pulsar_bw_read(a, MB64 as u64, b) };
+                unsafe { cudaDeviceSynchronize() };
                 for _ in 0..3 {
                     let t = std::time::Instant::now();
-                    if unsafe { cudaMemcpy(b, a, MB64, D2D_KIND) } == 0
+                    if unsafe { pulsar_bw_read(a, MB64 as u64, b) } != 0
                         && unsafe { cudaDeviceSynchronize() } == 0
                     {
-                        best = best.max(2.0 * MB64 as f64 / 1e9 / t.elapsed().as_secs_f64());
+                        best = best.max(MB64 as f64 / 1e9 / t.elapsed().as_secs_f64());
                     }
                 }
                 unsafe { cudaFree(b) };

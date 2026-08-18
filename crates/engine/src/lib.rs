@@ -3224,11 +3224,33 @@ mod real {
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .unwrap();
+                // Split the FFN by MEASURED VRAM BANDWIDTH, not evenly.
+                // Every sublayer is a barrier: both cards read their
+                // shard's weights and the layer advances when the SLOWER
+                // one finishes, so an even split on uneven cards runs the
+                // whole model at the slow card's rate. Measured here with
+                // nsys: the 4060 Ti moved 275 GB/s of its 288 GB/s peak
+                // while the 5060 Ti idled at 61% of its own.
+                //
+                // A's share must stay a multiple of PULSAR_QK_K: ffn_down
+                // splits along the CONTRACTION dim, so the cut has to land
+                // on a quant block boundary. Clamped to [1/4, 3/4] so a
+                // bogus bandwidth probe cannot starve a card.
+                let qk = 256u32;
+                let (ba, bb) = (kernels::vram_bandwidth(primary), kernels::vram_bandwidth(dev_b));
+                let frac = if ba > 0.0 && bb > 0.0 { ba / (ba + bb) } else { 0.5 };
+                let n_ff = shape.n_ff_exp;
+                // round to the NEAREST block: truncating hands the
+                // other card a whole extra block, which on a pair of
+                // identical cards is pure straggler time (measured 47.8
+                // -> 46.2 tok/s from one block of skew)
+                let half = ((n_ff as f64 * frac / qk as f64).round() as u32 * qk)
+                    .clamp(n_ff / 4 / qk * qk, n_ff * 3 / 4 / qk * qk);
                 eprintln!(
-                    "pulsar: FFN tensor parallel on devices {primary}+{dev_b} ({}-wide halves)",
-                    shape.n_ff_exp / 2
+                    "pulsar: FFN tensor parallel on devices {primary}+{dev_b} ({half}/{} split, {:.0}/{:.0} GB/s)",
+                    n_ff - half, ba, bb
                 );
-                Some((dev_b, shape.n_ff_exp / 2))
+                Some((dev_b, half))
             } else {
                 None
             };
@@ -3751,7 +3773,9 @@ mod real {
                         // output row contributes its first half of
                         // quant blocks to A and the rest to B
                         let drb = drb as usize;
-                        let dh = drb / 2;
+                        // same cut as gate/up, in bytes: exact because
+                        // `half` is a whole number of quant blocks
+                        let dh = half as usize * drb / shape.n_ff_exp as usize;
                         let n_out = db.len() / drb;
                         let mut da = Vec::with_capacity(n_out * dh);
                         let mut dbb = Vec::with_capacity(n_out * dh);
@@ -3772,7 +3796,9 @@ mod real {
                         *tp_ffn_stash.borrow_mut() = Some(TpFfnW {
                             gate: kq(&gb[gsplit..], grb, gq)?,
                             up: kq(&ub[usplit..], urb, uq)?,
-                            down: kq(&dbb, dh as u64, dq)?,
+                            // B's rows are the REMAINDER, which is only
+                            // dh wide when the split is even
+                            down: kq(&dbb, (drb - dh) as u64, dq)?,
                         });
                         kernels::set_device(cur)?;
                         a

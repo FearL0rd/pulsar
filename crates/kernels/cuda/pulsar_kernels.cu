@@ -4602,6 +4602,27 @@ static const char *gemm_octet_tile(const void *xq_dev, uint32_t in_blocks, uint3
     return (const char *)tile;
 }
 
+
+/* Streaming-read bandwidth probe. A D2D cudaMemcpy cannot measure this:
+ * it is bounded by the copy engine (~390 GB/s on every card in this box)
+ * and a small buffer additionally lands in L2, which runs to 32MB on Ada.
+ * Decode reads weights through the SMs, so probe that path instead. */
+__global__ static void bw_read_kernel(const float4 *p, uint64_t n4, float *out) {
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    float acc = 0.0f;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += stride) {
+        float4 v = p[i];
+        acc += v.x + v.y + v.z + v.w;
+    }
+    /* never true: keeps the loads from being optimized away */
+    if (acc == 1.2345678e30f) out[0] = acc;
+}
+
+extern "C" int pulsar_bw_read(void *buf, uint64_t bytes, void *sink) {
+    bw_read_kernel<<<1024, 256>>>((const float4 *)buf, bytes / 16u, (float *)sink);
+    return cuda_ok(cudaGetLastError(), "bw_read launch");
+}
+
 extern "C" int pulsar_matmul_kq(
         void *out_dev,
         const void *w_dev,

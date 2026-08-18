@@ -425,7 +425,8 @@ impl Qwen35Rt {
                 let q8k = |n: usize| {
                     n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
                 };
-                let half = tp.half as usize;
+                // tp.half is A's share; B holds the rest
+                let half = (s.n_ff_exp - tp.half) as usize;
                 let (kdh, vdh) = (key_dim / 2, value_dim / 2);
                 let cdh = 2 * kdh + vdh;
                 let vh = s.ssm_v_heads as usize / 2;
@@ -1877,11 +1878,13 @@ impl Model {
                 tb.lx.send(&st.xq, xb)?;
                 kernels::set_device(tb.dev)?;
                 tb.lx.recv(&mut tb.xq, xb)?;
-                kernels::matmul_kq(&mut tb.gate, &bw.gate.w, &tb.xq, s.n_embd, half, t, bw.gate.row_bytes, bw.gate.quant)?;
-                kernels::matmul_kq(&mut tb.up, &bw.up.w, &tb.xq, s.n_embd, half, t, bw.up.row_bytes, bw.up.quant)?;
-                kernels::swiglu(&mut tb.mid, &tb.gate, &tb.up, t * half, 0.0, 1.0, 0)?;
-                kernels::quantize_q8_k(&mut tb.midq, &tb.mid, half, t)?;
-                kernels::matmul_kq(&mut tb.out, &bw.down.w, &tb.midq, half, s.n_embd, t, bw.down.row_bytes, bw.down.quant)?;
+                // half is A's share of the FFN rows, hb is B's
+                let hb = s.n_ff_exp - half;
+                kernels::matmul_kq(&mut tb.gate, &bw.gate.w, &tb.xq, s.n_embd, hb, t, bw.gate.row_bytes, bw.gate.quant)?;
+                kernels::matmul_kq(&mut tb.up, &bw.up.w, &tb.xq, s.n_embd, hb, t, bw.up.row_bytes, bw.up.quant)?;
+                kernels::swiglu(&mut tb.mid, &tb.gate, &tb.up, t * hb, 0.0, 1.0, 0)?;
+                kernels::quantize_q8_k(&mut tb.midq, &tb.mid, hb, t)?;
+                kernels::matmul_kq(&mut tb.out, &bw.down.w, &tb.midq, hb, s.n_embd, t, bw.down.row_bytes, bw.down.quant)?;
                 tb.lo.send(&tb.out, t as usize * s.n_embd as usize * 4)?;
                 kernels::set_device(primary)?;
                 // A's half runs while B's chain + copies are in flight
