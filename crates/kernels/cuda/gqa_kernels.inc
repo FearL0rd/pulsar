@@ -169,27 +169,49 @@ __device__ __forceinline__ static uint64_t kv_row_stride(Kvf kvf, uint32_t head_
     }
 }
 
-/* qk dot for a single key row: dot = sum_d q[d] * dequant_k(d), then the
- * per-row / per-block scale folds out (applied once by the caller via
- * row_scale_out). The scale-free packed formats (f32, fp16) return 1.0. */
-template <Kvf KVF>
-__device__ __forceinline__ static float gqa_kdot(
-        const void *row_void, const float *sq, uint32_t head_dim, float *row_scale_out) {
-    float dot = 0.0f;
+/* qk dot of one key row against T query vectors (sq laid out
+ * [T][head_dim]): dots[t] = sum_d sq[t][d] * dequant_k(d). The key row is
+ * read ONCE for all T queries - that is the point, see the fused-token
+ * split kernel. The per-row / per-block scale folds out (applied once by
+ * the caller via row_scale_out); the scale-free packed formats (f32, fp16)
+ * return 1.0. The T=1 wrapper below keeps the exact multiply order of the
+ * old single-query gqa_kdot, so its callers stay bit-identical. */
+template <Kvf KVF, uint32_t T>
+__device__ __forceinline__ static void gqa_kdot_multi(
+        const void *row_void, const float *sq, uint32_t head_dim,
+        float *row_scale_out, float *dots) {
     float rs = 1.0f;
+    #pragma unroll
+    for (uint32_t t = 0; t < T; t++) dots[t] = 0.0f;
     if (KVF == Kvf::F32) {
         const float *krow = (const float *)row_void;
-        for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * krow[d];
+        for (uint32_t d = 0; d < head_dim; d++) {
+            float kv = krow[d];
+            #pragma unroll
+            for (uint32_t t = 0; t < T; t++) dots[t] += sq[t * head_dim + d] * kv;
+        }
     } else if (KVF == Kvf::FP16) {
         const __half *krow = (const __half *)row_void;
-        for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * __half2float(krow[d]);
+        for (uint32_t d = 0; d < head_dim; d++) {
+            float kv = __half2float(krow[d]);
+            #pragma unroll
+            for (uint32_t t = 0; t < T; t++) dots[t] += sq[t * head_dim + d] * kv;
+        }
     } else if (KVF == Kvf::FP8) {
         const uint8_t *krow = (const uint8_t *)row_void;
-        for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * e4m3_dec_common(krow[d]);
+        for (uint32_t d = 0; d < head_dim; d++) {
+            float kv = e4m3_dec_common(krow[d]);
+            #pragma unroll
+            for (uint32_t t = 0; t < T; t++) dots[t] += sq[t * head_dim + d] * kv;
+        }
         memcpy(&rs, krow + head_dim, 4);
     } else if (KVF == Kvf::INT8) {
         const int8_t *krow = (const int8_t *)row_void;
-        for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * (float)krow[d];
+        for (uint32_t d = 0; d < head_dim; d++) {
+            float kv = (float)krow[d];
+            #pragma unroll
+            for (uint32_t t = 0; t < T; t++) dots[t] += sq[t * head_dim + d] * kv;
+        }
         memcpy(&rs, (const uint8_t *)krow + head_dim, 4);
     } else if (KVF == Kvf::Q8_0) {
         const char *blocks = (const char *)row_void;
@@ -198,7 +220,12 @@ __device__ __forceinline__ static float gqa_kdot(
             const char *bb = blocks + (uint64_t)b * 34u;
             float d = __half2float(*(const __half *)bb);
             const int8_t *qs = (const int8_t *)(bb + 2u);
-            for (uint32_t i = 0; i < 32u; i++) dot += sq[b * 32u + i] * d * (float)qs[i];
+            for (uint32_t i = 0; i < 32u; i++) {
+                float kv = (float)qs[i];
+                #pragma unroll
+                for (uint32_t t = 0; t < T; t++)
+                    dots[t] += sq[t * head_dim + b * 32u + i] * d * kv;
+            }
         }
     } else { /* Q4_0 */
         const char *blocks = (const char *)row_void;
@@ -209,12 +236,24 @@ __device__ __forceinline__ static float gqa_kdot(
             const uint8_t *qs = (const uint8_t *)(bb + 2u);
             for (uint32_t i = 0; i < 16u; i++) {
                 uint8_t byte = qs[i];
-                dot += sq[b * 32u + i]      * d * ((float)(byte & 0xFu) - 8.0f);
-                dot += sq[b * 32u + i + 16u] * d * ((float)(byte >> 4)   - 8.0f);
+                float klo = (float)(byte & 0xFu) - 8.0f;
+                float khi = (float)(byte >> 4) - 8.0f;
+                #pragma unroll
+                for (uint32_t t = 0; t < T; t++) {
+                    dots[t] += sq[t * head_dim + b * 32u + i] * d * klo;
+                    dots[t] += sq[t * head_dim + b * 32u + i + 16u] * d * khi;
+                }
             }
         }
     }
     *row_scale_out = rs;
+}
+
+template <Kvf KVF>
+__device__ __forceinline__ static float gqa_kdot(
+        const void *row_void, const float *sq, uint32_t head_dim, float *row_scale_out) {
+    float dot;
+    gqa_kdot_multi<KVF, 1>(row_void, sq, head_dim, row_scale_out, &dot);
     return dot;
 }
 
@@ -377,19 +416,29 @@ __global__ static void gqa_attention_kernel(
  * UNNORMALIZED partial {acc[hd], m, den}; a combine kernel rescales onto
  * the global max and normalizes. Engaged only when n_tok <= 4, the
  * visible rows >= 4096 and there is no rel bias, so short-context calls
- * (and their bit-exact gates) take the original kernel unchanged. */
+ * (and their bit-exact gates) take the original kernel unchanged.
+ *
+ * The T tokens of a call (MTP verify rows) are FUSED into the block: one
+ * block owns all T tokens of a (head, split) and reads each K/V row once
+ * for all of them, cutting K/V traffic by T. nsys at 6.4k ctx put 83% of
+ * decode in this kernel at 3x the necessary traffic. The split geometry
+ * is shared - built on the union of the tokens' visible rows - and each
+ * token masks rows outside its own causal/window range, so the deepest
+ * token (and any T=1 call) keeps the old chunk alignment bit-exactly.
+ * DPT = head_dim/128 output lanes per thread is a template arg for the
+ * same reason as the tiled kernel: a runtime bound on the acc index
+ * spills the accumulators to local memory. */
 #define GQA_SPLIT_MIN_ROWS 4096u
 #define GQA_SPLIT_MAX_TOK  4u
 #define GQA_SPLIT_ROWS     2048u
 #define GQA_SPLIT_MAX      64u
 
-template <Kvf KVF>
+template <Kvf KVF, uint32_t T, uint32_t DPT>
 __global__ static void gqa_attention_split_kernel(
         float *partial,      /* [n_tok][n_head][n_split][hd+2]: acc, m, den */
         const float *q,
         const void *k_cache,
         const void *v_cache,
-        uint32_t n_tok,
         uint32_t n_head,
         uint32_t n_kv_head,
         uint32_t head_dim,
@@ -398,72 +447,124 @@ __global__ static void gqa_attention_split_kernel(
         float scale,
         uint32_t window,
         uint32_t n_split) {
-    uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     uint32_t sp = blockIdx.z;
-    if (t >= n_tok || h >= n_head) return;
+    if (h >= n_head) return;
     uint32_t kvh = h / (n_head / n_kv_head);
-    uint32_t n_rows = pos0 + t + 1u;
-    uint32_t row0 = (window != 0u && n_rows > window) ? n_rows - window : 0u;
+    uint32_t n_rows = pos0 + T;
+    uint32_t row0 = (window != 0u && pos0 + 1u > window) ? pos0 + 1u - window : 0u;
     uint32_t span = (n_rows - row0 + n_split - 1u) / n_split;
     uint32_t lo = row0 + sp * span;
     uint32_t hi = lo + span < n_rows ? lo + span : n_rows;
-    float *dst = partial + (((uint64_t)t * n_head + h) * n_split + sp) * ((uint64_t)head_dim + 2u);
     const uint32_t tid = threadIdx.x;
+    const uint64_t pstride = (uint64_t)head_dim + 2u;
     if (lo >= hi) {
-        for (uint32_t d = tid; d < head_dim; d += 128u) dst[d] = 0.0f;
-        if (tid == 0) { dst[head_dim] = -INFINITY; dst[head_dim + 1u] = 0.0f; }
+        for (uint32_t t = 0; t < T; t++) {
+            float *dst = partial + (((uint64_t)t * n_head + h) * n_split + sp) * pstride;
+            for (uint32_t d = tid; d < head_dim; d += 128u) dst[d] = 0.0f;
+            if (tid == 0) { dst[head_dim] = -INFINITY; dst[head_dim + 1u] = 0.0f; }
+        }
         return;
     }
-    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
     const uint64_t kv_stride = kv_row_stride(KVF, head_dim);
     const char *kbase = (const char *)k_cache + (uint64_t)kvh * cap * kv_stride;
     const char *vbase = (const char *)v_cache + (uint64_t)kvh * cap * kv_stride;
-    __shared__ float sq[512];
-    __shared__ float s_w[128];
-    __shared__ float red[128];
-    for (uint32_t d = tid; d < head_dim; d += 128u) sq[d] = qh[d];
+    __shared__ float sq[T * 512u];
+    __shared__ float s_w[T][128];
+    __shared__ float red[T * 128u];
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t d = tid; d < head_dim; d += 128u)
+            sq[t * head_dim + d] = q[((uint64_t)t * n_head + h) * head_dim + d];
     __syncthreads();
 
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float den = 0.0f;
-    float m = -INFINITY;
+    float acc[T][DPT];
+    float den[T], m[T];
+    #pragma unroll
+    for (uint32_t t = 0; t < T; t++) {
+        den[t] = 0.0f;
+        m[t] = -INFINITY;
+        #pragma unroll
+        for (uint32_t k = 0; k < DPT; k++) acc[t][k] = 0.0f;
+    }
     for (uint32_t base = lo; base < hi; base += 128u) {
         uint32_t chunk = hi - base < 128u ? hi - base : 128u;
-        float s = -INFINITY;
+        float s[T];
+        #pragma unroll
+        for (uint32_t t = 0; t < T; t++) s[t] = -INFINITY;
         if (tid < chunk) {
             const char *krow = kbase + (uint64_t)(base + tid) * kv_stride;
             float ks;
-            float dot = gqa_kdot<KVF>(krow, sq, head_dim, &ks);
-            s = dot * ks * scale;
-        }
-        red[tid] = s;
-        __syncthreads();
-        for (uint32_t st = 64u; st != 0; st >>= 1u) {
-            if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
-            __syncthreads();
-        }
-        float m_new = fmaxf(m, red[0]);
-        float corr = expf(m - m_new);
-        #pragma unroll
-        for (uint32_t k = 0; k < 4; k++) acc[k] *= corr;
-        den *= corr;
-        if (tid < chunk) s_w[tid] = expf(s - m_new);
-        __syncthreads();
-        for (uint32_t r = 0; r < chunk; r++) {
-            float w = s_w[r];
-            den += w;
-            const char *vrow = vbase + (uint64_t)(base + r) * kv_stride;
-            float wv = w * gqa_vrow_scale<KVF>(vrow, head_dim);
-            for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
-                acc[k] += wv * gqa_vacc_lane<KVF>(vrow, d, head_dim);
+            float dots[T];
+            gqa_kdot_multi<KVF, T>(krow, sq, head_dim, &ks, dots);
+            #pragma unroll
+            for (uint32_t t = 0; t < T; t++) {
+                uint32_t nr = pos0 + t + 1u;
+                uint32_t r0 = (window != 0u && nr > window) ? nr - window : 0u;
+                if (base + tid < nr && base + tid >= r0)
+                    s[t] = dots[t] * ks * scale;
             }
         }
-        m = m_new;
+        #pragma unroll
+        for (uint32_t t = 0; t < T; t++) red[t * 128u + tid] = s[t];
+        __syncthreads();
+        /* T max-trees reduced together, one barrier per level */
+        for (uint32_t st = 64u; st != 0; st >>= 1u) {
+            for (uint32_t u = tid; u < T * st; u += 128u) {
+                uint32_t rt = u / st, i = u - rt * st;
+                red[rt * 128u + i] = fmaxf(red[rt * 128u + i], red[rt * 128u + i + st]);
+            }
+            __syncthreads();
+        }
+        float m_new[T];
+        #pragma unroll
+        for (uint32_t t = 0; t < T; t++) {
+            m_new[t] = fmaxf(m[t], red[t * 128u]);
+            /* a chunk can be fully masked for a shallow token; its max is
+             * still -inf then and exp(-inf - -inf) would be NaN */
+            float corr = m_new[t] == -INFINITY ? 1.0f : expf(m[t] - m_new[t]);
+            #pragma unroll
+            for (uint32_t k = 0; k < DPT; k++) acc[t][k] *= corr;
+            den[t] *= corr;
+        }
+        if (tid < chunk) {
+            #pragma unroll
+            for (uint32_t t = 0; t < T; t++)
+                s_w[t][tid] = s[t] == -INFINITY ? 0.0f : expf(s[t] - m_new[t]);
+        }
+        __syncthreads();
+        for (uint32_t r = 0; r < chunk; r++) {
+            const char *vrow = vbase + (uint64_t)(base + r) * kv_stride;
+            float vs = gqa_vrow_scale<KVF>(vrow, head_dim);
+            float wv[T];
+            #pragma unroll
+            for (uint32_t t = 0; t < T; t++) {
+                den[t] += s_w[t][r];
+                wv[t] = s_w[t][r] * vs;
+            }
+            #pragma unroll
+            for (uint32_t k = 0; k < DPT; k++) {
+                uint32_t d = tid + k * 128u;
+                if (d < head_dim) {
+                    float vv = gqa_vacc_lane<KVF>(vrow, d, head_dim);
+                    #pragma unroll
+                    for (uint32_t t = 0; t < T; t++) acc[t][k] += wv[t] * vv;
+                }
+            }
+        }
+        #pragma unroll
+        for (uint32_t t = 0; t < T; t++) m[t] = m_new[t];
         __syncthreads();
     }
-    for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) dst[d] = acc[k];
-    if (tid == 0) { dst[head_dim] = m; dst[head_dim + 1u] = den; }
+    #pragma unroll
+    for (uint32_t t = 0; t < T; t++) {
+        float *dst = partial + (((uint64_t)t * n_head + h) * n_split + sp) * pstride;
+        #pragma unroll
+        for (uint32_t k = 0; k < DPT; k++) {
+            uint32_t d = tid + k * 128u;
+            if (d < head_dim) dst[d] = acc[t][k];
+        }
+        if (tid == 0) { dst[head_dim] = m[t]; dst[head_dim + 1u] = den[t]; }
+    }
 }
 
 __global__ static void gqa_attention_combine_kernel(
@@ -782,17 +883,22 @@ static int gqa_attention_dispatch(
         const float *rel, uint32_t rel_extent, const float *sinks) {
     uint32_t rows_eff = pos0 + n_tok;
     if (window != 0u && rows_eff > window) rows_eff = window;
-    if (!rel && n_tok <= GQA_SPLIT_MAX_TOK && rows_eff >= GQA_SPLIT_MIN_ROWS) {
+    if (!rel && n_tok <= GQA_SPLIT_MAX_TOK && rows_eff >= GQA_SPLIT_MIN_ROWS && head_dim <= 512u) {
         uint32_t n_split = (rows_eff + GQA_SPLIT_ROWS - 1u) / GQA_SPLIT_ROWS;
         if (n_split > GQA_SPLIT_MAX) n_split = GQA_SPLIT_MAX;
         if (n_split >= 2u) {
             uint64_t bytes = (uint64_t)n_tok * n_head * n_split * ((uint64_t)head_dim + 2u) * 4u;
             float *partial = (float *)gqa_split_scratch(bytes);
             if (partial) { /* alloc failure falls through to the plain kernel */
-                dim3 g1(n_tok, n_head, n_split);
-                gqa_attention_split_kernel<KVF><<<g1, 128>>>(
-                        partial, q, kc, vc, n_tok, n_head, n_kv_head,
-                        head_dim, cap, pos0, scale, window, n_split);
+                dim3 g1(1, n_head, n_split);
+                const uint32_t sdpt = head_dim <= 128u ? 1u : (head_dim <= 256u ? 2u : 4u);
+                #define GQA_SPLIT(TV, DPTV) gqa_attention_split_kernel<KVF, TV, DPTV><<<g1, 128>>>(partial, q, kc, vc, n_head, n_kv_head, head_dim, cap, pos0, scale, window, n_split)
+                #define GQA_SPLIT_T(DPTV) do { if (n_tok == 1u) GQA_SPLIT(1u, DPTV); else if (n_tok == 2u) GQA_SPLIT(2u, DPTV); else if (n_tok == 3u) GQA_SPLIT(3u, DPTV); else GQA_SPLIT(4u, DPTV); } while (0)
+                if (sdpt == 1u) GQA_SPLIT_T(1u);
+                else if (sdpt == 2u) GQA_SPLIT_T(2u);
+                else GQA_SPLIT_T(4u);
+                #undef GQA_SPLIT_T
+                #undef GQA_SPLIT
                 if (!cuda_ok(cudaGetLastError(), "gqa split launch")) return 0;
                 dim3 g2(n_tok, n_head, 1);
                 gqa_attention_combine_kernel<<<g2, 128>>>(out, partial, n_tok, n_head, head_dim, n_split, sinks);
@@ -1826,6 +1932,54 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
         ds4_gpu_tensor_free(g_q2); ds4_gpu_tensor_free(g_kc2); ds4_gpu_tensor_free(g_vc2);
         ds4_gpu_tensor_free(g_out2); ds4_gpu_tensor_free(g_kin); ds4_gpu_tensor_free(g_vin);
         ds4_gpu_tensor_free(g_kc8); ds4_gpu_tensor_free(g_vc8);
+    }
+
+    /* Phase 7 (split-K, fused tokens): a deep cache (rows >= 4096) takes
+     * the split kernel, which owns all n_tok MTP verify tokens in one
+     * block and masks each token's causal/window range against the shared
+     * split geometry. Prod shape: head_dim 256 (DPT=2), 4 tokens, group 4.
+     * The window makes row0 land mid-cache so both mask edges execute.
+     * Caches are filled host-side (no append) - only attention is under
+     * test. */
+    {
+        const uint32_t s_head = 16, s_kv = 4, s_hd = 256, s_cap = 4736;
+        const uint32_t n_tok = 4, pos0 = 4700, window = 4300;
+        const float scale = 1.0f / sqrtf((float)s_hd);
+        uint64_t q_elems = (uint64_t)n_tok * s_head * s_hd;
+        uint64_t c_elems = (uint64_t)s_kv * s_cap * s_hd;
+        float *q = (float *)malloc(q_elems * sizeof(float));
+        float *kc = (float *)malloc(c_elems * sizeof(float));
+        float *vc = (float *)malloc(c_elems * sizeof(float));
+        for (uint64_t i = 0; i < q_elems; i++) q[i] = gqa_test_randf();
+        for (uint64_t i = 0; i < c_elems; i++) { kc[i] = gqa_test_randf(); vc[i] = gqa_test_randf(); }
+
+        ds4_gpu_tensor *g_q2 = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+        ds4_gpu_tensor *g_kc2 = ds4_gpu_tensor_alloc(c_elems * sizeof(float));
+        ds4_gpu_tensor *g_vc2 = ds4_gpu_tensor_alloc(c_elems * sizeof(float));
+        ds4_gpu_tensor *g_out = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+        int ok = g_q2 && g_kc2 && g_vc2 && g_out;
+        if (ok) {
+            ds4_gpu_tensor_write(g_q2, 0, q, q_elems * sizeof(float));
+            ds4_gpu_tensor_write(g_kc2, 0, kc, c_elems * sizeof(float));
+            ds4_gpu_tensor_write(g_vc2, 0, vc, c_elems * sizeof(float));
+        }
+        float *ref_out = (float *)malloc(q_elems * sizeof(float));
+        gqa_ref_attention(ref_out, q, kc, vc, n_tok, s_head, s_kv, s_hd, s_cap, pos0,
+                          scale, window, NULL, 0u);
+        if (ok) ok = ds4_gpu_gqa_attention(g_out, g_q2, g_kc2, g_vc2, n_tok, s_head, s_kv,
+                                           s_hd, s_cap, pos0, scale, window, NULL, 0u, NULL) &&
+                     cuda_ok(cudaDeviceSynchronize(), "gqa split selftest sync");
+        float *gpu_out = (float *)malloc(q_elems * sizeof(float));
+        if (ok) ok = ds4_gpu_tensor_read(g_out, 0, gpu_out, q_elems * sizeof(float)) != 0;
+        float diff = ok ? gqa_max_abs_diff(ref_out, gpu_out, q_elems) : INFINITY;
+        int pass = ok && diff < 2e-4f;
+        fprintf(stderr, "gqa-selftest phase 8 split-fused (n_tok=%u pos0=%u win=%u): %s (max diff %.2e)\n",
+                n_tok, pos0, window, pass ? "PASS" : "FAIL", diff);
+        if (!pass) all_ok = 0;
+
+        free(q); free(kc); free(vc); free(ref_out); free(gpu_out);
+        ds4_gpu_tensor_free(g_q2); ds4_gpu_tensor_free(g_kc2);
+        ds4_gpu_tensor_free(g_vc2); ds4_gpu_tensor_free(g_out);
     }
 
     free(qn_w); free(kn_w); free(ref_kc); free(ref_vc);
