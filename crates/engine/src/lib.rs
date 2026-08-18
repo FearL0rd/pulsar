@@ -33,7 +33,7 @@ mod real {
 
     mod dsv4;
     mod k3;
-    mod qwen35;
+    pub(crate) mod qwen35;
     pub use dsv4::generate_dspark;
     pub use qwen35::{generate_dflash, DraftModel};
 
@@ -8671,12 +8671,19 @@ mod real {
         let spec = model.mtp.is_some() && sampler.is_greedy();
         let mut pos = pos0;
         let mut logits = None;
-        // qwen35 MTP prefill: the draft-layer scratch is 16-row and the
-        // qwen35 forward leaves only its LAST 16-row chunk in st.cur, so
-        // the fill pass needs outer chunks capped to match (the forward
-        // is internally 16-chunked anyway - same work either way)
+        // qwen35 MTP prefill: the forward leaves only its LAST internal
+        // chunk in st.cur and the fill pass reads every row of the chunk
+        // back, so the outer chunks are capped to the forward's own width.
+        //
+        // This used to be hardcoded to 16 with the note that the forward
+        // was internally 16-chunked anyway - same work either way.
+        // That stopped being true when the internal width grew to 128:
+        // 16-row outer chunks swept the whole 15.7GB of weights 8x more
+        // often than needed, and the MTP prefill path was 5.4x slower
+        // than the same prompt with MTP off (61s vs 11s on 7120 tokens).
+        // The MTP scratch is max_batch-sized, so it was never the limit.
         let chunk_cap = if spec && model.shape.family == Family::Qwen35 {
-            16
+            (st.max_batch() as usize).min(qwen35::T_MAX)
         } else {
             st.max_batch() as usize
         };
