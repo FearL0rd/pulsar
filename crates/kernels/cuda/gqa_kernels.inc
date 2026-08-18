@@ -433,7 +433,7 @@ __global__ static void gqa_attention_kernel(
 #define GQA_SPLIT_ROWS     512u
 #define GQA_SPLIT_MAX      64u
 
-template <Kvf KVF, uint32_t T, uint32_t DPT>
+template <Kvf KVF, uint32_t T, uint32_t G, uint32_t DPT>
 __global__ static void gqa_attention_split_kernel(
         float *partial,      /* [n_tok][n_head][n_split][hd+2]: acc, m, den */
         const float *q,
@@ -447,10 +447,15 @@ __global__ static void gqa_attention_split_kernel(
         float scale,
         uint32_t window,
         uint32_t n_split) {
-    uint32_t h = blockIdx.y;
+    /* G consecutive query heads of ONE KV group join the T fused tokens:
+     * a block owns G*T online softmaxes and reads each K/V row once for
+     * all of them. The dispatch guarantees G divides the GQA group, so
+     * every head here shares kvh. */
+    constexpr uint32_t GT = G * T;
+    uint32_t h0 = blockIdx.y * G;
     uint32_t sp = blockIdx.z;
-    if (h >= n_head) return;
-    uint32_t kvh = h / (n_head / n_kv_head);
+    if (h0 >= n_head) return;
+    uint32_t kvh = h0 / (n_head / n_kv_head);
     uint32_t n_rows = pos0 + T;
     uint32_t row0 = (window != 0u && pos0 + 1u > window) ? pos0 + 1u - window : 0u;
     uint32_t span = (n_rows - row0 + n_split - 1u) / n_split;
@@ -459,8 +464,9 @@ __global__ static void gqa_attention_split_kernel(
     const uint32_t tid = threadIdx.x;
     const uint64_t pstride = (uint64_t)head_dim + 2u;
     if (lo >= hi) {
+        for (uint32_t g = 0; g < G; g++)
         for (uint32_t t = 0; t < T; t++) {
-            float *dst = partial + (((uint64_t)t * n_head + h) * n_split + sp) * pstride;
+            float *dst = partial + (((uint64_t)t * n_head + h0 + g) * n_split + sp) * pstride;
             for (uint32_t d = tid; d < head_dim; d += 128u) dst[d] = 0.0f;
             if (tid == 0) { dst[head_dim] = -INFINITY; dst[head_dim + 1u] = 0.0f; }
         }
@@ -469,77 +475,80 @@ __global__ static void gqa_attention_split_kernel(
     const uint64_t kv_stride = kv_row_stride(KVF, head_dim);
     const char *kbase = (const char *)k_cache + (uint64_t)kvh * cap * kv_stride;
     const char *vbase = (const char *)v_cache + (uint64_t)kvh * cap * kv_stride;
-    __shared__ float sq[T * 512u];
-    __shared__ float s_w[T][128];
-    __shared__ float red[T * 128u];
+    __shared__ float sq[GT * 512u];
+    __shared__ float s_w[GT][128];
+    __shared__ float red[GT * 128u];
+    for (uint32_t g = 0; g < G; g++)
     for (uint32_t t = 0; t < T; t++)
         for (uint32_t d = tid; d < head_dim; d += 128u)
-            sq[t * head_dim + d] = q[((uint64_t)t * n_head + h) * head_dim + d];
+            sq[(g * T + t) * head_dim + d] = q[((uint64_t)t * n_head + h0 + g) * head_dim + d];
     __syncthreads();
 
-    float acc[T][DPT];
-    float den[T], m[T];
+    float acc[GT][DPT];
+    float den[GT], m[GT];
     #pragma unroll
-    for (uint32_t t = 0; t < T; t++) {
-        den[t] = 0.0f;
-        m[t] = -INFINITY;
+    for (uint32_t i = 0; i < GT; i++) {
+        den[i] = 0.0f;
+        m[i] = -INFINITY;
         #pragma unroll
-        for (uint32_t k = 0; k < DPT; k++) acc[t][k] = 0.0f;
+        for (uint32_t k = 0; k < DPT; k++) acc[i][k] = 0.0f;
     }
     for (uint32_t base = lo; base < hi; base += 128u) {
         uint32_t chunk = hi - base < 128u ? hi - base : 128u;
-        float s[T];
+        float s[GT];
         #pragma unroll
-        for (uint32_t t = 0; t < T; t++) s[t] = -INFINITY;
+        for (uint32_t i = 0; i < GT; i++) s[i] = -INFINITY;
         if (tid < chunk) {
             const char *krow = kbase + (uint64_t)(base + tid) * kv_stride;
             float ks;
-            float dots[T];
-            gqa_kdot_multi<KVF, T>(krow, sq, head_dim, &ks, dots);
+            float dots[GT];
+            gqa_kdot_multi<KVF, GT>(krow, sq, head_dim, &ks, dots);
+            #pragma unroll
+            for (uint32_t g = 0; g < G; g++)
             #pragma unroll
             for (uint32_t t = 0; t < T; t++) {
                 uint32_t nr = pos0 + t + 1u;
                 uint32_t r0 = (window != 0u && nr > window) ? nr - window : 0u;
                 if (base + tid < nr && base + tid >= r0)
-                    s[t] = dots[t] * ks * scale;
+                    s[g * T + t] = dots[g * T + t] * ks * scale;
             }
         }
         #pragma unroll
-        for (uint32_t t = 0; t < T; t++) red[t * 128u + tid] = s[t];
+        for (uint32_t i = 0; i < GT; i++) red[i * 128u + tid] = s[i];
         __syncthreads();
-        /* T max-trees reduced together, one barrier per level */
+        /* GT max-trees reduced together, one barrier per level */
         for (uint32_t st = 64u; st != 0; st >>= 1u) {
-            for (uint32_t u = tid; u < T * st; u += 128u) {
+            for (uint32_t u = tid; u < GT * st; u += 128u) {
                 uint32_t rt = u / st, i = u - rt * st;
                 red[rt * 128u + i] = fmaxf(red[rt * 128u + i], red[rt * 128u + i + st]);
             }
             __syncthreads();
         }
-        float m_new[T];
+        float m_new[GT];
         #pragma unroll
-        for (uint32_t t = 0; t < T; t++) {
-            m_new[t] = fmaxf(m[t], red[t * 128u]);
+        for (uint32_t i = 0; i < GT; i++) {
+            m_new[i] = fmaxf(m[i], red[i * 128u]);
             /* a chunk can be fully masked for a shallow token; its max is
              * still -inf then and exp(-inf - -inf) would be NaN */
-            float corr = m_new[t] == -INFINITY ? 1.0f : expf(m[t] - m_new[t]);
+            float corr = m_new[i] == -INFINITY ? 1.0f : expf(m[i] - m_new[i]);
             #pragma unroll
-            for (uint32_t k = 0; k < DPT; k++) acc[t][k] *= corr;
-            den[t] *= corr;
+            for (uint32_t k = 0; k < DPT; k++) acc[i][k] *= corr;
+            den[i] *= corr;
         }
         if (tid < chunk) {
             #pragma unroll
-            for (uint32_t t = 0; t < T; t++)
-                s_w[t][tid] = s[t] == -INFINITY ? 0.0f : expf(s[t] - m_new[t]);
+            for (uint32_t i = 0; i < GT; i++)
+                s_w[i][tid] = s[i] == -INFINITY ? 0.0f : expf(s[i] - m_new[i]);
         }
         __syncthreads();
         for (uint32_t r = 0; r < chunk; r++) {
             const char *vrow = vbase + (uint64_t)(base + r) * kv_stride;
             float vs = gqa_vrow_scale<KVF>(vrow, head_dim);
-            float wv[T];
+            float wv[GT];
             #pragma unroll
-            for (uint32_t t = 0; t < T; t++) {
-                den[t] += s_w[t][r];
-                wv[t] = s_w[t][r] * vs;
+            for (uint32_t i = 0; i < GT; i++) {
+                den[i] += s_w[i][r];
+                wv[i] = s_w[i][r] * vs;
             }
             #pragma unroll
             for (uint32_t k = 0; k < DPT; k++) {
@@ -547,23 +556,25 @@ __global__ static void gqa_attention_split_kernel(
                 if (d < head_dim) {
                     float vv = gqa_vacc_lane<KVF>(vrow, d, head_dim);
                     #pragma unroll
-                    for (uint32_t t = 0; t < T; t++) acc[t][k] += wv[t] * vv;
+                    for (uint32_t i = 0; i < GT; i++) acc[i][k] += wv[i] * vv;
                 }
             }
         }
         #pragma unroll
-        for (uint32_t t = 0; t < T; t++) m[t] = m_new[t];
+        for (uint32_t i = 0; i < GT; i++) m[i] = m_new[i];
         __syncthreads();
     }
     #pragma unroll
+    for (uint32_t g = 0; g < G; g++)
+    #pragma unroll
     for (uint32_t t = 0; t < T; t++) {
-        float *dst = partial + (((uint64_t)t * n_head + h) * n_split + sp) * pstride;
+        float *dst = partial + (((uint64_t)t * n_head + h0 + g) * n_split + sp) * pstride;
         #pragma unroll
         for (uint32_t k = 0; k < DPT; k++) {
             uint32_t d = tid + k * 128u;
-            if (d < head_dim) dst[d] = acc[t][k];
+            if (d < head_dim) dst[d] = acc[g * T + t][k];
         }
-        if (tid == 0) { dst[head_dim] = m[t]; dst[head_dim + 1u] = den[t]; }
+        if (tid == 0) { dst[head_dim] = m[g * T + t]; dst[head_dim + 1u] = den[g * T + t]; }
     }
 }
 
@@ -668,6 +679,17 @@ static uint32_t gqa_split_rows_env() {
         const char *e = getenv("PULSAR_SPLIT_ROWS");
         const uint32_t r = e ? (uint32_t)atoi(e) : GQA_SPLIT_ROWS;
         return r >= 256u ? r : GQA_SPLIT_ROWS;
+    }();
+    return v;
+}
+
+/* Head-group fusion cap (PULSAR_SPLIT_G): how many query heads of one KV
+ * group a block may own. 1 disables fusion for A/B runs. */
+static uint32_t gqa_split_g_env() {
+    static const uint32_t v = [] {
+        const char *e = getenv("PULSAR_SPLIT_G");
+        const uint32_t r = e ? (uint32_t)atoi(e) : 3u;
+        return (r >= 1u && r <= 3u) ? r : 3u;
     }();
     return v;
 }
@@ -903,14 +925,23 @@ static int gqa_attention_dispatch(
             uint64_t bytes = (uint64_t)n_tok * n_head * n_split * ((uint64_t)head_dim + 2u) * 4u;
             float *partial = (float *)gqa_split_scratch(bytes);
             if (partial) { /* alloc failure falls through to the plain kernel */
-                dim3 g1(1, n_head, n_split);
+                /* G = heads fused per block: largest of {3,2,1} that
+                 * divides the GQA group with G * n_tok <= 8 fused states
+                 * (the register ceiling; beyond that acc spills). */
+                const uint32_t grp = n_head / n_kv_head;
+                uint32_t gsel = 1u;
+                for (uint32_t c = gqa_split_g_env(); c >= 1u; c--)
+                    if (grp % c == 0u && c * n_tok <= 8u) { gsel = c; break; }
+                dim3 g1(1, n_head / gsel, n_split);
                 const uint32_t sdpt = head_dim <= 128u ? 1u : (head_dim <= 256u ? 2u : 4u);
-                #define GQA_SPLIT(TV, DPTV) gqa_attention_split_kernel<KVF, TV, DPTV><<<g1, 128>>>(partial, q, kc, vc, n_head, n_kv_head, head_dim, cap, pos0, scale, window, n_split)
-                #define GQA_SPLIT_T(DPTV) do { if (n_tok == 1u) GQA_SPLIT(1u, DPTV); else if (n_tok == 2u) GQA_SPLIT(2u, DPTV); else if (n_tok == 3u) GQA_SPLIT(3u, DPTV); else GQA_SPLIT(4u, DPTV); } while (0)
+                #define GQA_SPLIT(TV, GV, DPTV) gqa_attention_split_kernel<KVF, TV, GV, DPTV><<<g1, 128>>>(partial, q, kc, vc, n_head, n_kv_head, head_dim, cap, pos0, scale, window, n_split)
+                #define GQA_SPLIT_G(TV, DPTV) do { if (gsel == 3u && TV <= 2u) GQA_SPLIT(TV, (TV <= 2u ? 3u : 1u), DPTV); else if (gsel == 2u) GQA_SPLIT(TV, 2u, DPTV); else GQA_SPLIT(TV, 1u, DPTV); } while (0)
+                #define GQA_SPLIT_T(DPTV) do { if (n_tok == 1u) GQA_SPLIT_G(1u, DPTV); else if (n_tok == 2u) GQA_SPLIT_G(2u, DPTV); else if (n_tok == 3u) GQA_SPLIT_G(3u, DPTV); else GQA_SPLIT_G(4u, DPTV); } while (0)
                 if (sdpt == 1u) GQA_SPLIT_T(1u);
                 else if (sdpt == 2u) GQA_SPLIT_T(2u);
                 else GQA_SPLIT_T(4u);
                 #undef GQA_SPLIT_T
+                #undef GQA_SPLIT_G
                 #undef GQA_SPLIT
                 if (!cuda_ok(cudaGetLastError(), "gqa split launch")) return 0;
                 dim3 g2(n_tok, n_head, 1);
