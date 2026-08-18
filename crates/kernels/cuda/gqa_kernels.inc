@@ -543,17 +543,37 @@ static void *gqa_split_scratch(uint64_t bytes) {
 #define GQA_TILE_Q       8u
 #define GQA_TILE_MIN_TOK 16u
 
+/* Query tile at runtime (PULSAR_ATTN_TQ): this kernel is MEMORY bound,
+ * not compute bound - 4 FLOP/byte against a machine balance of 56 - so
+ * what matters is how many times the same K/V row is re-read. A chunk
+ * of 128 queries over 24 heads at tile 8 re-reads every K/V row 384
+ * times. Doubling the tile halves that. */
+static uint32_t gqa_tile_q() {
+    static const uint32_t tq = [] {
+        const char *e = getenv("PULSAR_ATTN_TQ");
+        const uint32_t v = e ? (uint32_t)atoi(e) : 16u;
+        /* 32 needs more than the 48KB default dynamic shared memory and
+         * would spill acc/m/den/dot besides, so it is not offered */
+        return (v == 8u || v == 16u) ? v : 16u;
+    }();
+    return tq;
+}
+
 static bool gqa_tile_off() {
     static const bool off = getenv("PULSAR_NO_ATTN_TILE") != NULL;
     return off;
 }
 
-static size_t gqa_tile_smem_bytes(uint32_t head_dim) {
-    return (size_t)((head_dim * GQA_TILE_Q) + (GQA_TILE_Q * 128u)
-                    + (4u * GQA_TILE_Q) + GQA_TILE_Q) * sizeof(float);
+static size_t gqa_tile_smem_bytes(uint32_t head_dim, uint32_t tq) {
+    return (size_t)((head_dim * tq) + (tq * 128u)
+                    + (4u * tq) + tq) * sizeof(float);
 }
 
-template <Kvf KVF>
+/* DPT = output dims each thread owns = ceil(head_dim/128). Templating
+ * it stops acc[][] from carrying dead slots: head_dim 256 needs 2, and
+ * the fixed 4 was spilling the accumulators at tile 16, which is why a
+ * bigger tile measured SLOWER before. */
+template <Kvf KVF, uint32_t TQ, uint32_t DPT>
 __global__ static void gqa_attention_tiled_kernel(
         float *out,
         const float *q,
@@ -570,10 +590,10 @@ __global__ static void gqa_attention_tiled_kernel(
         const float *rel,
         uint32_t rel_extent,
         const float *sinks) {
-    const uint32_t t0 = blockIdx.x * GQA_TILE_Q;
+    const uint32_t t0 = blockIdx.x * TQ;
     const uint32_t h = blockIdx.y;
     if (t0 >= n_tok || h >= n_head) return;
-    const uint32_t nq = n_tok - t0 < GQA_TILE_Q ? n_tok - t0 : GQA_TILE_Q;
+    const uint32_t nq = n_tok - t0 < TQ ? n_tok - t0 : TQ;
     const uint32_t kvh = h / (n_head / n_kv_head);
     const uint64_t kv_stride = kv_row_stride(KVF, head_dim);
     const char *kbase = (const char *)k_cache + (uint64_t)kvh * cap * kv_stride;
@@ -585,14 +605,14 @@ __global__ static void gqa_attention_tiled_kernel(
      * two float4 loads instead of eight scalar smem reads per element */
     extern __shared__ float gqa_tile_smem[];
     float *sq_t = gqa_tile_smem;
-    float *s_w = sq_t + head_dim * GQA_TILE_Q;
-    float *warpmax = s_w + GQA_TILE_Q * 128u;
-    float *den_s = warpmax + 4u * GQA_TILE_Q;
+    float *s_w = sq_t + head_dim * TQ;
+    float *warpmax = s_w + TQ * 128u;
+    float *den_s = warpmax + 4u * TQ;
 
-    for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) {
+    for (uint32_t qi = 0; qi < TQ; qi++) {
         const float *qh = q + ((uint64_t)(t0 + qi) * n_head + h) * head_dim;
         for (uint32_t d = tid; d < head_dim; d += 128u)
-            sq_t[d * GQA_TILE_Q + qi] = qi < nq ? qh[d] : 0.0f;
+            sq_t[d * TQ + qi] = qi < nq ? qh[d] : 0.0f;
     }
     __syncthreads();
 
@@ -606,11 +626,11 @@ __global__ static void gqa_attention_tiled_kernel(
         row0_min = nr0 > window ? nr0 - window : 0u;
     }
 
-    float acc[GQA_TILE_Q][4], m[GQA_TILE_Q], den[GQA_TILE_Q];
+    float acc[TQ][DPT], m[TQ], den[TQ];
     #pragma unroll
-    for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) {
+    for (uint32_t qi = 0; qi < TQ; qi++) {
         #pragma unroll
-        for (uint32_t k = 0; k < 4u; k++) acc[qi][k] = 0.0f;
+        for (uint32_t k = 0; k < DPT; k++) acc[qi][k] = 0.0f;
         m[qi] = -INFINITY;
         den[qi] = 0.0f;
     }
@@ -619,27 +639,31 @@ __global__ static void gqa_attention_tiled_kernel(
         const uint32_t chunk = n_rows_max - base < 128u ? n_rows_max - base : 128u;
 
         /* one key row per thread, read once into all eight dot products */
-        float dot[GQA_TILE_Q];
+        float dot[TQ];
         #pragma unroll
-        for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) dot[qi] = 0.0f;
+        for (uint32_t qi = 0; qi < TQ; qi++) dot[qi] = 0.0f;
         float ks = 1.0f;
         if (tid < chunk) {
             const char *krow = kbase + (uint64_t)(base + tid) * kv_stride;
             ks = gqa_vrow_scale<KVF>(krow, head_dim);
             for (uint32_t d = 0; d < head_dim; d++) {
                 const float kd = gqa_vacc_lane<KVF>(krow, d, head_dim);
-                const float4 qa = *(const float4 *)&sq_t[d * GQA_TILE_Q];
-                const float4 qb = *(const float4 *)&sq_t[d * GQA_TILE_Q + 4u];
-                dot[0] += kd * qa.x; dot[1] += kd * qa.y;
-                dot[2] += kd * qa.z; dot[3] += kd * qa.w;
-                dot[4] += kd * qb.x; dot[5] += kd * qb.y;
-                dot[6] += kd * qb.z; dot[7] += kd * qb.w;
+                /* q is staged transposed, so one d's queries are
+                 * contiguous: float4 loads regardless of tile width */
+                #pragma unroll
+                for (uint32_t g = 0; g < TQ / 4u; g++) {
+                    const float4 qv = *(const float4 *)&sq_t[d * TQ + g * 4u];
+                    dot[g * 4u + 0u] += kd * qv.x;
+                    dot[g * 4u + 1u] += kd * qv.y;
+                    dot[g * 4u + 2u] += kd * qv.z;
+                    dot[g * 4u + 3u] += kd * qv.w;
+                }
             }
         }
 
-        float sc[GQA_TILE_Q];
+        float sc[TQ];
         #pragma unroll
-        for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) {
+        for (uint32_t qi = 0; qi < TQ; qi++) {
             const uint32_t tq = t0 + qi;
             const uint32_t nrq = pos0 + tq + 1u;
             const uint32_t r0q = (window != 0u && nrq > window) ? nrq - window : 0u;
@@ -657,36 +681,36 @@ __global__ static void gqa_attention_tiled_kernel(
         }
 
         /* block max per query: warp shuffle tree, then one barrier */
-        float mx[GQA_TILE_Q];
+        float mx[TQ];
         #pragma unroll
-        for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) mx[qi] = sc[qi];
+        for (uint32_t qi = 0; qi < TQ; qi++) mx[qi] = sc[qi];
         #pragma unroll
         for (uint32_t off = 16u; off > 0u; off >>= 1u) {
             #pragma unroll
-            for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++)
+            for (uint32_t qi = 0; qi < TQ; qi++)
                 mx[qi] = fmaxf(mx[qi], __shfl_xor_sync(0xffffffffu, mx[qi], off));
         }
         if (lane == 0u) {
             #pragma unroll
-            for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++)
-                warpmax[warp * GQA_TILE_Q + qi] = mx[qi];
+            for (uint32_t qi = 0; qi < TQ; qi++)
+                warpmax[warp * TQ + qi] = mx[qi];
         }
         __syncthreads();
         #pragma unroll
-        for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) {
+        for (uint32_t qi = 0; qi < TQ; qi++) {
             float v = warpmax[qi];
-            for (uint32_t w = 1u; w < 4u; w++) v = fmaxf(v, warpmax[w * GQA_TILE_Q + qi]);
+            for (uint32_t w = 1u; w < 4u; w++) v = fmaxf(v, warpmax[w * TQ + qi]);
             mx[qi] = v;
         }
 
         #pragma unroll
-        for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) {
+        for (uint32_t qi = 0; qi < TQ; qi++) {
             const float m_new = fmaxf(m[qi], mx[qi]);
             /* a chunk can be entirely outside a later query's window, so
              * both maxes may be -inf; expf(-inf - -inf) is NaN */
             const float corr = m_new == -INFINITY ? 1.0f : expf(m[qi] - m_new);
             #pragma unroll
-            for (uint32_t k = 0; k < 4u; k++) acc[qi][k] *= corr;
+            for (uint32_t k = 0; k < DPT; k++) acc[qi][k] *= corr;
             den[qi] *= corr;
             m[qi] = m_new;
             s_w[qi * 128u + tid] = sc[qi] == -INFINITY ? 0.0f : expf(sc[qi] - m_new);
@@ -695,29 +719,29 @@ __global__ static void gqa_attention_tiled_kernel(
 
         /* denominators: eight threads, one query each, rather than every
          * thread redundantly summing 128 weights per query */
-        if (tid < GQA_TILE_Q) {
+        if (tid < TQ) {
             float dsum = 0.0f;
             for (uint32_t r = 0; r < chunk; r++) dsum += s_w[tid * 128u + r];
             den_s[tid] = dsum;
         }
         __syncthreads();
         #pragma unroll
-        for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) den[qi] += den_s[qi];
+        for (uint32_t qi = 0; qi < TQ; qi++) den[qi] += den_s[qi];
 
         /* V read once per row, applied to all eight weight sets */
         for (uint32_t r = 0; r < chunk; r++) {
             const char *vrow = vbase + (uint64_t)(base + r) * kv_stride;
             const float vs = gqa_vrow_scale<KVF>(vrow, head_dim);
-            float wq[GQA_TILE_Q];
+            float wq[TQ];
             #pragma unroll
-            for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) wq[qi] = s_w[qi * 128u + r] * vs;
+            for (uint32_t qi = 0; qi < TQ; qi++) wq[qi] = s_w[qi * 128u + r] * vs;
             #pragma unroll
-            for (uint32_t k = 0; k < 4u; k++) {
+            for (uint32_t k = 0; k < DPT; k++) {
                 const uint32_t d = tid + k * 128u;
                 if (d < head_dim) {
                     const float vd = gqa_vacc_lane<KVF>(vrow, d, head_dim);
                     #pragma unroll
-                    for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) acc[qi][k] += wq[qi] * vd;
+                    for (uint32_t qi = 0; qi < TQ; qi++) acc[qi][k] += wq[qi] * vd;
                 }
             }
         }
@@ -725,7 +749,7 @@ __global__ static void gqa_attention_tiled_kernel(
     }
 
     #pragma unroll
-    for (uint32_t qi = 0; qi < GQA_TILE_Q; qi++) {
+    for (uint32_t qi = 0; qi < TQ; qi++) {
         if (qi >= nq) continue;
         float mq = m[qi], dq = den[qi];
         if (sinks) {
@@ -733,7 +757,7 @@ __global__ static void gqa_attention_tiled_kernel(
             if (sv > mq) {
                 const float corr = expf(mq - sv);
                 #pragma unroll
-                for (uint32_t k = 0; k < 4u; k++) acc[qi][k] *= corr;
+                for (uint32_t k = 0; k < DPT; k++) acc[qi][k] *= corr;
                 dq = dq * corr + 1.0f;
                 mq = sv;
             } else {
@@ -741,7 +765,7 @@ __global__ static void gqa_attention_tiled_kernel(
             }
         }
         #pragma unroll
-        for (uint32_t k = 0; k < 4u; k++) {
+        for (uint32_t k = 0; k < DPT; k++) {
             const uint32_t d = tid + k * 128u;
             if (d < head_dim)
                 out[((uint64_t)(t0 + qi) * n_head + h) * head_dim + d] = acc[qi][k] / dq;
@@ -778,11 +802,18 @@ static int gqa_attention_dispatch(
     }
     /* prefill shapes take the query-tiled kernel: it reads each K/V
      * element once for GQA_TILE_Q queries instead of once per query */
-    if (n_tok >= GQA_TILE_MIN_TOK && !gqa_tile_off()) {
-        dim3 gt((n_tok + GQA_TILE_Q - 1u) / GQA_TILE_Q, n_head, 1);
-        gqa_attention_tiled_kernel<KVF><<<gt, 128, gqa_tile_smem_bytes(head_dim)>>>(
-                out, q, kc, vc, n_tok, n_head, n_kv_head, head_dim, cap, pos0,
-                scale, window, rel, rel_extent, sinks);
+    if (n_tok >= GQA_TILE_MIN_TOK && !gqa_tile_off() && head_dim <= 512u) {
+        const uint32_t tq = gqa_tile_q();
+        const uint32_t dpt = head_dim <= 128u ? 1u : (head_dim <= 256u ? 2u : 4u);
+        dim3 gt((n_tok + tq - 1u) / tq, n_head, 1);
+        const size_t sm = gqa_tile_smem_bytes(head_dim, tq);
+        #define GQA_TILED(TQV, DPTV)                                                      gqa_attention_tiled_kernel<KVF, TQV, DPTV><<<gt, 128, sm>>>(                          out, q, kc, vc, n_tok, n_head, n_kv_head, head_dim, cap,                      pos0, scale, window, rel, rel_extent, sinks)
+        #define GQA_TILED_D(DPTV)                                                         do {                                                                              if (tq == 8u) GQA_TILED(8u, DPTV);                                            else if (tq == 16u) GQA_TILED(16u, DPTV);                                     else GQA_TILED(32u, DPTV);                                                } while (0)
+        if (dpt == 1u) GQA_TILED_D(1u);
+        else if (dpt == 2u) GQA_TILED_D(2u);
+        else GQA_TILED_D(4u);
+        #undef GQA_TILED_D
+        #undef GQA_TILED
         return cuda_ok(cudaGetLastError(), "gqa attention tiled launch");
     }
     dim3 grid(n_tok, n_head, 1);
