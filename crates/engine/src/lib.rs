@@ -6048,14 +6048,14 @@ mod real {
                 // and the trellis codecs 128-wide groups; a non-multiple
                 // head_dim makes the append guard return 0 silently (cache
                 // stays uninitialized).
-                if matches!(kvq, 4..=7) {
+                if matches!(kvq, 4 | 5) {
                     eprintln!(
                         "pulsar: block-KV head_dim={} ({}divisible by 32)",
                         s.head_dim,
                         if s.head_dim.is_multiple_of(32) { "" } else { "NOT " }
                     );
                 }
-                if matches!(kvq, 8..=10) {
+                if matches!(kvq, 6..=10) {
                     eprintln!(
                         "pulsar: block-KV head_dim={} ({}divisible by 128)",
                         s.head_dim,

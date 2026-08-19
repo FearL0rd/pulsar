@@ -185,8 +185,8 @@ extern "C" int pulsar_dsv4_attention(
     if (!out_dev || !q_dev || !raw_dev || !sinks_dev || n_head == 0 ||
         head_dim == 0 || head_dim > 512u || (n_comp > 0 && !comp_dev) ||
         kvq > 10u || turbo > 1u || (turbo && !pi_dev) ||
-        (kvq >= 4u && kvq <= 7u && head_dim % 32u != 0) ||
-        (kvq >= 8u && head_dim % 128u != 0) ||
+        (kvq >= 4u && kvq <= 5u && head_dim % 32u != 0) ||
+        (kvq >= 6u && head_dim % 128u != 0) ||
         (turbo && kvq < 4u)) {
         return 0;
     }
@@ -628,8 +628,8 @@ extern "C" int pulsar_dsv4_comp_step(
         !ape_dev || !norm_dev || width == 0 || head_dim == 0 ||
         head_dim > 512u || ratio == 0 || (emit && !cache_row_dev) ||
         kvq > 10u || turbo > 1u || (turbo && !pi_dev) ||
-        (kvq >= 4u && kvq <= 7u && head_dim % 32u != 0) ||
-        (kvq >= 8u && head_dim % 128u != 0) ||
+        (kvq >= 4u && kvq <= 5u && head_dim % 32u != 0) ||
+        (kvq >= 6u && head_dim % 128u != 0) ||
         (turbo && kvq < 4u)) {
         return 0;
     }
@@ -947,8 +947,8 @@ extern "C" int pulsar_dsv4_kv_store(
         uint32_t kvq, uint32_t turbo, const void *pi_dev) {
     if (!dst_dev || !src_dev || head_dim == 0 || head_dim > 512u ||
         kvq > 10u || turbo > 1u || (turbo && !pi_dev) ||
-        (kvq >= 4u && kvq <= 7u && head_dim % 32u != 0) ||
-        (kvq >= 8u && head_dim % 128u != 0) ||
+        (kvq >= 4u && kvq <= 5u && head_dim % 32u != 0) ||
+        (kvq >= 6u && head_dim % 128u != 0) ||
         (turbo && kvq < 4u)) {
         return 0;
     }
