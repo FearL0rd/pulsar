@@ -2247,6 +2247,65 @@ mod tests {
         }
     }
 
+    /// Prefill attention at the qwen35 TP-shard shape (12 heads / 2 kv /
+    /// head_dim 256, one 128-token chunk against a deep f32 cache).
+    /// PULSAR_ATTN_TILE2=0/1 picks v1/v2 for A/B.
+    /// cargo test --release -p kernels gqa_tile_bench -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf probe, requires a CUDA device"]
+    fn gqa_tile_bench() {
+        use super::*;
+        let (n_head, n_kv, hd, cap) = (12u32, 2u32, 256u32, 8192u32);
+        let (n_tok, pos0) = (128u32, 3500u32);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let c_elems = (n_kv * cap * hd) as usize;
+        let q_elems = (n_tok * n_head * hd) as usize;
+        let rnd = |i: usize| ((i * 37) % 97) as f32 * 0.01 - 0.5;
+        let kc_h: Vec<f32> = (0..c_elems).map(rnd).collect();
+        let q_h: Vec<f32> = (0..q_elems).map(|i| rnd(i + 13)).collect();
+        let mut kc = DeviceBuf::alloc(c_elems * 4).unwrap();
+        let mut vc = DeviceBuf::alloc(c_elems * 4).unwrap();
+        let mut q = DeviceBuf::alloc(q_elems * 4).unwrap();
+        kc.write(0, as_bytes(&kc_h)).unwrap();
+        vc.write(0, as_bytes(&kc_h)).unwrap();
+        q.write(0, as_bytes(&q_h)).unwrap();
+        let mut out = DeviceBuf::alloc(q_elems * 4).unwrap();
+        /* PULSAR_BENCH_L2BUST=1: cycle 6 distinct cache pairs so L2 never
+         * retains K/V between launches - the production regime, where the
+         * FFN GEMMs stream GBs of weights between attention launches. */
+        let bust = std::env::var("PULSAR_BENCH_L2BUST").ok().as_deref() == Some("1");
+        let n_sets = if bust { 6 } else { 1 };
+        let mut sets: Vec<(DeviceBuf, DeviceBuf)> = Vec::new();
+        for _ in 0..n_sets {
+            let mut k2 = DeviceBuf::alloc(c_elems * 4).unwrap();
+            let mut v2 = DeviceBuf::alloc(c_elems * 4).unwrap();
+            k2.write(0, as_bytes(&kc_h)).unwrap();
+            v2.write(0, as_bytes(&kc_h)).unwrap();
+            sets.push((k2, v2));
+        }
+        let _ = (&kc, &vc);
+        for _ in 0..5 {
+            gqa_attention(&mut out, &q, &sets[0].0, &sets[0].1, n_tok, n_head, n_kv, hd, cap, pos0, scale, 0).unwrap();
+        }
+        sync().unwrap();
+        let iters = 60;
+        let t0 = std::time::Instant::now();
+        for i in 0..iters {
+            let (kx, vx) = &sets[i % n_sets];
+            gqa_attention(&mut out, &q, kx, vx, n_tok, n_head, n_kv, hd, cap, pos0, scale, 0).unwrap();
+        }
+        sync().unwrap();
+        let dt = t0.elapsed().as_secs_f64() / iters as f64;
+        let rows = (pos0 + n_tok / 2) as f64; // avg visible rows per query
+        let flops = 4.0 * rows * hd as f64 * n_tok as f64 * n_head as f64; // qk + pv
+        eprintln!(
+            "gqa tile bench (tile2={}): {:7.0} us, {:5.2} TFLOP/s",
+            std::env::var("PULSAR_ATTN_TILE2").unwrap_or_else(|_| "default".into()),
+            dt * 1e6,
+            flops / dt / 1e12
+        );
+    }
+
     /// cargo test --release -p kernels kq_gemm_bench -- --ignored --nocapture
     #[test]
     #[ignore = "perf probe, requires a CUDA device"]

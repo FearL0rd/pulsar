@@ -1106,7 +1106,11 @@ static void *gqa_split_scratch(uint64_t bytes) {
  *
  * Decode keeps the original kernel, and with it every bit-exact gate. */
 #define GQA_TILE_Q       8u
-#define GQA_TILE_MIN_TOK 16u
+/* 5, not 16: the split path tops out at 4 tokens, so 5..15-token chunks
+ * (a prefill's final partial chunk) fell to the untiled kernel - 7.2ms
+ * per launch against a deep cache, 0.23s of a 7k prefill. A partial
+ * query tile in the tiled kernel handles them fine. */
+#define GQA_TILE_MIN_TOK 5u
 
 /* Query tile at runtime (PULSAR_ATTN_TQ): this kernel is MEMORY bound,
  * not compute bound - 4 FLOP/byte against a machine balance of 56 - so
@@ -1155,6 +1159,74 @@ static bool gqa_tile_off() {
 static size_t gqa_tile_smem_bytes(uint32_t head_dim, uint32_t tq) {
     return (size_t)((head_dim * tq) + (tq * 128u)
                     + (4u * tq) + tq) * sizeof(float);
+}
+
+/* tiled2 (register-tiled score phase): the v1 score loop is one thread
+ * per K row walking the row scalar - the row rides L1, but at one
+ * element per load with a TQ-FMA chain per element the LSUs saturate at
+ * a fraction of ALU rate (nsys: 54% of prefill GPU time in this kernel
+ * at ~6% of fp32 peak). v2 stages K sub-chunks in smem TRANSPOSED so
+ * four rows load as one float4, and each thread owns a 4 rows x 4
+ * queries register tile with head_dim split across the four warps:
+ * 2 vector loads per 16 FMAs. Scores land in smem and the v1 masking /
+ * online-softmax / V phases run unchanged. Slice-summed dots round
+ * differently than v1's straight d-chain, so this is selftest-gated by
+ * tolerance, not bit-exactness (decode paths keep theirs).
+ * PULSAR_ATTN_TILE2=0 restores v1 for A/B. */
+/* four consecutive K dims decoded to f32, vectorized per format (the
+ * per-element gqa_vacc_lane in a d-loop is one L1 op per element; these
+ * are one per four). Row scale is NOT applied - same contract as
+ * gqa_vacc_lane. */
+template <Kvf KVF>
+__device__ __forceinline__ static float4 gqa_load4(const char *row, uint32_t d4) {
+    if (KVF == Kvf::F32) {
+        return ((const float4 *)row)[d4];
+    } else if (KVF == Kvf::FP16) {
+        const __half2 h0 = ((const __half2 *)row)[d4 * 2u];
+        const __half2 h1 = ((const __half2 *)row)[d4 * 2u + 1u];
+        const float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
+        return make_float4(f0.x, f0.y, f1.x, f1.y);
+    } else if (KVF == Kvf::INT8) {
+        const char4 c = ((const char4 *)row)[d4];
+        return make_float4((float)c.x, (float)c.y, (float)c.z, (float)c.w);
+    } else { /* FP8 */
+        const uchar4 c = ((const uchar4 *)row)[d4];
+        return make_float4(e4m3_dec_common(c.x), e4m3_dec_common(c.y),
+                           e4m3_dec_common(c.z), e4m3_dec_common(c.w));
+    }
+}
+
+/* tiled2 is OPT-IN (PULSAR_ATTN_TILE2=1), not default: it beats v1 by
+ * 14-35% when K/V sit in L2 (back-to-back microbench launches) and
+ * LOSES by ~20% when they don't (production, where the FFN GEMMs flush
+ * L2 between attention launches - measured with the L2BUST microbench:
+ * v1 is insensitive to L2 state, 1770us either way, because its L1-issue
+ * wall hides DRAM latency; tiled2 removed the L1 wall and exposed DRAM).
+ * Winning for real needs cp.async double-buffered K tiles at small-smem
+ * occupancy - v3 material. */
+static bool gqa_tile2_on() {
+    /* read live, not latched: the selftest flips it around phases 9/10
+     * so tiled2 keeps coverage while v1 keeps the default phases */
+    const char *e = getenv("PULSAR_ATTN_TILE2");
+    return e && atoi(e) == 1;
+}
+
+static size_t gqa_tile2_smem_bytes(uint32_t head_dim, uint32_t tq) {
+    return gqa_tile_smem_bytes(head_dim, tq)
+           + (size_t)(128u * (tq + 1u)          /* raw dots, row-major padded */
+                      + 128u                    /* per-row kv scales */
+                      + 4u * tq)                /* warpmax for 8 warps, not 4 */
+                     * sizeof(float);
+}
+
+static int gqa_smem_ok(const void *func, uint64_t smem_bytes, const char *what) {
+    if (smem_bytes <= 48u * 1024u) return 1;
+    if (smem_bytes > (uint64_t)INT_MAX) return 0;
+    return cuda_ok(cudaFuncSetAttribute(
+                           (const void *)func,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           (int)smem_bytes),
+                   what);
 }
 
 /* DPT = output dims each thread owns = ceil(head_dim/128). Templating
@@ -1361,6 +1433,269 @@ __global__ static void gqa_attention_tiled_kernel(
     }
 }
 
+/* v2 of the query-tiled prefill kernel: identical contract and grid as
+ * gqa_attention_tiled_kernel, score phase register-tiled. v1 is
+ * L1-throughput bound (ncu: 85% L1, 22% occupancy): one thread per K
+ * row, one L1 op per element, TQ FMAs each. Here each thread owns a
+ * 2-row x 4-query tile over the full head_dim - 6 L1 ops per 32 FMAs -
+ * and smem stays small (raw-dot bridge only, no K staging), so two
+ * 256-thread blocks fit per SM. Two earlier shapes measured SLOWER
+ * than v1 and are kept out on purpose: a 36KB smem-transposed K stage
+ * (Block Limit Shared Mem hit 1, occupancy 16.7% - 14.3s vs 12.1s on
+ * the 7k prefill) and a per-element integer-division stage loop.
+ * TQ must be 16, head_dim a multiple of 4, <= 256, formats with
+ * per-element decode (F32/FP16/INT8/FP8) only - block formats keep v1.
+ * DPT here is ceil(head_dim/256), not v1's ceil(head_dim/128).
+ * Scores land in smem and the v1 masking / online-softmax / V phases
+ * run unchanged; tile-summed dots round differently than v1's straight
+ * d-chain, so this is selftest-gated by tolerance, not bit-exactness. */
+template <Kvf KVF, uint32_t TQ, uint32_t DPT>
+__global__ static void gqa_attention_tiled2_kernel(
+        float *out,
+        const float *q,
+        const void *k_cache,
+        const void *v_cache,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t n_kv_head,
+        uint32_t head_dim,
+        uint32_t cap,
+        uint32_t pos0,
+        float scale,
+        uint32_t window,
+        const float *rel,
+        uint32_t rel_extent,
+        const float *sinks) {
+    const uint32_t t0 = blockIdx.x * TQ;
+    const uint32_t h = blockIdx.y;
+    if (t0 >= n_tok || h >= n_head) return;
+    const uint32_t nq = n_tok - t0 < TQ ? n_tok - t0 : TQ;
+    const uint32_t kvh = h / (n_head / n_kv_head);
+    const uint64_t kv_stride = kv_row_stride(KVF, head_dim);
+    const char *kbase = (const char *)k_cache + (uint64_t)kvh * cap * kv_stride;
+    const char *vbase = (const char *)v_cache + (uint64_t)kvh * cap * kv_stride;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5u;
+
+    extern __shared__ float gqa_tile_smem[];
+    float *sq_t = gqa_tile_smem;
+    float *s_w = sq_t + head_dim * TQ;
+    float *warpmax = s_w + TQ * 128u;        /* [8][TQ] here, [4][TQ] in v1 */
+    float *den_s = warpmax + 8u * TQ;
+    float *dots_s = den_s + TQ;              /* [128][TQ+1] raw dots */
+    float *rs_s = dots_s + 128u * (TQ + 1u); /* [128] kv row scales */
+
+    for (uint32_t qi = 0; qi < TQ; qi++) {
+        const float *qh = q + ((uint64_t)(t0 + qi) * n_head + h) * head_dim;
+        for (uint32_t d = tid; d < head_dim; d += 256u)
+            sq_t[d * TQ + qi] = qi < nq ? qh[d] : 0.0f;
+    }
+    __syncthreads();
+
+    const uint32_t n_rows_max = pos0 + t0 + nq;
+    uint32_t row0_min = 0u;
+    if (window != 0u) {
+        const uint32_t nr0 = pos0 + t0 + 1u;
+        row0_min = nr0 > window ? nr0 - window : 0u;
+    }
+
+    float acc[TQ][DPT], m[TQ], den[TQ];
+    #pragma unroll
+    for (uint32_t qi = 0; qi < TQ; qi++) {
+        #pragma unroll
+        for (uint32_t k = 0; k < DPT; k++) acc[qi][k] = 0.0f;
+        m[qi] = -INFINITY;
+        den[qi] = 0.0f;
+    }
+
+    /* register-tile decomposition: 256 threads = 64 row-slots (2 rows
+     * each) x 4 query-slots (4 queries each), full head_dim per thread:
+     * no cross-thread reduction, no K staging, one barrier per chunk. */
+    const uint32_t qslot = tid & 3u;
+    const uint32_t rslot = tid >> 2u;
+
+    for (uint32_t base = row0_min; base < n_rows_max; base += 128u) {
+        const uint32_t chunk = n_rows_max - base < 128u ? n_rows_max - base : 128u;
+
+        if (tid < 128u)
+            rs_s[tid] = tid < chunk
+                    ? gqa_vrow_scale<KVF>(kbase + (uint64_t)(base + tid) * kv_stride, head_dim)
+                    : 1.0f;
+
+        const uint32_t r0 = rslot * 2u;
+        if (r0 < chunk) {
+            /* row r0+1 clamps to a valid row when past the chunk edge:
+             * the loads stay in bounds and the result is never written */
+            const uint32_t r1 = r0 + 1u < chunk ? r0 + 1u : r0;
+            const char *k0 = kbase + (uint64_t)(base + r0) * kv_stride;
+            const char *k1 = kbase + (uint64_t)(base + r1) * kv_stride;
+            float a[2][4];
+            #pragma unroll
+            for (uint32_t i = 0; i < 2u; i++)
+                #pragma unroll
+                for (uint32_t j = 0; j < 4u; j++) a[i][j] = 0.0f;
+            for (uint32_t d4 = 0; d4 * 4u < head_dim; d4++) {
+                const float4 k0f = gqa_load4<KVF>(k0, d4);
+                const float4 k1f = gqa_load4<KVF>(k1, d4);
+                const uint32_t d = d4 * 4u;
+                #pragma unroll
+                for (uint32_t dd = 0; dd < 4u; dd++) {
+                    const float4 qf = *(const float4 *)&sq_t[(d + dd) * TQ + qslot * 4u];
+                    const float k0v = dd == 0u ? k0f.x : dd == 1u ? k0f.y : dd == 2u ? k0f.z : k0f.w;
+                    const float k1v = dd == 0u ? k1f.x : dd == 1u ? k1f.y : dd == 2u ? k1f.z : k1f.w;
+                    a[0][0] += k0v * qf.x; a[0][1] += k0v * qf.y;
+                    a[0][2] += k0v * qf.z; a[0][3] += k0v * qf.w;
+                    a[1][0] += k1v * qf.x; a[1][1] += k1v * qf.y;
+                    a[1][2] += k1v * qf.z; a[1][3] += k1v * qf.w;
+                }
+            }
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; j++)
+                dots_s[r0 * (TQ + 1u) + qslot * 4u + j] = a[0][j];
+            if (r0 + 1u < chunk) {
+                #pragma unroll
+                for (uint32_t j = 0; j < 4u; j++)
+                    dots_s[(r0 + 1u) * (TQ + 1u) + qslot * 4u + j] = a[1][j];
+            }
+        }
+        __syncthreads();
+
+        /* bridge into the v1 phases: thread = row again (threads 128+
+         * carry no row; their scores stay -inf and they skip s_w) */
+        float dot[TQ];
+        float ks = 1.0f;
+        if (tid < chunk) {
+            ks = rs_s[tid];
+            #pragma unroll
+            for (uint32_t qi = 0; qi < TQ; qi++)
+                dot[qi] = dots_s[tid * (TQ + 1u) + qi];
+        }
+
+        float sc[TQ];
+        #pragma unroll
+        for (uint32_t qi = 0; qi < TQ; qi++) {
+            const uint32_t tq = t0 + qi;
+            const uint32_t nrq = pos0 + tq + 1u;
+            const uint32_t r0q = (window != 0u && nrq > window) ? nrq - window : 0u;
+            const uint32_t row = base + tid;
+            float sv = -INFINITY;
+            if (tid < chunk && qi < nq && row < nrq && row >= r0q) {
+                sv = dot[qi] * ks * scale;
+                if (rel) {
+                    const float *rr = rel + ((uint64_t)tq * n_head + h) * rel_extent;
+                    const uint32_t dist = (pos0 + tq) - row;
+                    if (dist < rel_extent) sv += rr[dist];
+                }
+            }
+            sc[qi] = sv;
+        }
+
+        float mx[TQ];
+        #pragma unroll
+        for (uint32_t qi = 0; qi < TQ; qi++) mx[qi] = sc[qi];
+        #pragma unroll
+        for (uint32_t off = 16u; off > 0u; off >>= 1u) {
+            #pragma unroll
+            for (uint32_t qi = 0; qi < TQ; qi++)
+                mx[qi] = fmaxf(mx[qi], __shfl_xor_sync(0xffffffffu, mx[qi], off));
+        }
+        if (lane == 0u) {
+            #pragma unroll
+            for (uint32_t qi = 0; qi < TQ; qi++)
+                warpmax[warp * TQ + qi] = mx[qi];
+        }
+        __syncthreads();
+        #pragma unroll
+        for (uint32_t qi = 0; qi < TQ; qi++) {
+            float v = warpmax[qi];
+            for (uint32_t w = 1u; w < 8u; w++) v = fmaxf(v, warpmax[w * TQ + qi]);
+            mx[qi] = v;
+        }
+
+        #pragma unroll
+        for (uint32_t qi = 0; qi < TQ; qi++) {
+            const float m_new = fmaxf(m[qi], mx[qi]);
+            const float corr = m_new == -INFINITY ? 1.0f : expf(m[qi] - m_new);
+            #pragma unroll
+            for (uint32_t k = 0; k < DPT; k++) acc[qi][k] *= corr;
+            den[qi] *= corr;
+            m[qi] = m_new;
+            if (tid < 128u)
+                s_w[qi * 128u + tid] = sc[qi] == -INFINITY ? 0.0f : expf(sc[qi] - m_new);
+        }
+        __syncthreads();
+
+        if (tid < TQ) {
+            float dsum = 0.0f;
+            for (uint32_t r = 0; r < chunk; r++) dsum += s_w[tid * 128u + r];
+            den_s[tid] = dsum;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (uint32_t qi = 0; qi < TQ; qi++) den[qi] += den_s[qi];
+
+        /* V phase, 4 rows per step so the s_w weights load as float4
+         * (r is the fast index of s_w on purpose). Rows past the chunk
+         * edge clamp to a valid row and carry zero weight - s_w's tail
+         * was zeroed above - so the 4-row step needs no tail loop. Row
+         * order inside the step matches the scalar loop, keeping the
+         * accumulation order of v1. */
+        for (uint32_t rq = 0; rq < chunk; rq += 4u) {
+            const char *vr[4];
+            float vs[4];
+            #pragma unroll
+            for (uint32_t i = 0; i < 4u; i++) {
+                const uint32_t r = rq + i < chunk ? rq + i : chunk - 1u;
+                vr[i] = vbase + (uint64_t)(base + r) * kv_stride;
+                vs[i] = gqa_vrow_scale<KVF>(vr[i], head_dim);
+            }
+            #pragma unroll
+            for (uint32_t k = 0; k < DPT; k++) {
+                const uint32_t d = tid + k * 256u;
+                if (d < head_dim) {
+                    float vd[4];
+                    #pragma unroll
+                    for (uint32_t i = 0; i < 4u; i++)
+                        vd[i] = gqa_vacc_lane<KVF>(vr[i], d, head_dim) * vs[i];
+                    #pragma unroll
+                    for (uint32_t qi = 0; qi < TQ; qi++) {
+                        const float4 w4 = *(const float4 *)&s_w[qi * 128u + rq];
+                        acc[qi][k] += w4.x * vd[0];
+                        acc[qi][k] += w4.y * vd[1];
+                        acc[qi][k] += w4.z * vd[2];
+                        acc[qi][k] += w4.w * vd[3];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (uint32_t qi = 0; qi < TQ; qi++) {
+        if (qi >= nq) continue;
+        float mq = m[qi], dq = den[qi];
+        if (sinks) {
+            const float sv = sinks[h];
+            if (sv > mq) {
+                const float corr = expf(mq - sv);
+                #pragma unroll
+                for (uint32_t k = 0; k < DPT; k++) acc[qi][k] *= corr;
+                dq = dq * corr + 1.0f;
+                mq = sv;
+            } else {
+                dq += expf(sv - mq);
+            }
+        }
+        #pragma unroll
+        for (uint32_t k = 0; k < DPT; k++) {
+            const uint32_t d = tid + k * 256u;
+            if (d < head_dim)
+                out[((uint64_t)(t0 + qi) * n_head + h) * head_dim + d] = acc[qi][k] / dq;
+        }
+    }
+}
+
 template <Kvf KVF>
 static int gqa_attention_dispatch(
         float *out, const float *q, const void *kc, const void *vc,
@@ -1409,6 +1744,27 @@ static int gqa_attention_dispatch(
         const uint32_t tq = gqa_tile_q();
         const uint32_t dpt = head_dim <= 128u ? 1u : (head_dim <= 256u ? 2u : 4u);
         dim3 gt((n_tok + tq - 1u) / tq, n_head, 1);
+        /* v2 register-tiled score phase for per-element formats at the
+         * default tile; block formats and overrides keep v1 */
+        if (tq == 16u && head_dim >= 64u && head_dim <= 256u
+            && head_dim % 4u == 0u && !rel && gqa_tile2_on()
+            && (KVF == Kvf::F32 || KVF == Kvf::FP16
+                || KVF == Kvf::INT8 || KVF == Kvf::FP8)) {
+            const size_t sm2 = gqa_tile2_smem_bytes(head_dim, 16u);
+            /* attribute set ONCE per instantiation, sized for the worst
+             * case (a per-launch cudaFuncSetAttribute is a driver call
+             * between kernel launches; it cost 0.3s on a 7k prefill).
+             * The attribute is an upper bound, so oversizing is free. */
+            static const bool smem_ok_i = gqa_smem_ok(
+                    (const void *)gqa_attention_tiled2_kernel<KVF, 16u, 1u>,
+                    gqa_tile2_smem_bytes(256u, 16u), "gqa tiled2 smem");
+            if (smem_ok_i) {
+                gqa_attention_tiled2_kernel<KVF, 16u, 1u><<<gt, 256, sm2>>>(
+                        out, q, kc, vc, n_tok, n_head, n_kv_head, head_dim,
+                        cap, pos0, scale, window, rel, rel_extent, sinks);
+                return cuda_ok(cudaGetLastError(), "gqa attention tiled2 launch");
+            }
+        }
         const size_t sm = gqa_tile_smem_bytes(head_dim, tq);
         #define GQA_TILED(TQV, DPTV)                                                      gqa_attention_tiled_kernel<KVF, TQV, DPTV><<<gt, 128, sm>>>(                          out, q, kc, vc, n_tok, n_head, n_kv_head, head_dim, cap,                      pos0, scale, window, rel, rel_extent, sinks)
         #define GQA_TILED_D(DPTV)                                                         do {                                                                              if (tq == 8u) GQA_TILED(8u, DPTV);                                            else if (tq == 16u) GQA_TILED(16u, DPTV);                                     else GQA_TILED(32u, DPTV);                                                } while (0)
@@ -2477,6 +2833,131 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
         free(q); free(kc); free(vc); free(ref_out); free(gpu_out);
         ds4_gpu_tensor_free(g_q2); ds4_gpu_tensor_free(g_kc2);
         ds4_gpu_tensor_free(g_vc2); ds4_gpu_tensor_free(g_out);
+    }
+
+    /* Phase 9 (tiled2 prefill): n_tok >= 16 takes the register-tiled v2
+     * score phase. Prod shape: head 24 / kv 4 (group 6) / head_dim 256
+     * (DPT=2). n_tok 45 leaves a partial final query tile (nq=13);
+     * pos0 makes the last row chunk 93 rows so the sub-chunk break and
+     * the stale-row guards both execute. Run twice: causal, then a
+     * window that puts row0 mid-cache. Caches filled host-side. */
+    {
+        setenv("PULSAR_ATTN_TILE2", "1", 1); /* opt-in path under test */
+        const uint32_t t_head = 24, t_kv = 4, t_hd = 256, t_cap = 1400;
+        const uint32_t n_tok = 45, pos0 = 1200;
+        const float scale = 1.0f / sqrtf((float)t_hd);
+        uint64_t q_elems = (uint64_t)n_tok * t_head * t_hd;
+        uint64_t c_elems = (uint64_t)t_kv * t_cap * t_hd;
+        float *q = (float *)malloc(q_elems * sizeof(float));
+        float *kc = (float *)malloc(c_elems * sizeof(float));
+        float *vc = (float *)malloc(c_elems * sizeof(float));
+        for (uint64_t i = 0; i < q_elems; i++) q[i] = gqa_test_randf();
+        for (uint64_t i = 0; i < c_elems; i++) { kc[i] = gqa_test_randf(); vc[i] = gqa_test_randf(); }
+
+        ds4_gpu_tensor *g_q2 = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+        ds4_gpu_tensor *g_kc2 = ds4_gpu_tensor_alloc(c_elems * sizeof(float));
+        ds4_gpu_tensor *g_vc2 = ds4_gpu_tensor_alloc(c_elems * sizeof(float));
+        ds4_gpu_tensor *g_out = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+        int ok = g_q2 && g_kc2 && g_vc2 && g_out;
+        if (ok) {
+            ds4_gpu_tensor_write(g_q2, 0, q, q_elems * sizeof(float));
+            ds4_gpu_tensor_write(g_kc2, 0, kc, c_elems * sizeof(float));
+            ds4_gpu_tensor_write(g_vc2, 0, vc, c_elems * sizeof(float));
+        }
+        float *ref_out = (float *)malloc(q_elems * sizeof(float));
+        float *gpu_out = (float *)malloc(q_elems * sizeof(float));
+        const uint32_t windows[2] = { 0u, 500u };
+        for (int wi = 0; wi < 2 && ok; wi++) {
+            gqa_ref_attention(ref_out, q, kc, vc, n_tok, t_head, t_kv, t_hd, t_cap, pos0,
+                              scale, windows[wi], NULL, 0u);
+            ok = ds4_gpu_gqa_attention(g_out, g_q2, g_kc2, g_vc2, n_tok, t_head, t_kv,
+                                       t_hd, t_cap, pos0, scale, windows[wi], NULL, 0u, NULL) &&
+                 cuda_ok(cudaDeviceSynchronize(), "gqa tiled2 selftest sync");
+            if (ok) ok = ds4_gpu_tensor_read(g_out, 0, gpu_out, q_elems * sizeof(float)) != 0;
+            float diff = ok ? gqa_max_abs_diff(ref_out, gpu_out, q_elems) : INFINITY;
+            int pass = ok && diff < 2e-4f;
+            fprintf(stderr, "gqa-selftest phase 9 tiled2 (n_tok=%u pos0=%u win=%u): %s (max diff %.2e)\n",
+                    n_tok, pos0, windows[wi], pass ? "PASS" : "FAIL", diff);
+            if (!pass) all_ok = 0;
+        }
+
+        free(q); free(kc); free(vc); free(ref_out); free(gpu_out);
+        ds4_gpu_tensor_free(g_q2); ds4_gpu_tensor_free(g_kc2);
+        ds4_gpu_tensor_free(g_vc2); ds4_gpu_tensor_free(g_out);
+    }
+
+    /* Phase 10 (tiled2 int8): the production big-ctx prefill runs int8
+     * KV through the same v2 path. Same shape as phase 9; the reference
+     * dequantizes the int8 cache the kernel actually read (phase 7's
+     * trick), so only attention is under test, not quantization error. */
+    {
+        const uint32_t t_head = 24, t_kv = 4, t_hd = 256, t_cap = 1400;
+        const uint32_t n_tok = 45, pos0 = 1200, rows = pos0 + n_tok;
+        const float scale = 1.0f / sqrtf((float)t_hd);
+        const uint64_t stride8 = (uint64_t)t_hd + 4u;
+        uint64_t q_elems = (uint64_t)n_tok * t_head * t_hd;
+        uint64_t fill_elems = (uint64_t)rows * t_kv * t_hd;
+        uint64_t cache8 = (uint64_t)t_kv * t_cap * stride8;
+        uint64_t c_elems = (uint64_t)t_kv * t_cap * t_hd;
+        float *q = (float *)malloc(q_elems * sizeof(float));
+        float *kin = (float *)malloc(fill_elems * sizeof(float));
+        float *vin = (float *)malloc(fill_elems * sizeof(float));
+        for (uint64_t i = 0; i < q_elems; i++) q[i] = gqa_test_randf();
+        for (uint64_t i = 0; i < fill_elems; i++) { kin[i] = gqa_test_randf(); vin[i] = gqa_test_randf(); }
+
+        ds4_gpu_tensor *g_q2 = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+        ds4_gpu_tensor *g_kin = ds4_gpu_tensor_alloc(fill_elems * sizeof(float));
+        ds4_gpu_tensor *g_vin = ds4_gpu_tensor_alloc(fill_elems * sizeof(float));
+        ds4_gpu_tensor *g_kc8 = ds4_gpu_tensor_alloc(cache8);
+        ds4_gpu_tensor *g_vc8 = ds4_gpu_tensor_alloc(cache8);
+        ds4_gpu_tensor *g_out = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+        int ok = g_q2 && g_kin && g_vin && g_kc8 && g_vc8 && g_out;
+        if (ok) {
+            ds4_gpu_tensor_write(g_q2, 0, q, q_elems * sizeof(float));
+            ds4_gpu_tensor_write(g_kin, 0, kin, fill_elems * sizeof(float));
+            ds4_gpu_tensor_write(g_vin, 0, vin, fill_elems * sizeof(float));
+            ok = ds4_gpu_gqa_kv_cache_append_int8(g_kc8, g_kin, rows, t_kv, t_hd, t_cap, 0u) &&
+                 ds4_gpu_gqa_kv_cache_append_int8(g_vc8, g_vin, rows, t_kv, t_hd, t_cap, 0u) &&
+                 ds4_gpu_gqa_attention_int8(g_out, g_q2, g_kc8, g_vc8, n_tok, t_head, t_kv,
+                                            t_hd, t_cap, pos0, scale, 0u, NULL, 0u, NULL) &&
+                 cuda_ok(cudaDeviceSynchronize(), "gqa tiled2 int8 selftest sync");
+        }
+        uint8_t *kc8h = (uint8_t *)malloc(cache8);
+        uint8_t *vc8h = (uint8_t *)malloc(cache8);
+        float *kc = (float *)calloc(c_elems, sizeof(float));
+        float *vc = (float *)calloc(c_elems, sizeof(float));
+        if (ok) ok = ds4_gpu_tensor_read(g_kc8, 0, kc8h, cache8) != 0 &&
+                     ds4_gpu_tensor_read(g_vc8, 0, vc8h, cache8) != 0;
+        if (ok) {
+            for (uint32_t h2 = 0; h2 < t_kv; h2++)
+            for (uint32_t r = 0; r < rows; r++) {
+                const uint8_t *kr = kc8h + ((uint64_t)h2 * t_cap + r) * stride8;
+                const uint8_t *vr = vc8h + ((uint64_t)h2 * t_cap + r) * stride8;
+                float ksc, vsc;
+                memcpy(&ksc, kr + t_hd, 4);
+                memcpy(&vsc, vr + t_hd, 4);
+                for (uint32_t d = 0; d < t_hd; d++) {
+                    kc[((uint64_t)h2 * t_cap + r) * t_hd + d] = (float)(int8_t)kr[d] * ksc;
+                    vc[((uint64_t)h2 * t_cap + r) * t_hd + d] = (float)(int8_t)vr[d] * vsc;
+                }
+            }
+        }
+        float *ref_out = (float *)malloc(q_elems * sizeof(float));
+        float *gpu_out = (float *)malloc(q_elems * sizeof(float));
+        gqa_ref_attention(ref_out, q, kc, vc, n_tok, t_head, t_kv, t_hd, t_cap, pos0,
+                          scale, 0u, NULL, 0u);
+        if (ok) ok = ds4_gpu_tensor_read(g_out, 0, gpu_out, q_elems * sizeof(float)) != 0;
+        float diff = ok ? gqa_max_abs_diff(ref_out, gpu_out, q_elems) : INFINITY;
+        int pass = ok && diff < 1e-3f;
+        fprintf(stderr, "gqa-selftest phase 10 tiled2 int8 (n_tok=%u pos0=%u): %s (max diff %.2e)\n",
+                n_tok, pos0, pass ? "PASS" : "FAIL", diff);
+        if (!pass) all_ok = 0;
+
+        free(q); free(kin); free(vin); free(kc); free(vc);
+        free(kc8h); free(vc8h); free(ref_out); free(gpu_out);
+        ds4_gpu_tensor_free(g_q2); ds4_gpu_tensor_free(g_kin); ds4_gpu_tensor_free(g_vin);
+        ds4_gpu_tensor_free(g_kc8); ds4_gpu_tensor_free(g_vc8); ds4_gpu_tensor_free(g_out);
+        unsetenv("PULSAR_ATTN_TILE2");
     }
 
     free(qn_w); free(kn_w); free(ref_kc); free(ref_vc);
