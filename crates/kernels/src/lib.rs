@@ -971,6 +971,16 @@ mod real {
         check(unsafe { pulsar_embed_q8_0(out.ptr_mut(), w.ptr(), tokens.ptr(), n_embd, n_vocab, n_tok) }, "embed_q8_0")
     }
 
+    /// embed_q8_0 starting at token index `tok_off` of `tokens`. Lets a
+    /// prefill upload the whole prompt's ids ONCE and walk it per chunk:
+    /// the per-chunk 512B `write` was a synchronous cudaMemcpy, and each
+    /// one drained the device - 11.4s of a 12s 7k-token prefill.
+    pub fn embed_q8_0_at(out: &mut DeviceBuf, w: &DeviceBuf, tokens: &DeviceBuf, tok_off: u32, n_embd: u32, n_vocab: u32, n_tok: u32) -> Result {
+        assert!(((tok_off + n_tok) as usize) * 4 <= tokens.bytes());
+        let p = unsafe { (tokens.ptr() as *const u8).add(tok_off as usize * 4) as *const c_void };
+        check(unsafe { pulsar_embed_q8_0(out.ptr_mut(), w.ptr(), p, n_embd, n_vocab, n_tok) }, "embed_q8_0_at")
+    }
+
     /// DSpark fused markov argmax over one logits row: returns
     /// argmax_v logits[row_off + v] + q8dot(w2[v], state). `scratch` needs
     /// 128 * 8 bytes; `out` 4 bytes (device); the id is read back here.

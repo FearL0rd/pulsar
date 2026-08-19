@@ -1151,10 +1151,17 @@ impl Model {
         let n0 = banks.first().map_or(self.layers.len(), |b| b.first);
         let mut pos = pos0;
         let mut last_t = 0u32;
-        let mut run = |st: &mut State, rt: &mut Qwen35Rt, chunk: &[u32], pos: u32, last: bool| -> Result {
-            let t = chunk.len() as u32;
-            let ids: Vec<i32> = chunk.iter().map(|&x| x as i32).collect();
-            st.tok.write(0, kernels::as_bytes(&ids))?;
+        // the whole prompt's ids go up ONCE, chunks index into them: the
+        // per-chunk 512B st.tok.write was a synchronous cudaMemcpy, and
+        // each drained the device pipeline - 11.4s of a 12s 7k prefill
+        // (nsys cuda_api_sum, 2026-08-19). Grow-only, like the scratch
+        // buffers; decode (1 token) takes the same path unchanged.
+        let ids: Vec<i32> = tokens.iter().map(|&x| x as i32).collect();
+        if st.tok.bytes() < ids.len() * 4 {
+            st.tok = kernels::DeviceBuf::alloc(ids.len() * 4)?;
+        }
+        st.tok.write(0, kernels::as_bytes(&ids))?;
+        let mut run = |st: &mut State, rt: &mut Qwen35Rt, t: u32, tok_off: u32, pos: u32, last: bool| -> Result {
             // per-token position cells (TP graph capture): the captured
             // attention kernels dereference these, so a replayed graph
             // sees the fresh position. Written OUTSIDE any capture, one
@@ -1165,7 +1172,7 @@ impl Model {
                 kernels::set_u32(&mut tb.pos_b, pos)?;
                 kernels::set_device(primary)?;
             }
-            kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, t)?;
+            kernels::embed_q8_0_at(&mut st.cur, &self.token_embd, &st.tok, tok_off, s.n_embd, s.n_vocab, t)?;
             self.eval_qwen35_span(st, rt, 0, n0, pos, t)?;
             let n_banks = banks.len();
             for bi in 0..n_banks {
@@ -1250,9 +1257,10 @@ impl Model {
         };
         let n_chunks = tokens.chunks(T_MAX).count();
         for (ci, chunk) in tokens.chunks(T_MAX).enumerate() {
-            run(st, rt, chunk, pos, ci + 1 == n_chunks)?;
-            pos += chunk.len() as u32;
-            last_t = chunk.len() as u32;
+            let t = chunk.len() as u32;
+            run(st, rt, t, (ci * T_MAX) as u32, pos, ci + 1 == n_chunks)?;
+            pos += t;
+            last_t = t;
         }
         rt.banks = banks;
         if rows == 0 {
