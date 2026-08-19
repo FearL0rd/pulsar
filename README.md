@@ -443,7 +443,7 @@ Everything auto-configures; these override. Shared by `pulsar-cli` and
 
 | var | default | what |
 |---|---|---|
-| `PULSAR_KV` | `f32` (serve UI may show `auto`) | K/V storage for GQA, qwen35 and **dsv4**: `f32`, `fp8`, `fp16`, `int8`, `q8_0`, `q4_0`, `turbo8`, `turbo4` (aliases `rotq*` / `turboq*`). Lossy formats are opt-in so default decode stays bit-exact. **MLA / K3:** latent KV only honors `f32` \| `fp8` \| `fp16`. `auto` picks `int8` when f32 KV would not fit (`fp8` for the MLA latent cache, its only quantized format). Prefer `turbo4` for long context. Measured quality per codec: [docs/kv-codecs.md](docs/kv-codecs.md) |
+| `PULSAR_KV` | `f32` (serve UI may show `auto`) | K/V storage for GQA, qwen35 and **dsv4**: `f32`, `fp8`, `fp16`, `int8`, `q8_0`, `q4_0`, `turbo8`, `turbo4` (aliases `rotq*` / `turboq*`), plus dsv4-only sub-4-bit codecs `turbo3`, `turbo2`, `turbo3_tcq`, `turbo2_tcq`, `turbo1_tcq` (rotated centroids; `_tcq` = trellis-coded, Viterbi at encode / flat window at decode; other families fall back to `f32` with a warning). Lossy formats are opt-in so default decode stays bit-exact. **MLA / K3:** latent KV only honors `f32` \| `fp8` \| `fp16`. `auto` picks `int8` when f32 KV would not fit (`fp8` for the MLA latent cache, its only quantized format). Prefer `turbo4` for long context, `turbo3_tcq` when every GB counts. Serve `POST /kv` re-execs with a new codec (webui KV format dropdown). Measured quality per codec: [docs/kv-codecs.md](docs/kv-codecs.md) |
 | `PULSAR_CACHE_GB` | measured | host RAM budget for the expert LFU cache |
 | `PULSAR_DEV_CACHE_GB` | solved | VRAM hot-expert pool (free VRAM − staging − reserve) |
 | `PULSAR_BATCH` | solved | prefill chunk size (largest expert-union fit) |
@@ -618,7 +618,10 @@ tensor-core prefill (dense GEMM + grouped MoE) · MiniMax M3, Qwen3,
 Gemma 4, TML Inkling forward graphs · opt-in fp8 e4m3 KV cache
 (`PULSAR_KV=fp8`) · TurboQuant rotated block-KV (`PULSAR_KV=turbo4|turbo8`,
 orthogonal Π on K/Q spreads outliers so block-quant stops zeroing the
-other 31 lanes; decode-invariant, V untouched) · `pulsar-quant` recipe quantizer (BF16 gguf →
+other 31 lanes; decode-invariant, V untouched) · dsv4 sub-4-bit rotated
+KV (`PULSAR_KV=turbo3|turbo2|turbo3_tcq|turbo2_tcq|turbo1_tcq`, 3.5 down
+to 1.25 bits/elem; trellis-coded `_tcq` variants run a per-128-group
+Viterbi at encode and decode with a flat bit window) · `pulsar-quant` recipe quantizer (BF16 gguf →)
 ds4-style expert mixes, iq2_xxs with imatrix, per-tensor `--map`
 rules; removes llama.cpp from the model-prep pipeline; shard
 streaming: `--fetch-cmd`/`--delete-shards` quantize sources bigger

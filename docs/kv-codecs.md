@@ -16,11 +16,29 @@ than letting the run degrade invisibly.
 | `q8_0` | 32-wide blocks, f16 scale + 32 int8 | ~3.8x |
 | `q4_0` | 32-wide blocks, f16 scale + 16 nibbles | ~7.1x |
 | `turbo8` / `turbo4` | q8_0 / q4_0 with a fixed orthogonal rotation | same as base |
+| `turbo3` | 3.5-bit centroids + f16 norm, per 32 (dsv4-only) | ~9.1x |
+| `turbo2` | 2.5-bit centroids + f16 norm, per 32 (dsv4-only) | ~10.2x |
+| `turbo3_tcq` | 3.25-bit trellis, per 128 (dsv4-only) | ~9.8x |
+| `turbo2_tcq` | 2.25-bit trellis, per 128 (dsv4-only) | ~14.2x |
+| `turbo1_tcq` | 1.25-bit trellis, per 128 (dsv4-only) | ~25.6x |
 
 The turbo codecs fold a rotation into K before append and into Q before
 attention. Since the rotation is orthogonal the scores are unchanged
 (`(Q@Piᵀ)·(K@Piᵀ)ᵀ = Q@Kᵀ`), but per-32-block outliers get spread across
 the block so no single lane dominates the block scale. V is untouched.
+
+The `turbo3` / `turbo2` / `*_tcq` codecs are dsv4-only (other families
+fall back to `f32` with a warning). They extend the same idea to sub-4-bit
+rates on the fused 512-wide latent row: a block-diagonal orthogonal Π
+(FWHT with fixed signs, per 128-group) spreads the row, then each 32-block
+stores one f16 scale plus centroid indices — `turbo3` keeps 3-bit
+sign-magnitude centroids, `turbo2` drops the sign plane. The `_tcq`
+variants replace per-element scalar quantization with trellis-coded
+quantization: a per-128-group Viterbi search at encode picks the index
+sequence, and decode is a flat bit-window shift per element, so the
+attention kernel pays nothing for the trellis. Like the other turbo
+codecs these need the rotation — the centroids only cover a narrow
+magnitude range, so energy concentrated in one lane saturates.
 
 MLA models (`Family::Mla`, `K3`) keep their own compact latent cache and
 accept only `fp8` / `fp16` / `f32`. Dense qwen35 (`n_expert == 1`) runs
@@ -65,6 +83,17 @@ row), same passage:
 | turbo4 | 0.017760 | 0.032939 | 0.128123 | 0.323266 | 92.37% |
 | q4_0 | 0.031917 | 0.052479 | 0.162358 | 0.955787 | 89.55% |
 
+DeepSeek-V4-Flash-0731-Abliterated (Dsv4 family), sub-4-bit turbo
+codecs, same passage:
+
+| codec | median | mean | p95 | max | top-1 |
+|---|---|---|---|---|---|
+| turbo3_tcq | 0.067567 | 0.163851 | 0.798507 | 1.811669 | 84.33% |
+| turbo3 | 0.073792 | 0.139380 | 0.496688 | 1.753119 | 83.58% |
+| turbo2_tcq | 0.108012 | 0.187680 | 0.513632 | 3.532312 | 79.10% |
+| turbo2 | 0.225861 | 0.442068 | 1.518093 | 4.900636 | 73.13% |
+| turbo1_tcq | 0.465245 | 0.590506 | 1.650581 | 2.910727 | 67.91% |
+
 ## What the panels say
 
 **fp8 is the worst of the 8-bit codecs on both models.** It loses to int8
@@ -81,6 +110,16 @@ stronger outliers and turbo4 nearly halves the median against q4_0
 (0.0178 vs 0.0319), cuts the worst case by 3x (0.323 vs 0.956), and lands
 at the same 92.37% top-1 as q8_0 while using half the bytes. For long
 context on dsv4, `PULSAR_KV=turbo4` is the codec to reach for.
+
+**The trellis beats the scalar quantizer at equal or fewer bits.**
+`turbo3_tcq` (3.25 bits) edges out `turbo3` (3.5 bits) on median and
+top-1, and `turbo2_tcq` (2.25 bits) halves `turbo2`'s (2.5 bits) median
+while beating it by 6 points of top-1. The Viterbi encode spends the
+noise budget where the row actually is instead of per-element
+independently. `turbo1_tcq` is the 1.25-bit floor: 25x compression with
+two-thirds top-1 agreement — usable as a starvation fallback, not as a
+quality pick. For sub-4-bit dsv4 caches, `turbo3_tcq` is the codec to
+reach for.
 
 **Read `max`, not just `median`.** On dsv4, q8_0 and fp8 have similar
 medians but fp8's worst position is 4x worse. A rare badly-quantized
