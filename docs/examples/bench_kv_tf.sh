@@ -32,7 +32,7 @@ CLI="${PULSAR_CLI:-$ROOT/target/release/pulsar-cli}"
 [ -x "$CLI" ] || { echo "build first: cargo build --release -p engine" >&2; exit 1; }
 
 MODEL="${MODEL:?set MODEL= to a GQA/Qwen35 family gguf (NOT glm-dsa/GLM-5.2)}"
-FMTS="${FMTS:-f32 fp8 fp16 int8 q8_0 q4_0}"
+FMTS="${FMTS:-f32 fp8 fp16 int8 q8_0 q4_0 turbo8 turbo4 turbo3 turbo2 turbo3_tcq turbo2_tcq turbo1_tcq}"
 MIN_VRAM_MB="${PULSAR_MIN_VRAM_MB:-8192}"
 
 ATTN_FAMILY="$(resolve_attn_family "$MODEL")"

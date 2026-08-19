@@ -1,0 +1,14 @@
+f32xf32,63/64 differ, first at #2
+f32,baseline 64 tokens
+fp8,56/64 differ, first at #5
+fp16,43/64 differ, first at #20
+int8,63/64 differ, first at #2
+q8_0,51/64 differ, first at #14
+q4_0,62/64 differ, first at #2
+turbo8,56/64 differ, first at #5
+turbo4,62/64 differ, first at #2
+turbo3,57/64 differ, first at #5
+turbo2,58/64 differ, first at #2
+turbo3_tcq,57/64 differ, first at #5
+turbo2_tcq,60/64 differ, first at #2
+turbo1_tcq,61/64 differ, first at #2
