@@ -442,7 +442,9 @@ impl Qwen35Rt {
         let banks = DenseBank::all(m)?;
         let f32s = |n: usize| DeviceBuf::alloc(n * 4);
         let graphs_on = std::env::var("PULSAR_GRAPHS").ok().as_deref() != Some("0")
-            && m.layers.iter().any(|l| matches!(l.ffn, super::Ffn::DenseKq { .. }));
+            && m.layers.iter().any(|l| {
+                matches!(l.ffn, super::Ffn::DenseKq { .. } | super::Ffn::Dense { .. })
+            });
         let tpb = match &m.tp {
             Some(tp) => {
                 let q8k = |n: usize| {
@@ -1344,7 +1346,7 @@ impl Model {
             // B's stream into the capture DAG, so the whole dual-card
             // GDN+FFN chain replays as one multi-device graph
             !dflash_on
-                && matches!(l.ffn, Ffn::DenseKq { .. })
+                && matches!(l.ffn, Ffn::DenseKq { .. } | Ffn::Dense { .. })
                 && match &l.attn {
                     Attn::Qwen35(w) if w.gdn.is_some() => true,
                     Attn::Qwen35(w) if w.attn.is_some() => attn_ok && self.tp_attn(il).is_some(),
@@ -1363,6 +1365,15 @@ impl Model {
                     let key = (t, il);
                     if let std::collections::hash_map::Entry::Vacant(e) = graphs.entry(key) {
                         let (lo2, hi2) = (il, end);
+                        // q8_0 weights (a --default q8_0 quant) prequant
+                        // through a lazily-grown scratch; it must exist
+                        // BEFORE the capture or its cudaMalloc kills the
+                        // graph. Covers every projection in the span:
+                        // attention/GDN in_dims <= n_embd, the FFN down
+                        // dot contracts n_ff_exp (xq + scales per row).
+                        let wide =
+                            self.shape.n_embd.max(self.shape.n_ff_exp) as u64;
+                        kernels::preq_scratch_reserve(t as u64 * wide * 9 / 8 + 64)?;
                         // capture takes a kernels::Result closure; stash
                         // the real engine error across the boundary
                         let mut inner: Option<Box<dyn std::error::Error>> = None;
@@ -1995,6 +2006,18 @@ impl Model {
                 kernels::sync()?;
                 st.prof.resolve += mark.elapsed();
             }
+            return Ok(());
+        }
+        // q8_0 FFN triple (a --default q8_0 quant): matmul_kq cannot
+        // dispatch q8_0, so the loader parks such triples here - the
+        // same q8_0 dot every other projection uses, f32 activations
+        // in, prequant scratch prewarmed before the graph capture.
+        if let Ffn::Dense { gate, up, down } = &l.ffn {
+            kernels::matmul_q8_0(&mut st.gate_act, gate, &st.normed, s.n_embd, s.n_ff_exp, t)?;
+            kernels::matmul_q8_0(&mut st.up_act, up, &st.normed, s.n_embd, s.n_ff_exp, t)?;
+            kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * s.n_ff_exp, 0.0, 1.0, 0)?;
+            kernels::matmul_q8_0(&mut st.ffn_out, down, &st.ffn_mid, s.n_ff_exp, s.n_embd, t)?;
+            kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
             return Ok(());
         }
         let Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, .. } = &l.ffn else {
