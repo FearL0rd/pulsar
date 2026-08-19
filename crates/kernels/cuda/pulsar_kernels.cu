@@ -463,12 +463,30 @@ static void *preq_scratch(uint64_t bytes) {
     (void)cudaGetDevice(&dev);
     if (dev < 0 || dev >= PULSAR_MAX_DEVICES) return NULL;
     if (bytes <= g_preq_scratch_cap[dev]) return g_preq_scratch[dev];
+    /* cudaMalloc is illegal mid graph-capture and pulsar captures the
+     * GDN+FFN chain (qwen35 graphs); grow only outside capture, with a
+     * floor so it happens once - a later grow would cudaFree the
+     * pointer already baked into captured graphs. Capture-time callers
+     * prewarm via pulsar_preq_scratch_reserve before Graph::capture. */
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &cap) != cudaSuccess ||
+        cap != cudaStreamCaptureStatusNone) {
+        return NULL;
+    }
+    const uint64_t floor_bytes = 64u << 20;
+    if (bytes < floor_bytes) bytes = floor_bytes;
     if (g_preq_scratch[dev]) (void)cudaFree(g_preq_scratch[dev]);
     g_preq_scratch[dev] = NULL;
     g_preq_scratch_cap[dev] = 0;
     if (!cuda_ok(cudaMalloc(&g_preq_scratch[dev], bytes), "preq scratch alloc")) return NULL;
     g_preq_scratch_cap[dev] = bytes;
     return g_preq_scratch[dev];
+}
+
+/* prewarm the per-device preq scratch OUTSIDE any graph capture, so
+ * the first matmul_q8_0 inside the capture hits the cached pointer */
+extern "C" int pulsar_preq_scratch_reserve(uint64_t bytes) {
+    return preq_scratch(bytes) != NULL;
 }
 
 extern "C" int pulsar_q8_0_matmul(
@@ -655,6 +673,7 @@ static int q8_0_matmul_selftest_one(uint32_t n_tok) {
              cuda_ok(cudaMalloc(&out_dev, o_bytes), "out alloc") &&
              cuda_ok(cudaMemcpy(w_dev, w, w_bytes, cudaMemcpyHostToDevice), "w h2d") &&
              cuda_ok(cudaMemcpy(x_dev, x, x_bytes, cudaMemcpyHostToDevice), "x h2d") &&
+             pulsar_preq_scratch_reserve((uint64_t)n_tok * in_dim + 64u) &&
              pulsar_q8_0_matmul(out_dev, w_dev, x_dev, in_dim, out_dim, n_tok) &&
              cuda_ok(cudaDeviceSynchronize(), "sync") &&
              cuda_ok(cudaMemcpy(gpu, out_dev, o_bytes, cudaMemcpyDeviceToHost), "d2h");
