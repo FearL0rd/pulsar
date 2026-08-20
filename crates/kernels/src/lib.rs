@@ -466,7 +466,8 @@ mod real {
         [const { std::sync::atomic::AtomicI64::new(i64::MAX) }; 16];
 
     /// Cap weight VRAM on `dev` at `bytes` (engine passes free minus the
-    /// same 2GiB reserve the dense-split planner trusts); from_bytes
+    /// 3GiB state reserve for KV/activations/scratch/graph pools);
+    /// from_bytes
     /// spends it and spills the overflow to pinned host RAM.
     pub fn set_weight_vram_budget(dev: i32, bytes: i64) {
         WEIGHT_BUDGET[dev as usize].store(bytes.clamp(0, i64::MAX), std::sync::atomic::Ordering::Relaxed);
