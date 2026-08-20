@@ -1,5 +1,10 @@
 # bench_kv_tf.sh
 
+> Prefer [`kv-codec-bench.sh`](./kv-codec-bench.md) for new runs — it folds
+> this teacher-force panel into a model-agnostic sweep (plus tok/s, greedy
+> first-divergence, and a chart). `TF=1` is on by default there; `TF=0`
+> skips it.
+
 Teacher-forced `PULSAR_KV` quality sweep — the non-chaotic counterpart to
 [`bench_kv.sh`](./bench_kv.md). Force-feeds the **same** token sequence
 through every KV format and compares per-position logits against an f32

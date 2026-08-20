@@ -1,5 +1,10 @@
 # bench_kv.sh
 
+> Prefer [`kv-codec-bench.sh`](./kv-codec-bench.md) for new runs — it is
+> model-agnostic and already includes this greedy sweep plus teacher-force
+> and an HTML chart. This script stays as the small tok/s + first-divergence
+> smoke.
+
 Quick `PULSAR_KV` sweep: tok/s + greedy-id quality diff vs an f32 baseline.
 Cycles every KV format through the same prompt and prints (a) decode
 throughput and (b) where the greedy token stream first diverges from f32.

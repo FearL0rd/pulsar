@@ -94,6 +94,7 @@ mod real {
         fn pulsar_dspark_markov_argmax(logits: *const c_void, w2: *const c_void, state: *const c_void, vocab: u32, rank: u32, scratch: *mut c_void, out: *mut c_void) -> i32;
         fn pulsar_rms_norm(out: *mut c_void, x: *const c_void, w: *const c_void, n: u32, rows: u32, eps: f32) -> i32;
         fn pulsar_q8_0_matmul(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
+        fn pulsar_preq_scratch_reserve(bytes: u64) -> i32;
         fn pulsar_q8_0_matmul_banked(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_bank: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_f32(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_kq(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
@@ -459,6 +460,18 @@ mod real {
         Ok((free, total))
     }
 
+    /// Per-device free-VRAM budget for WEIGHT uploads (DeviceBuf::from_bytes
+    /// callers only). i64::MAX = untracked; 0 = pin everything new.
+    static WEIGHT_BUDGET: [std::sync::atomic::AtomicI64; 16] =
+        [const { std::sync::atomic::AtomicI64::new(i64::MAX) }; 16];
+
+    /// Cap weight VRAM on `dev` at `bytes` (engine passes free minus the
+    /// same 2GiB reserve the dense-split planner trusts); from_bytes
+    /// spends it and spills the overflow to pinned host RAM.
+    pub fn set_weight_vram_budget(dev: i32, bytes: i64) {
+        WEIGHT_BUDGET[dev as usize].store(bytes.clamp(0, i64::MAX), std::sync::atomic::Ordering::Relaxed);
+    }
+
     impl DeviceBuf {
         pub fn alloc(bytes: usize) -> Result<Self> {
             ensure_device();
@@ -496,7 +509,38 @@ mod real {
         }
 
         pub fn from_bytes(data: &[u8]) -> Result<Self> {
-            let mut b = Self::alloc(data.len())?;
+            // Weights only (every engine caller is a load-time weight).
+            // VRAM while the device's weight budget lasts, then mapped
+            // pinned host memory - zero-copy PCIe reads, the same path
+            // budgeted Mla/dsv4 attn weights already take every token.
+            // Activations and KV never come through here, so a full card
+            // degrades to host residency instead of a fatal cudaMalloc.
+            let dev = get_device();
+            use std::sync::atomic::Ordering;
+            let mut b = if WEIGHT_BUDGET[dev as usize].load(Ordering::Relaxed) >= data.len() as i64 {
+                match Self::alloc(data.len()) {
+                    Ok(b) => {
+                        WEIGHT_BUDGET[dev as usize].fetch_sub(data.len() as i64, Ordering::Relaxed);
+                        b
+                    }
+                    Err(_) => Self::weight_pinned(data)?,
+                }
+            } else {
+                Self::weight_pinned(data)?
+            };
+            b.write(0, data)?;
+            Ok(b)
+        }
+
+        fn weight_pinned(data: &[u8]) -> Result<Self> {
+            let dev = get_device();
+            use std::sync::atomic::Ordering;
+            if WEIGHT_BUDGET[dev as usize].swap(0, Ordering::Relaxed) != 0 {
+                eprintln!(
+                    "pulsar: weights exceed VRAM on device {dev} - overflow resident in pinned host RAM (zero-copy PCIe reads)"
+                );
+            }
+            let mut b = Self::alloc_pinned(data.len())?;
             b.write(0, data)?;
             Ok(b)
         }
@@ -1028,6 +1072,13 @@ mod real {
 
     pub fn matmul_q8_0(out: &mut DeviceBuf, w: &DeviceBuf, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_q8_0_matmul(out.ptr_mut(), w.ptr(), x.ptr(), in_dim, out_dim, n_tok) }, "matmul_q8_0")
+    }
+
+    /// Pre-allocate the q8_0 prequant scratch on the CURRENT device so a
+    /// later matmul_q8_0 inside a CUDA-graph capture hits the cached
+    /// pointer: cudaMalloc is illegal mid-capture.
+    pub fn preq_scratch_reserve(bytes: u64) -> Result {
+        check(unsafe { pulsar_preq_scratch_reserve(bytes) }, "preq_scratch_reserve")
     }
 
     /// Banked matmul: x is n_tok*n_bank contiguous pseudo-rows of in_dim,
@@ -2474,5 +2525,25 @@ mod tests {
         for (i, &v) in y.iter().enumerate() {
             assert_eq!(v, 3.0 * i as f32);
         }
+    }
+
+    /// Weight VRAM budget: exhausted -> pinned host fallback; refilled ->
+    /// VRAM again. Same bytes either way.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn weight_budget_pins_overflow() {
+        const DEV: i32 = 0;
+        super::set_device(DEV).unwrap();
+        let data = vec![7u8; 4096];
+        super::set_weight_vram_budget(DEV, 0);
+        let p = super::DeviceBuf::from_bytes(&data).unwrap();
+        assert!(p.is_pinned());
+        let mut back = vec![0u8; 4096];
+        p.read(0, &mut back).unwrap();
+        assert_eq!(back[0], 7);
+        super::set_weight_vram_budget(DEV, 1 << 20);
+        let v = super::DeviceBuf::from_bytes(&data).unwrap();
+        assert!(!v.is_pinned());
+        super::set_weight_vram_budget(DEV, i64::MAX);
     }
 }

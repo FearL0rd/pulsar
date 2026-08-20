@@ -30,7 +30,7 @@ CLI="${PULSAR_CLI:-$ROOT/target/release/pulsar-cli}"
 MODEL="${MODEL:?set MODEL= to a GQA/Qwen35 family gguf (NOT glm-dsa/GLM-5.2)}"
 PROMPT="${PROMPT:-List the first eight Fibonacci numbers, then explain each in one short sentence.}"
 N="${N:-512}"
-FMTS="${FMTS:-f32 fp8 fp16 int8 q8_0 q4_0}"
+FMTS="${FMTS:-f32 fp8 fp16 int8 q8_0 q4_0 turbo8 turbo4 turbo3 turbo2 turbo3_tcq turbo2_tcq turbo1_tcq}"
 MIN_VRAM_MB="${PULSAR_MIN_VRAM_MB:-8192}"
 
 ATTN_FAMILY="$(resolve_attn_family "$MODEL")"

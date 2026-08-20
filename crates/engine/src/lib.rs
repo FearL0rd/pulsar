@@ -3007,19 +3007,41 @@ mod real {
             let file = VFile::open(&shards)?;
             let shape = Shape::from_gguf(&gguf)?;
 
+            // A model bigger than every card combined (or a single-card
+            // run, where the dense-split planner never engages) must
+            // degrade to pinned host RAM, not die at cudaMalloc: budget
+            // each card's free VRAM minus a 3GiB reserve for
+            // KV/activations/preq scratch/graph pools (state allocs come
+            // AFTER weights and cannot pin). Spent only by weight
+            // uploads; multi-GPU plans that already fit never touch the
+            // ceiling, so placement there is unchanged.
+            // Establish the measured primary FIRST: mem_info saves and
+            // restores the current device, and before the first ensure
+            // that is CUDA's default (0) - budgeting here would silently
+            // re-pin every later allocation to device 0 even when the
+            // probe picked a different primary.
+            kernels::set_device(kernels::primary_device())?;
+            for d in 0..kernels::device_count() {
+                if let Ok((free, _)) = kernels::mem_info(d) {
+                    kernels::set_weight_vram_budget(d, free as i64 - (3i64 << 30));
+                }
+            }
+
             // the embedding table is read ~one row per token - pinned
             // host is free for it and returns ~1GB of VRAM to hot weights
             let token_embd = {
                 // deepseek4 embd arrives F16 (antirez ds4 recipe) or Q5_K
                 // (unsloth UD-*); both convert to q8_0 for embed_q8_0.
                 let bytes = read_tensor_bytes(&file, &gguf, "token_embd.weight")?;
-                let mut buf = if matches!(shape.family, Family::Mla | Family::Dsv4) {
-                    DeviceBuf::alloc_pinned(bytes.len())?
+                if matches!(shape.family, Family::Mla | Family::Dsv4) {
+                    let mut buf = DeviceBuf::alloc_pinned(bytes.len())?;
+                    buf.write(0, &bytes)?;
+                    buf
                 } else {
-                    DeviceBuf::alloc(bytes.len())?
-                };
-                buf.write(0, &bytes)?;
-                buf
+                    // budgeted weight path: VRAM while it lasts, pinned on
+                    // overflow (a row-per-token read - pinned costs nothing)
+                    DeviceBuf::from_bytes(&bytes)?
+                }
             };
             let output_norm = upload(&file, &gguf, "output_norm.weight")?;
             // K3 mixes the banked AttnRes checkpoints one last time before
@@ -3822,6 +3844,29 @@ mod real {
                 } else if shape.family == Family::Qwen35
                     && gguf.tensor(&t("ffn_gate_exps.weight")).is_none()
                 {
+                    // A FFN triple matmul_kq cannot dispatch (q8_0 from a
+                    // --default q8_0 quant, f16/f32 sources, or a
+                    // non-256-multiple contraction dim) rides the plain
+                    // q8_0 Dense path instead: matmul_q8_0 on the f32
+                    // activations, preq scratch prewarmed before the GDN
+                    // graph capture. ponytail: dense qwen35 + PULSAR_TP
+                    // leaves this FFN un-split on the primary (the TP
+                    // stash is K-quant only); split it when a q8_0 model
+                    // needs TP.
+                    let kq_dispatch = |ti: &TensorInfo| {
+                        MatW::keep_native(ti)
+                            || (matches!(
+                                ti.ty,
+                                TensorType::Q2K | TensorType::Q3K | TensorType::IQ2XXS
+                            ) && ti.dims[0].is_multiple_of(256))
+                    };
+                    if gguf.tensor(&t("ffn_gate.weight")).is_some_and(|ti| !kq_dispatch(ti)) {
+                        Ffn::Dense {
+                            gate: upload(&file, &gguf, &t("ffn_gate.weight"))?,
+                            up: upload(&file, &gguf, &t("ffn_up.weight"))?,
+                            down: upload(&file, &gguf, &t("ffn_down.weight"))?,
+                        }
+                    } else
                     // dense qwen35 (27B): the FFN triple resident in
                     // native K-quant on whatever device is current (the
                     // layer's owner under the dense split). Under
