@@ -738,9 +738,41 @@ pub fn quantize_row_nvfp4(x: &[f32], out: &mut Vec<u8>) {
             if amax == 0.0 {
                 continue;
             }
-            // max |value| the reader can produce is ue4m3_half(s) * 12
-            // = ue4m3(s) * 6, so the scale must satisfy ue4m3(s) >= amax/6
-            let s = ue4m3_ceil(amax / 6.0);
+            // Scale search: the smallest non-clipping UE4M3 (ceil of
+            // amax/6) is the upper anchor, but clipping one outlier to
+            // encode the other fifteen values tighter often wins - try
+            // the ceil and a few steps below, keep the min-SSE scale
+            // (same trade the K-quant make_qx search makes).
+            let ceil = ue4m3_ceil(amax / 6.0);
+            let mut best_s = ceil;
+            let mut best_err = f32::INFINITY;
+            for cand in (ceil.saturating_sub(3))..=ceil.min(0x7E) {
+                if cand == 0 {
+                    continue;
+                }
+                let sv = ue4m3_to_f32(cand) * 0.5;
+                if sv == 0.0 {
+                    continue;
+                }
+                let mut err = 0.0f32;
+                for &v in sb.iter() {
+                    let t = (v / sv).abs();
+                    let mut be = f32::INFINITY;
+                    for &kv in NVFP4_KV.iter() {
+                        let e = (t - kv as f32).abs();
+                        if e < be {
+                            be = e;
+                        }
+                    }
+                    let d = be * sv;
+                    err += d * d;
+                }
+                if err < best_err {
+                    best_err = err;
+                    best_s = cand;
+                }
+            }
+            let s = best_s;
             scales[sub] = s;
             let sv = ue4m3_to_f32(s) * 0.5; // ue4m3_half, like the reader
             if sv == 0.0 {
