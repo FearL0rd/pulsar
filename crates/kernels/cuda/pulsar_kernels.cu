@@ -314,6 +314,130 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+/* warp-per-row GEMV for sm_70 (V100): cooperative coalesced staging. Each warp
+ * copies its row into shared memory 1088B at a time (32 lanes x uint4, fully
+ * coalesced), then computes 16 quant-block pairs from smem per chunk. The old
+ * byte-load kernel loses ~45% of peak on sm_70 because per-instruction lane
+ * addresses sit 68B apart (LSU wavefront amplification); sm_86 doesn't care.
+ * Staging needs blocks % 8 == 0 so both the row start and every 1088B chunk
+ * stay 16B-aligned. Microbench: V100 631 vs 451 GB/s (ceiling 858); 3090
+ * unchanged within noise, so dispatch is cc_major < 8 only. */
+__global__ static void matmul_q8_0_preq_warp8v5_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    (void)in_dim;
+    __shared__ uint4 smem[8][68];
+    const uint32_t wid = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
+    uint64_t row = (uint64_t)blockIdx.x * 8u + wid;
+    if (row >= out_dim) return;
+    const uint64_t pairs = blocks / 2u;
+    const uint32_t *Vr = (const uint32_t *)(w + row * blocks * 34u);
+    const int32_t *xw = (const int32_t *)xq;
+    const uint64_t chunks = (pairs + 15u) / 16u;
+    const uint64_t row_bytes = blocks * 34u;
+    float acc = 0.0f;
+    for (uint64_t c = 0; c < chunks; ++c) {
+        const uint4 *src = (const uint4 *)((const unsigned char *)Vr + c * 1088u);
+        uint4 *dst = smem[wid];
+        const uint64_t rem = row_bytes - c * 1088u;
+        const uint32_t valid16 = (uint32_t)((rem < 1088u ? rem : 1088u) + 15u) / 16u;
+#pragma unroll
+        for (uint32_t r = 0; r < 3u; ++r) {
+            uint32_t idx = lane + 32u * r;
+            if (idx < valid16) dst[idx] = src[idx];
+        }
+        __syncwarp();
+        const uint32_t *V = (const uint32_t *)dst;
+        const uint64_t pair = c * 16u + lane;
+        if (lane < 16u && pair < pairs) {
+            const int32_t *xa = xw + pair * 16u;
+            const uint32_t o = lane * 17u;
+            int32_t d0 = 0, d1 = 0;
+#pragma unroll
+            for (uint32_t g = 0; g < 8u; ++g) {
+                d0 = __dp4a((int32_t)__byte_perm(V[o + g], V[o + g + 1u], 0x5432), xa[g], d0);
+                d1 = __dp4a((int32_t)V[o + 9u + g], xa[8u + g], d1);
+            }
+            const float sa = __half2float(__ushort_as_half((unsigned short)(V[o] & 0xFFFFu)));
+            const float sb = __half2float(__ushort_as_half((unsigned short)(V[o + 8u] >> 16)));
+            acc += sa * xscale[pair * 2u] * (float)d0
+                 + sb * xscale[pair * 2u + 1u] * (float)d1;
+        }
+        __syncwarp();
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+/* 2-token GEMV for sm_70 (V100): v5 staging (1088B chunk, smem 8.7KB,
+ * 8 blocks/SM) with lanes split by token — lanes 0-15 compute tok0,
+ * 16-31 compute tok1. Per-lane work identical to v5; weights streamed once
+ * for both tokens. x vectorized via 4 LDG.128 (saves v7's 16-LDG.32 hot
+ * path on V100's LSU — microbench: 130us vs v5 151us, vs v7 267us).
+ * Out layout [2][out_dim] token-major, matches tiled kernel. */
+__global__ static void matmul_q8_0_preq_warp8v7b_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    __shared__ uint4 smem[8][68];
+    const uint32_t wid = threadIdx.x >> 5u, lane = threadIdx.x & 31u;
+    uint64_t row = (uint64_t)blockIdx.x * 8u + wid;
+    if (row >= out_dim) return;
+    const uint64_t pairs = blocks / 2u;
+    const uint32_t *Vr = (const uint32_t *)(w + row * blocks * 34u);
+    const uint32_t tok = lane >> 4u;
+    const uint4 *xt = (const uint4 *)(xq + (uint64_t)tok * blocks * 32u);
+    const float *xst = xscale + (uint64_t)tok * blocks;
+    const uint64_t chunks = (pairs + 15u) / 16u;
+    const uint64_t row_bytes = blocks * 34u;
+    float acc = 0.0f;
+    for (uint64_t c = 0; c < chunks; ++c) {
+        const uint4 *src = (const uint4 *)((const unsigned char *)Vr + c * 1088u);
+        uint4 *dst = smem[wid];
+        const uint64_t rem = row_bytes - c * 1088u;
+        const uint32_t valid16 = (uint32_t)((rem < 1088u ? rem : 1088u) + 15u) / 16u;
+#pragma unroll
+        for (uint32_t r = 0; r < 3u; ++r) {
+            uint32_t idx = lane + 32u * r;
+            if (idx < valid16) dst[idx] = src[idx];
+        }
+        __syncwarp();
+        const uint32_t *V = (const uint32_t *)dst;
+        const uint64_t pair = c * 16u + (lane & 15u);
+        if (pair < pairs) {
+            const uint4 xvs[4] = {xt[pair * 4u + 0u], xt[pair * 4u + 1u],
+                                  xt[pair * 4u + 2u], xt[pair * 4u + 3u]};
+            const uint32_t *xw = (const uint32_t *)xvs;
+            const uint32_t o = (lane & 15u) * 17u;
+            int32_t d0 = 0, d1 = 0;
+#pragma unroll
+            for (uint32_t g = 0; g < 8u; ++g) {
+                d0 = __dp4a((int32_t)__byte_perm(V[o + g], V[o + g + 1u], 0x5432), (int32_t)xw[g], d0);
+                d1 = __dp4a((int32_t)V[o + 9u + g], (int32_t)xw[8u + g], d1);
+            }
+            const float sa = __half2float(__ushort_as_half((unsigned short)(V[o] & 0xFFFFu)));
+            const float sb = __half2float(__ushort_as_half((unsigned short)(V[o + 8u] >> 16)));
+            acc += sa * xst[pair * 2u] * (float)d0
+                 + sb * xst[pair * 2u + 1u] * (float)d1;
+        }
+        __syncwarp();
+    }
+    const float s0 = warp_sum_f32(tok == 0u ? acc : 0.0f);
+    const float s1 = warp_sum_f32(tok == 1u ? acc : 0.0f);
+    if (lane == 0u) {
+        out[row] = s0;
+        out[out_dim + row] = s1;
+    }
+}
+
 /* banked q8_0 matmul: pseudo-row j = token*n_bank + bank multiplies weight
  * bank j % n_bank (deepseek4's grouped out-proj: heads is [t][n_bank]
  * contiguous slices, low is [t][n_bank] contiguous rank-rows, so the whole
@@ -510,16 +634,25 @@ extern "C" int pulsar_q8_0_matmul(
     if (!cuda_ok(cudaGetLastError(), "q8_0 prequant launch")) return 0;
 
     if (n_tok == 1) {
-        matmul_q8_0_preq_warp8_kernel<<<(out_dim + 7u) / 8u, 256>>>(
-                (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
-                in_dim, out_dim, blocks);
+        if ((blocks & 7u) == 0u && pulsar_device_cc_major() < 8)
+            matmul_q8_0_preq_warp8v5_kernel<<<(out_dim + 7u) / 8u, 256>>>(
+                    (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
+                    in_dim, out_dim, blocks);
+        else
+            matmul_q8_0_preq_warp8_kernel<<<(out_dim + 7u) / 8u, 256>>>(
+                    (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
+                    in_dim, out_dim, blocks);
     } else if (n_tok >= 16 && pulsar_device_cc_major() >= 8 &&
                !getenv("PULSAR_NO_MMA")) {
         dim3 grid((out_dim + 63u) / 64u, (n_tok + 15u) / 16u, 1);
         matmul_q8_0_preq_mma_kernel<<<grid, 256>>>(
                 (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
                 out_dim, n_tok, (uint32_t)blocks);
-    } else if (n_tok >= 8) {
+    } else if (n_tok == 2 && (blocks & 7u) == 0u) {
+        matmul_q8_0_preq_warp8v7b_kernel<<<(out_dim + 7u) / 8u, 256>>>(
+                (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
+                out_dim, blocks);
+    } else if (n_tok >= 2) {
         dim3 grid((unsigned)((out_dim + 7u) / 8u),
                   (unsigned)((n_tok + PULSAR_Q8_TILE_TOK - 1u) / PULSAR_Q8_TILE_TOK), 1);
         matmul_q8_0_preq_tiled_kernel<<<grid, 256>>>(
@@ -595,11 +728,13 @@ static uint16_t f32_to_f16_bits(float f) {
     return (uint16_t)(sign | ((uint32_t)exp << 10) | half_man);
 }
 
-static int q8_0_matmul_selftest_one(uint32_t n_tok) {
+static int q8_0_matmul_selftest_one(uint32_t in_dim, uint32_t n_tok) {
     /* n_tok 9 = tiled path incl. partial tile; 19/40 = tensor-core mma on
      * sm_80+ (partial + multi 16-token tiles), tiled elsewhere; in_dim
-     * 4256 -> 133 blocks, a partial 5-block weight slab */
-    const uint32_t in_dim = 4256, out_dim = 512;
+     * 4256 -> 133 blocks, a partial 5-block weight slab; n_tok 1 hits the
+     * decode GEMV: 4096 -> 128 blocks (blocks%8==0, v5 smem path on sm_70),
+     * 4256 -> 133 blocks (warp8 byte-wise fallback) */
+    const uint32_t out_dim = 512;
     const uint32_t blocks = in_dim / 32u;
     q8_0_block *w = (q8_0_block *)malloc((uint64_t)out_dim * blocks * sizeof(*w));
     float *wf = (float *)malloc((uint64_t)out_dim * in_dim * sizeof(float));
@@ -687,8 +822,8 @@ static int q8_0_matmul_selftest_one(uint32_t n_tok) {
         }
         ok = maxd <= 1e-3f * (maxref > 1.0f ? maxref : 1.0f);
     }
-    fprintf(stderr, "q8_0-matmul-selftest n_tok=%u: %s (max abs diff %.2e, max |ref| %.2e)\n",
-            n_tok, ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
+    fprintf(stderr, "q8_0-matmul-selftest in_dim=%u n_tok=%u: %s (max abs diff %.2e, max |ref| %.2e)\n",
+            in_dim, n_tok, ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
     if (w_dev) cudaFree(w_dev);
     if (x_dev) cudaFree(x_dev);
     if (out_dev) cudaFree(out_dev);
@@ -754,9 +889,11 @@ static int q8_0_banked_selftest_one(uint32_t n_tok) {
 }
 
 extern "C" int pulsar_q8_0_matmul_selftest(void) {
-    return q8_0_matmul_selftest_one(9) &&
-           q8_0_matmul_selftest_one(19) &&
-           q8_0_matmul_selftest_one(40) &&
+    return q8_0_matmul_selftest_one(4256, 9) &&
+           q8_0_matmul_selftest_one(4256, 19) &&
+           q8_0_matmul_selftest_one(4256, 40) &&
+           q8_0_matmul_selftest_one(4096, 1) &&
+           q8_0_matmul_selftest_one(4256, 1) &&
            q8_0_banked_selftest_one(1) &&
            q8_0_banked_selftest_one(5) &&
            q8_0_banked_selftest_one(16);
