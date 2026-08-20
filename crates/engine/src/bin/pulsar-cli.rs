@@ -946,7 +946,7 @@ fn run() -> engine::Result {
         && dump_logits.is_none() {
         let mut generated: Vec<u32> = Vec::new();
         let mut t_first: Option<std::time::Instant> = None;
-        let mut sampler = engine::Sampler::new(0.0, 1.0, 0.0, 1);
+        let mut sampler = engine::Sampler::new(temp.unwrap_or(0.0), top_p.unwrap_or(1.0), min_p, seed);
         let out = std::io::stdout();
         engine::generate(
             &model,

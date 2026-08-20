@@ -8810,6 +8810,29 @@ mod real {
             Ok(ids[0])
         }
 
+        /// Sampled MTP draft: like mtp_draft but reads the full nextn
+        /// logits back and returns (sampled token, draft distribution q)
+        /// so speculative SAMPLING can accept/reject against the target.
+        /// No argmax-split shortcut - the residual math needs q's mass.
+        fn mtp_draft_sampled(
+            &self,
+            st: &mut State,
+            token: u32,
+            pos: u32,
+            sampler: &mut Sampler,
+        ) -> Result<(u32, Vec<(u32, f32)>)> {
+            self.mtp_body(st, token, pos)?;
+            let mtp = self.mtp.as_ref().ok_or("mtp_draft without an MTP layer")?;
+            let s = self.shape;
+            kernels::rms_norm(&mut st.normed, &st.cur, &mtp.head_norm, s.n_embd, 1, s.rms_eps)?;
+            self.head_logits(st, 1)?;
+            kernels::sync()?;
+            let logits = st.logits.read_f32(s.n_vocab as usize)?;
+            let q = sampler.dist(&logits);
+            let t = sampler.sample_from(&q);
+            Ok((t, q))
+        }
+
         fn mtp_body(&self, st: &mut State, token: u32, pos: u32) -> Result {
             let mtp = self.mtp.as_ref().ok_or("mtp_draft without an MTP layer")?;
             let s = self.shape;
@@ -8867,9 +8890,16 @@ mod real {
         mut on_token: impl FnMut(u32),
         cancel: impl Fn() -> bool,
     ) -> Result<u32> {
-        // MTP speculative decode is greedy-only: acceptance compares the
-        // draft against the verified argmax, which IS greedy sampling.
+        // MTP greedy spec: acceptance compares the draft against the
+        // verified argmax, which IS greedy sampling (readback-free).
         let spec = model.mtp.is_some() && sampler.is_greedy();
+        // MTP sampled spec: rejection sampling against the target
+        // distribution, distribution-preserving at any temperature. Reads
+        // full logits (draft q + target p), so pricier than greedy verify
+        // but lets temp>0 requests (pi) use the 87%-accept nextn head.
+        let spec_sample = model.mtp.is_some() && !sampler.is_greedy()
+            && std::env::var_os("PULSAR_NO_SPEC_SAMPLE").is_none();
+        let mtp_prefill = spec || spec_sample;
         let mut pos = pos0;
         let mut logits = None;
         // qwen35 MTP prefill: the forward leaves only its LAST internal
@@ -8883,7 +8913,7 @@ mod real {
         // often than needed, and the MTP prefill path was 5.4x slower
         // than the same prompt with MTP off (61s vs 11s on 7120 tokens).
         // The MTP scratch is max_batch-sized, so it was never the limit.
-        let chunk_cap = if spec && model.shape.family == Family::Qwen35 {
+        let chunk_cap = if mtp_prefill && model.shape.family == Family::Qwen35 {
             (st.max_batch() as usize).min(qwen35::chunk_max())
         } else {
             st.max_batch() as usize
@@ -8898,7 +8928,7 @@ mod real {
             }
             let t0 = std::time::Instant::now();
             logits = model.forward_batch(st, chunk, pos, true)?;
-            if spec {
+            if mtp_prefill {
                 model.mtp_prefill_fill(st, chunk.len() as u32, pos)?;
             }
             if prof_chunks {
@@ -8984,6 +9014,109 @@ mod real {
                     on_token(d);
                     emitted += 1;
                     hist.push(d);
+                }
+            }
+            return Ok(pos);
+        }
+
+        // MTP speculative SAMPLING (temp>0): same draft/verify/GDN-state
+        // flow as the greedy block below, but the draft samples from the
+        // nextn head (recording q), the verify reads full target logits
+        // (p), and acceptance is Leviathan/Chen rejection sampling so the
+        // emitted stream is distributed EXACTLY as non-spec sampling at
+        // the same temp/top_p/min_p. Reuses the sampler RNG for accept
+        // draws, residual, and bonus - one deterministic stream.
+        if spec_sample {
+            let v = model.shape.n_vocab as usize;
+            let row = model.shape.n_embd as usize * 4;
+            let depth_max = model.mtp_depth.max(1);
+            let debug = std::env::var_os("PULSAR_MTP_DEBUG").is_some();
+            let mut emitted = 0usize;
+            let mut next = sampler.sample(logits.as_deref().ok_or("no logits")?);
+            'sround: while emitted < max_tokens {
+                if stop(next) || pos + 2 >= st.ctx() {
+                    model.forward_batch(st, &[next], pos, false)?;
+                    pos += 1;
+                    break;
+                }
+                on_token(next);
+                emitted += 1;
+
+                // draft a chain, recording each step's draft distribution q
+                kernels::copy_d2d(&mut st.mtp_hidden_save, 0, &st.mtp_hidden, 0, row)?;
+                let depth = depth_max.min(st.ctx() - pos - 2);
+                let mut chain = vec![next];
+                let mut qs: Vec<Vec<(u32, f32)>> = Vec::with_capacity(depth as usize);
+                for i in 0..depth {
+                    let (d, q) = model.mtp_draft_sampled(st, chain[i as usize], pos + i, sampler)?;
+                    st.mtp_drafted += 1;
+                    kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.cur, 0, row)?;
+                    chain.push(d);
+                    qs.push(q);
+                    if stop(d) {
+                        break;
+                    }
+                }
+                let k = chain.len() - 1;
+
+                // verify: full target logits per row (no argmax shortcut)
+                let recurrent = model.shape.family == Family::Qwen35;
+                if recurrent {
+                    st.qwen35.as_mut().ok_or("qwen35 state missing")?.gdn_snapshot()?;
+                }
+                let all = model
+                    .forward_rows(st, &chain, pos, (k + 1) as u32)?
+                    .ok_or("no verify logits")?;
+
+                // rejection sampling over the drafted prefix
+                let mut j = 0usize;
+                let mut resid_next: Option<u32> = None;
+                while j < k {
+                    let p = sampler.dist(&all[j * v..(j + 1) * v]);
+                    match sampler.spec_step(chain[j + 1], &qs[j], &p) {
+                        Ok(_) => {
+                            st.mtp_accepted += 1;
+                            j += 1;
+                        }
+                        Err(resid) => {
+                            resid_next = Some(resid);
+                            break;
+                        }
+                    }
+                }
+                // next token: residual on a reject, else the bonus sampled
+                // from the target's row-k distribution (whole chain accepted)
+                next = match resid_next {
+                    Some(r) => r,
+                    None => {
+                        // whole chain accepted: bonus from the target's
+                        // row-k distribution, via the same dist() the
+                        // accept step used (consistency)
+                        let bonus = sampler.dist(&all[k * v..(k + 1) * v]);
+                        sampler.sample_from(&bonus)
+                    }
+                };
+                if debug {
+                    eprintln!("mtp-sample: pos={pos} chain={chain:?} accepted={j}/{k} next={next}");
+                }
+
+                if recurrent && j < k {
+                    st.qwen35.as_mut().ok_or("qwen35 state missing")?.gdn_restore()?;
+                    model.forward_batch(st, &chain[..=j], pos, false)?;
+                }
+                kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.mtp_hidden_save, 0, row)?;
+                model.mtp_prefill_fill(st, (j + 1) as u32, pos)?;
+                pos += (j + 1) as u32;
+
+                for &d in &chain[1..=j] {
+                    if stop(d) {
+                        break 'sround;
+                    }
+                    if emitted >= max_tokens {
+                        break 'sround;
+                    }
+                    on_token(d);
+                    emitted += 1;
                 }
             }
             return Ok(pos);
@@ -9259,6 +9392,130 @@ mod real {
                 r -= c.1;
             }
             cand[kept - 1].0
+        }
+
+        /// The truncated, normalized sampling distribution as (token,
+        /// prob) pairs over the kept support - EXACTLY the set `sample`
+        /// would draw from (same temp/top_p/min_p filter), so speculative
+        /// draft (q) and target (p) distributions match token-for-token
+        /// where their supports overlap. Sorted descending by prob.
+        /// Empty when greedy (temp<=0): the caller uses the argmax path.
+        pub fn dist(&self, logits: &[f32]) -> Vec<(u32, f32)> {
+            if self.temp <= 0.0 {
+                return Vec::new();
+            }
+            // full-softmax denominator + max (the min_p/top_p thresholds
+            // are against the FULL distribution, so this reduction is
+            // needed - but it is O(n), not a sort)
+            let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut full_sum = 0f32;
+            for &l in logits {
+                full_sum += ((l - maxl) / self.temp).exp();
+            }
+            // only the highest logits can survive top_p/min_p, so
+            // partial-select a top slab and sort THAT instead of the whole
+            // 248k vocab (the full sort was ~40% of spec-sampling time).
+            // 4096 covers top_p at any sane temp; the fallback keeps it
+            // exact if a pathologically flat row needs more.
+            let n = logits.len();
+            let build = |idx: &[u32]| -> (Vec<(u32, f32)>, f32) {
+                let p0 = ((logits[idx[0] as usize] - maxl) / self.temp).exp() / full_sum;
+                let mut kept: Vec<(u32, f32)> = Vec::new();
+                let (mut cum, mut kept_sum) = (0f32, 0f32);
+                for &i in idx {
+                    let e = ((logits[i as usize] - maxl) / self.temp).exp();
+                    let p = e / full_sum;
+                    if self.min_p > 0.0 && p < self.min_p * p0 && !kept.is_empty() {
+                        break;
+                    }
+                    cum += p;
+                    kept.push((i, e));
+                    kept_sum += e;
+                    if self.top_p < 1.0 && cum >= self.top_p {
+                        break;
+                    }
+                }
+                for c in kept.iter_mut() {
+                    c.1 /= kept_sum;
+                }
+                (kept, cum)
+            };
+            let slab = 4096.min(n);
+            let mut idx: Vec<u32> = (0..n as u32).collect();
+            let cmp = |a: &u32, b: &u32| logits[*b as usize].total_cmp(&logits[*a as usize]);
+            if slab < n {
+                idx.select_nth_unstable_by(slab - 1, cmp);
+                idx.truncate(slab);
+            }
+            idx.sort_unstable_by(cmp);
+            let (kept, cum) = build(&idx);
+            // slab exhausted before reaching top_p (only a near-uniform
+            // row): redo exactly over the full sorted vocab.
+            if self.top_p < 1.0 && cum < self.top_p && slab < n {
+                let mut full: Vec<u32> = (0..n as u32).collect();
+                full.sort_unstable_by(cmp);
+                return build(&full).0;
+            }
+            kept
+        }
+
+        /// A uniform draw in [0,1) from the sampler's own RNG, for the
+        /// speculative accept/reject test.
+        pub fn accept_uniform(&mut self) -> f32 {
+            self.randf()
+        }
+
+        /// Prob of `tok` in a (token,prob) distribution, 0 if outside its
+        /// support.
+        fn prob_of(dist: &[(u32, f32)], tok: u32) -> f32 {
+            dist.iter().find(|(t, _)| *t == tok).map_or(0.0, |(_, p)| *p)
+        }
+
+        /// Draw one token from an explicit (token,prob) distribution
+        /// (used for the bonus token when the whole chain is accepted).
+        pub fn sample_from(&mut self, dist: &[(u32, f32)]) -> u32 {
+            let sum: f32 = dist.iter().map(|(_, p)| p).sum();
+            let mut r = self.randf() * sum;
+            for &(t, p) in dist {
+                if r < p {
+                    return t;
+                }
+                r -= p;
+            }
+            dist.last().map_or(0, |&(t, _)| t)
+        }
+
+        /// One speculative accept/reject step (Leviathan/Chen). `drafted`
+        /// was sampled from `q`; `p` is the target distribution at the
+        /// same position. Returns Some(accepted token) when the draft is
+        /// accepted, or None with the residual token to emit instead
+        /// (sampled from norm(relu(p-q)) over the union support), which
+        /// also ends the chain. Distribution-preserving: over the RNG the
+        /// emitted token is distributed exactly as p.
+        pub fn spec_step(&mut self, drafted: u32, q: &[(u32, f32)], p: &[(u32, f32)]) -> std::result::Result<u32, u32> {
+            let qd = Self::prob_of(q, drafted).max(1e-30);
+            let pd = Self::prob_of(p, drafted);
+            if self.randf() <= (pd / qd).min(1.0) {
+                return Ok(drafted);
+            }
+            // residual: (p - q)+ over the union of supports, normalized
+            let mut resid: Vec<(u32, f32)> = Vec::with_capacity(p.len());
+            for &(t, pt) in p {
+                let r = pt - Self::prob_of(q, t);
+                if r > 0.0 {
+                    resid.push((t, r));
+                }
+            }
+            let s: f32 = resid.iter().map(|(_, r)| r).sum();
+            if s <= 0.0 {
+                // p is a subset of q at this token's mass; fall back to a
+                // fresh draw from p (rare; keeps output within p's support)
+                return Err(self.sample_from(p));
+            }
+            for c in resid.iter_mut() {
+                c.1 /= s;
+            }
+            Err(self.sample_from(&resid))
         }
     }
 }
