@@ -35,6 +35,27 @@ fn matw(out: &mut DeviceBuf, w: &MatW, x: &DeviceBuf, xq: &DeviceBuf, in_dim: u3
 /// in st.cur, so any caller that needs every row of a batch back (the
 /// MTP prefill fill does) must not hand in more than this at once.
 pub(super) const T_MAX: usize = 128;
+
+/// Prefill chunk width (PULSAR_PREFILL_CHUNK, default 512, clamped to
+/// [T_MAX, 2048]). Bigger chunks amortize the per-chunk fixed costs -
+/// TP hop latency, kernel launches, bank barriers - over more tokens.
+/// Measured on the 7.4k TP prefill: 128/256/512/1024 = 12.04/11.66/
+/// 11.41/11.21s; the flattening curve says the remaining hop cost is
+/// BYTES, not launches - overlap is the next lever, not more width.
+/// 512 keeps the scratch ~400MB smaller than 1024 for 0.2s, which the
+/// 262k-ctx KV auto-sizer appreciates. Every chunk-shaped scratch set
+/// (state, banks, TP) sizes to this; the spec-verify contract stays
+/// T_MAX.
+pub(super) fn chunk_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("PULSAR_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512)
+            .clamp(T_MAX, 2048)
+    })
+}
 /// DFlash feature-ring capacity = the draft context window (lucebox
 /// defaults to 2048; v1 keeps the fc cost down with 256).
 pub(super) const RING_CAP: usize = 256;
@@ -109,9 +130,9 @@ struct Stage2 {
     il: usize,
     /// slot index within layer_ids (ring column offset)
     slot: usize,
-    /// [T_MAX][n_embd] f32 on the bank device
+    /// [chunk_max()][n_embd] f32 on the bank device
     stage: DeviceBuf,
-    /// [T_MAX][n_embd] f32 on the primary
+    /// [chunk_max()][n_embd] f32 on the primary
     bounce: DeviceBuf,
 }
 
@@ -195,6 +216,7 @@ impl DenseBank {
     }
 
     fn one(m: &Model, first: usize, end: usize) -> Result<DenseBank> {
+        let cm = chunk_max();
         let primary = kernels::get_device();
         let s = m.shape;
         let primary = kernels::get_device();
@@ -221,34 +243,34 @@ impl DenseBank {
             ev_p,
             ev_b,
             ev_in,
-            cur: f32s(T_MAX * n_embd)?,
-            normed: f32s(T_MAX * n_embd)?,
-            attn_out: f32s(T_MAX * n_embd)?,
-            after_attn: f32s(T_MAX * n_embd)?,
-            q: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
-            k: f32s(T_MAX * (s.n_head_kv * s.head_dim) as usize)?,
-            v: f32s(T_MAX * (s.n_head_kv * s.head_dim) as usize)?,
-            heads: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
-            xq: q8k(T_MAX * n_embd)?,
-            gate_act: f32s(T_MAX * n_ff)?,
-            up_act: f32s(T_MAX * n_ff)?,
-            ffn_mid: f32s(T_MAX * n_ff)?,
-            midq: q8k(T_MAX * n_ff)?,
-            ffn_out: f32s(T_MAX * n_embd)?,
-            qkv: f32s(T_MAX * conv_dim)?,
-            conv_out: f32s(T_MAX * conv_dim)?,
-            z: f32s(T_MAX * value_dim)?,
-            gq: f32s(T_MAX * key_dim)?,
-            gk: f32s(T_MAX * key_dim)?,
-            gv: f32s(T_MAX * value_dim)?,
-            small: f32s(T_MAX * s.ssm_v_heads as usize)?,
+            cur: f32s(cm * n_embd)?,
+            normed: f32s(cm * n_embd)?,
+            attn_out: f32s(cm * n_embd)?,
+            after_attn: f32s(cm * n_embd)?,
+            q: f32s(cm * (s.n_head * s.head_dim) as usize)?,
+            k: f32s(cm * (s.n_head_kv * s.head_dim) as usize)?,
+            v: f32s(cm * (s.n_head_kv * s.head_dim) as usize)?,
+            heads: f32s(cm * (s.n_head * s.head_dim) as usize)?,
+            xq: q8k(cm * n_embd)?,
+            gate_act: f32s(cm * n_ff)?,
+            up_act: f32s(cm * n_ff)?,
+            ffn_mid: f32s(cm * n_ff)?,
+            midq: q8k(cm * n_ff)?,
+            ffn_out: f32s(cm * n_embd)?,
+            qkv: f32s(cm * conv_dim)?,
+            conv_out: f32s(cm * conv_dim)?,
+            z: f32s(cm * value_dim)?,
+            gq: f32s(cm * key_dim)?,
+            gk: f32s(cm * key_dim)?,
+            gv: f32s(cm * value_dim)?,
+            small: f32s(cm * s.ssm_v_heads as usize)?,
             gb: f32s(2 * s.ssm_v_heads as usize)?,
-            g: f32s(T_MAX * s.ssm_v_heads as usize)?,
-            beta: f32s(T_MAX * s.ssm_v_heads as usize)?,
-            gdn_o: f32s(T_MAX * value_dim)?,
-            gdn_tmp: f32s(T_MAX * value_dim)?,
-            qfull: f32s(T_MAX * 2 * (s.n_head * s.head_dim) as usize)?,
-            gate: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
+            g: f32s(cm * s.ssm_v_heads as usize)?,
+            beta: f32s(cm * s.ssm_v_heads as usize)?,
+            gdn_o: f32s(cm * value_dim)?,
+            gdn_tmp: f32s(cm * value_dim)?,
+            qfull: f32s(cm * 2 * (s.n_head * s.head_dim) as usize)?,
+            gate: f32s(cm * (s.n_head * s.head_dim) as usize)?,
         };
         kernels::set_device(primary)?;
         Ok(b)
@@ -300,7 +322,7 @@ impl DenseBank {
 /// activation bounces into xq, the half-width chain runs there while
 /// the primary runs its own half, and out carries B's partial down
 /// output back through recv (allocated on the PRIMARY) for the add.
-/// T_MAX rows like every other qwen35 scratch.
+/// chunk_max() rows like every other qwen35 scratch.
 /// Third card's FFN-only scratch. It never runs GDN or attention, so it
 /// carries no recurrent state, no KV and no position cells: just the
 /// activation it receives, its slice of the FFN, and the partial it
@@ -370,7 +392,7 @@ struct TpBank {
     lo: kernels::TpLink,
 }
 
-/// qwen35 runtime: GDN states + scratch sized for T_MAX-token chunks.
+/// qwen35 runtime: GDN states + scratch sized for chunk_max()-token chunks.
 pub(super) struct Qwen35Rt {
     states: Vec<Option<GdnState>>,
     /// dense-split second-card buffers (None single-card)
@@ -409,6 +431,7 @@ pub(super) struct Qwen35Rt {
 
 impl Qwen35Rt {
     pub fn new(m: &Model) -> Result<Qwen35Rt> {
+        let cm = chunk_max();
         let s = m.shape;
         let primary = kernels::get_device();
         let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
@@ -455,13 +478,13 @@ impl Qwen35Rt {
                 let (kdh, vdh) = (key_dim / 2, value_dim / 2);
                 let cdh = 2 * kdh + vdh;
                 let vh = s.ssm_v_heads as usize / 2;
-                let recv = f32s(T_MAX * s.n_embd as usize)?; // on the primary
+                let recv = f32s(cm * s.n_embd as usize)?; // on the primary
                 // an event records only on its OWN device's streams: lx
                 // records on A (the activation sends: q8_K rows for the
                 // FFN, f32 normed for the GDN half), lo on B (the
                 // partial returns), so each is created with that device
                 // current
-                let lx = kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?;
+                let lx = kernels::TpLink::new(cm * s.n_embd as usize * 4)?;
                 kernels::set_device(tp.dev)?;
                 let mut bstates = Vec::with_capacity(s.n_exec_layer as usize);
                 for il in 0..s.n_exec_layer as usize {
@@ -484,32 +507,32 @@ impl Qwen35Rt {
                 }
                 let b = TpBank {
                     dev: tp.dev,
-                    xq: DeviceBuf::alloc(T_MAX * q8k(s.n_embd as usize))?,
-                    gate: f32s(T_MAX * half)?,
-                    up: f32s(T_MAX * half)?,
-                    mid: f32s(T_MAX * half)?,
-                    midq: DeviceBuf::alloc(T_MAX * q8k(half))?,
-                    out: f32s(T_MAX * s.n_embd as usize)?,
+                    xq: DeviceBuf::alloc(cm * q8k(s.n_embd as usize))?,
+                    gate: f32s(cm * half)?,
+                    up: f32s(cm * half)?,
+                    mid: f32s(cm * half)?,
+                    midq: DeviceBuf::alloc(cm * q8k(half))?,
+                    out: f32s(cm * s.n_embd as usize)?,
                     recv,
-                    normed: f32s(T_MAX * s.n_embd as usize)?,
-                    qkv: f32s(T_MAX * cdh)?,
-                    conv_out: f32s(T_MAX * cdh)?,
-                    z: f32s(T_MAX * vdh)?,
-                    gq: f32s(T_MAX * kdh)?,
-                    gk: f32s(T_MAX * kdh)?,
-                    gv: f32s(T_MAX * vdh)?,
-                    g: f32s(T_MAX * vh)?,
-                    beta: f32s(T_MAX * vh)?,
+                    normed: f32s(cm * s.n_embd as usize)?,
+                    qkv: f32s(cm * cdh)?,
+                    conv_out: f32s(cm * cdh)?,
+                    z: f32s(cm * vdh)?,
+                    gq: f32s(cm * kdh)?,
+                    gk: f32s(cm * kdh)?,
+                    gv: f32s(cm * vdh)?,
+                    g: f32s(cm * vh)?,
+                    beta: f32s(cm * vh)?,
                     gb: f32s(2 * vh)?,
-                    gdn_o: f32s(T_MAX * vdh)?,
-                    gdn_tmp: f32s(T_MAX * vdh)?,
+                    gdn_o: f32s(cm * vdh)?,
+                    gdn_tmp: f32s(cm * vdh)?,
                     states: bstates,
-                    aqf: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
-                    aq: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
-                    agate: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
-                    ak: f32s(T_MAX * (s.n_head_kv / 2 * s.head_dim) as usize)?,
-                    av: f32s(T_MAX * (s.n_head_kv / 2 * s.head_dim) as usize)?,
-                    aheads: f32s(T_MAX * (s.n_head / 2 * s.head_dim) as usize)?,
+                    aqf: f32s(cm * (s.n_head * s.head_dim) as usize)?,
+                    aq: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
+                    agate: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
+                    ak: f32s(cm * (s.n_head_kv / 2 * s.head_dim) as usize)?,
+                    av: f32s(cm * (s.n_head_kv / 2 * s.head_dim) as usize)?,
+                    aheads: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
                     pos_b: DeviceBuf::alloc(4)?,
                     hlog: f32s(16 * (s.n_vocab / 2) as usize)?,
                     bmax: DeviceBuf::alloc(16 * 8)?,
@@ -520,7 +543,7 @@ impl Qwen35Rt {
                         b
                     },
                     lx,
-                    lo: kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?,
+                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4)?,
                 };
                 kernels::set_device(primary)?;
                 Some(b)
@@ -535,21 +558,21 @@ impl Qwen35Rt {
                 let w = c.width as usize;
                 // lx records on the primary (it sends), lo on the third
                 // card, so each link is created with its device current
-                let lx = kernels::TpLink::new(T_MAX * q8k(s.n_embd as usize))?;
-                let recv = f32s(T_MAX * s.n_embd as usize)?;
+                let lx = kernels::TpLink::new(cm * q8k(s.n_embd as usize))?;
+                let recv = f32s(cm * s.n_embd as usize)?;
                 kernels::set_device(c.dev)?;
                 let b = FfnBank {
                     dev: c.dev,
                     width: c.width,
-                    xq: DeviceBuf::alloc(T_MAX * q8k(s.n_embd as usize))?,
-                    gate: f32s(T_MAX * w)?,
-                    up: f32s(T_MAX * w)?,
-                    mid: f32s(T_MAX * w)?,
-                    midq: DeviceBuf::alloc(T_MAX * q8k(w))?,
-                    out: f32s(T_MAX * s.n_embd as usize)?,
+                    xq: DeviceBuf::alloc(cm * q8k(s.n_embd as usize))?,
+                    gate: f32s(cm * w)?,
+                    up: f32s(cm * w)?,
+                    mid: f32s(cm * w)?,
+                    midq: DeviceBuf::alloc(cm * q8k(w))?,
+                    out: f32s(cm * s.n_embd as usize)?,
                     recv,
                     lx,
-                    lo: kernels::TpLink::new(T_MAX * s.n_embd as usize * 4)?,
+                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4)?,
                 };
                 kernels::set_device(primary)?;
                 Some(b)
@@ -563,21 +586,21 @@ impl Qwen35Rt {
             graphs_on,
             tpb,
             states,
-            qkv: f32s(T_MAX * conv_dim)?,
-            conv_out: f32s(T_MAX * conv_dim)?,
-            z: f32s(T_MAX * value_dim)?,
-            gq: f32s(T_MAX * key_dim)?,
-            gk: f32s(T_MAX * key_dim)?,
-            gv: f32s(T_MAX * value_dim)?,
-            small: f32s(T_MAX * s.ssm_v_heads as usize)?,
+            qkv: f32s(cm * conv_dim)?,
+            conv_out: f32s(cm * conv_dim)?,
+            z: f32s(cm * value_dim)?,
+            gq: f32s(cm * key_dim)?,
+            gk: f32s(cm * key_dim)?,
+            gv: f32s(cm * value_dim)?,
+            small: f32s(cm * s.ssm_v_heads as usize)?,
             gb: f32s(2 * s.ssm_v_heads as usize)?,
-            g: f32s(T_MAX * s.ssm_v_heads as usize)?,
-            beta: f32s(T_MAX * s.ssm_v_heads as usize)?,
-            gdn_o: f32s(T_MAX * value_dim)?,
-            gdn_tmp: f32s(T_MAX * value_dim)?,
-            qfull: f32s(T_MAX * 2 * (s.n_head * s.head_dim) as usize)?,
-            gate: f32s(T_MAX * (s.n_head * s.head_dim) as usize)?,
-            shg: f32s(T_MAX)?,
+            g: f32s(cm * s.ssm_v_heads as usize)?,
+            beta: f32s(cm * s.ssm_v_heads as usize)?,
+            gdn_o: f32s(cm * value_dim)?,
+            gdn_tmp: f32s(cm * value_dim)?,
+            qfull: f32s(cm * 2 * (s.n_head * s.head_dim) as usize)?,
+            gate: f32s(cm * (s.n_head * s.head_dim) as usize)?,
+            shg: f32s(cm)?,
             dflash: None,
         })
     }
@@ -671,6 +694,7 @@ impl Qwen35Rt {
     }
 
     fn enable_dflash(&mut self, m: &Model, layer_ids: Vec<usize>) -> Result {
+        let cm = chunk_max();
         if self.dflash.is_some() {
             return Ok(());
         }
@@ -695,9 +719,9 @@ impl Qwen35Rt {
             for (slot, &il) in layer_ids.iter().enumerate() {
                 if il >= b.first {
                     kernels::set_device(b.dev)?;
-                    let stage = DeviceBuf::alloc(T_MAX * s.n_embd as usize * 4)?;
+                    let stage = DeviceBuf::alloc(cm * s.n_embd as usize * 4)?;
                     kernels::set_device(prev)?;
-                    let bounce = DeviceBuf::alloc(T_MAX * s.n_embd as usize * 4)?;
+                    let bounce = DeviceBuf::alloc(cm * s.n_embd as usize * 4)?;
                     stage2.push(Stage2 { il, slot, stage, bounce });
                 }
             }
@@ -706,11 +730,11 @@ impl Qwen35Rt {
             bank_rb = Some(BankRb {
                 dev: b.dev,
                 first: b.first,
-                conv_out: f32s(T_MAX * conv_dim)?,
-                gq: f32s(T_MAX * key_dim)?,
-                gk: f32s(T_MAX * key_dim)?,
-                gv: f32s(T_MAX * value_dim)?,
-                gdn_o: f32s(T_MAX * value_dim)?,
+                conv_out: f32s(cm * conv_dim)?,
+                gq: f32s(cm * key_dim)?,
+                gk: f32s(cm * key_dim)?,
+                gv: f32s(cm * value_dim)?,
+                gdn_o: f32s(cm * value_dim)?,
             });
             kernels::set_device(prev)?;
         }
@@ -736,9 +760,9 @@ impl Qwen35Rt {
                     }
                     snap_s.push(Some(DeviceBuf::alloc(g.s.bytes())?));
                     snap_conv.push(Some(DeviceBuf::alloc(g.conv.bytes())?));
-                    stash_qkv.push(Some(DeviceBuf::alloc(T_MAX * conv_dim * 4)?));
-                    stash_g.push(Some(DeviceBuf::alloc(T_MAX * s.ssm_v_heads as usize * 4)?));
-                    stash_beta.push(Some(DeviceBuf::alloc(T_MAX * s.ssm_v_heads as usize * 4)?));
+                    stash_qkv.push(Some(DeviceBuf::alloc(cm * conv_dim * 4)?));
+                    stash_g.push(Some(DeviceBuf::alloc(cm * s.ssm_v_heads as usize * 4)?));
+                    stash_beta.push(Some(DeviceBuf::alloc(cm * s.ssm_v_heads as usize * 4)?));
                     if bank_dev.is_some() {
                         kernels::set_device(prev_dev)?;
                     }
@@ -1339,10 +1363,11 @@ impl Model {
             }
             Ok(())
         };
-        let n_chunks = tokens.chunks(T_MAX).count();
-        for (ci, chunk) in tokens.chunks(T_MAX).enumerate() {
+        let cm = chunk_max();
+        let n_chunks = tokens.chunks(cm).count();
+        for (ci, chunk) in tokens.chunks(cm).enumerate() {
             let t = chunk.len() as u32;
-            run(st, rt, t, (ci * T_MAX) as u32, pos, ci + 1 == n_chunks)?;
+            run(st, rt, t, (ci * cm) as u32, pos, ci + 1 == n_chunks)?;
             pos += t;
             last_t = t;
         }

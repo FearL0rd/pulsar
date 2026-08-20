@@ -6179,7 +6179,11 @@ mod real {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(256)
-                .max(1);
+                .max(1)
+                // the qwen35 prefill chunk rides State's generic scratch
+                // (cur/normed/xq/ffn set), so a wider PULSAR_PREFILL_CHUNK
+                // lifts the batch floor with it
+                .max(qwen35::chunk_max() as u32);
 
             // everything the attn segment touches lives on the attn GPU
             // when one is set: KV, MLA scratch, q/heads, hop buffers
@@ -8880,7 +8884,7 @@ mod real {
         // than the same prompt with MTP off (61s vs 11s on 7120 tokens).
         // The MTP scratch is max_batch-sized, so it was never the limit.
         let chunk_cap = if spec && model.shape.family == Family::Qwen35 {
-            (st.max_batch() as usize).min(qwen35::T_MAX)
+            (st.max_batch() as usize).min(qwen35::chunk_max())
         } else {
             st.max_batch() as usize
         };

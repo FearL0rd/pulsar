@@ -1331,7 +1331,7 @@ fn encode_messages_auto(
     tools: Option<&Vec<serde_json::Value>>,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<&str>,
-) -> Vec<u32> {
+) -> (Vec<u32>, bool) {
     if jinja_chat {
         if let Some(tmpl) = chat_template {
             match encode_messages_jinja(
@@ -1342,7 +1342,7 @@ fn encode_messages_auto(
                 enable_thinking,
                 reasoning_effort,
             ) {
-                Ok(ids) => return ids,
+                Ok(r) => return r,
                 Err(e) => {
                     eprintln!(
                         "pulsar-serve: jinja chat template apply failed ({e}); falling back to ChatMarkers"
@@ -1351,7 +1351,7 @@ fn encode_messages_auto(
             }
         }
     }
-    encode_messages(tok, m, messages, tools)
+    (encode_messages(tok, m, messages, tools), false)
 }
 
 /// Encode OpenAI messages via a resolved Jinja chat template, then
@@ -1364,7 +1364,7 @@ fn encode_messages_jinja(
     tools: Option<&Vec<serde_json::Value>>,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<&str>,
-) -> Result<Vec<u32>, String> {
+) -> Result<(Vec<u32>, bool), String> {
     // DeepSeek V4 speaks DSML; Poolside Laguna speaks arg_key/arg_value XML.
     // Replaying the wrong dialect leaves the model stuck after MCP dispatch.
     let dsml = tool_calls::is_dsml_template(&template.template);
@@ -1499,7 +1499,15 @@ After tool results arrive in <tool_response>, base your answer only on them.",
     if std::env::var_os("PULSAR_DEBUG_CHAT").is_some() {
         eprintln!("pulsar-serve: jinja prompt:\n{rendered}");
     }
-    Ok(tok.encode_with_specials(&rendered))
+    // Template truth beats style tables: when the rendered prompt ends
+    // inside an open <think> block (Qwen3.8's default, GLM's, Laguna's),
+    // the reply STARTS as reasoning and the first </think> closes it -
+    // the split sites need to know regardless of ChatStyle.
+    let opened = rendered.trim_end().ends_with("<think>");
+    if std::env::var_os("PULSAR_DEBUG_CHAT").is_some() {
+        eprintln!("pulsar-serve: open_think={opened} tail={:?}", &rendered[rendered.len().saturating_sub(24)..]);
+    }
+    Ok((tok.encode_with_specials(&rendered), opened))
 }
 
 /// Encode OpenAI messages as a Hy3 context: bos, system text, then per
@@ -1839,7 +1847,7 @@ fn handle_chat(
             reasoning_effort.as_deref(),
         )
     };
-    let prompt = encode(messages);
+    let (prompt, jinja_open_think) = encode(messages);
     if std::env::var_os("PULSAR_DEBUG_IDS").is_some() {
         eprintln!("pulsar-serve: prompt ids {prompt:?}");
     }
@@ -1990,7 +1998,7 @@ fn handle_chat(
         let mut hdr_buf: Vec<u8> = Vec::new();
         // GLM opens the think block in the PROMPT, so the stream begins
         // inside reasoning and the first </think> ends it.
-        let open_think = markers.opens_thinking();
+        let open_think = markers.opens_thinking() || jinja_open_think;
         let mut reasoning = open_think;
         let mut rbytes: Vec<u8> = Vec::new();
         engine::generate_cancellable(
@@ -2156,7 +2164,7 @@ fn handle_chat(
         let mut prev_calls: Vec<(String, String)> = Vec::new();
         let mut empty_nudge_used = false;
         for turn in 0..MAX_TURNS {
-            let tp = encode(&msgs);
+            let (tp, _) = encode(&msgs);
             if tp.len() as u32 + 2 >= st.ctx() {
                 eprintln!(
                     "pulsar-serve: {id}: context exceeded after tool turn {turn} ({} tokens)",
@@ -2218,7 +2226,7 @@ fn handle_chat(
                     full.len()
                 );
             }
-            let (r, c2) = if markers.opens_thinking() {
+            let (r, c2) = if markers.opens_thinking() || jinja_open_think {
                 split_open_think(&c)
             } else {
                 split_harmony(&c)
