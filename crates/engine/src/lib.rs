@@ -2599,6 +2599,20 @@ mod real {
         Ok(DeviceBuf::from_bytes(&read_tensor_bytes(file, g, name)?)?)
     }
 
+    /// Raw f16 tensor bytes -> device, no dequant (DFlash2 selector
+    /// codebooks: gather tables read as __half by the kernel, kept f16
+    /// to halve their 254MB VRAM cost). Bypasses read_tensor_bytes on
+    /// purpose - its F16-2D branch requantizes to q8_0.
+    fn upload_raw_f16(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        if t.ty != TensorType::F16 {
+            return Err(format!("{name}: expected f16, got {:?}", t.ty).into());
+        }
+        let mut buf = vec![0u8; t.n_elements() as usize * 2];
+        file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+        Ok(DeviceBuf::from_bytes(&buf)?)
+    }
+
     /// FFN tensor-parallel shards (PULSAR_TP=1, dense qwen35): card B's
     /// halves. gate/up hold output rows [half..n_ff), down holds input
     /// blocks [half..) of every row repacked contiguously. Card A's

@@ -904,6 +904,33 @@ struct DsparkHeads {
     conf_bias: f32,
 }
 
+/// DFlash2 (incoai) additions to the v1 draft: grouped block-convs
+/// wrapping each layer's attention and MLP, and the candidate selector
+/// (top-k head candidates chain-walked with codebook edge scores).
+/// None on v1 drafts.
+struct Dflash2W {
+    /// per layer: attn conv (base f32 [2][taps][n_embd], proj q8), then
+    /// ffn conv (base, proj)
+    conv: Vec<(DeviceBuf, DeviceBuf, DeviceBuf, DeviceBuf)>,
+    hproj: DeviceBuf, // q8 [n_embd -> rank]
+    pred: DeviceBuf,  // f16 raw [vocab][rank] predecessor codebook
+    succ: DeviceBuf,  // f16 raw [vocab][rank] successor codebook
+    rank: u32,
+    top_k: u32,
+    taps: u32,
+    group: u32,
+    // scratch
+    coef: DeviceBuf,        // [bs][2*taps*n_groups] projection output
+    hc: DeviceBuf,          // [bs][n_embd] conv output
+    ids: DeviceBuf,         // i32 [bs*top_k] candidate ids
+    vals: DeviceBuf,        // f32 [bs*top_k] candidate logits
+    hp: DeviceBuf,          // [bs][rank] hidden projection
+    pred_g: DeviceBuf,      // [bs*top_k][rank] gathered predecessors
+    succ_g: DeviceBuf,      // [bs*top_k][rank] gathered successors
+    anchor_id: DeviceBuf,   // i32 [1]
+    anchor_pred: DeviceBuf, // [rank]
+}
+
 /// The DFlash block-diffusion draft (lucebox draft_graph semantics).
 /// Shares the TARGET's token embedding and lm head.
 pub struct DraftModel {
@@ -934,6 +961,8 @@ pub struct DraftModel {
     tmp: DeviceBuf, // [16][n_embd]
     /// DSpark markov + confidence heads (None on plain DFlash drafts)
     dspark: Option<DsparkHeads>,
+    /// DFlash2 convs + candidate selector (None on v1 drafts)
+    dflash2: Option<Dflash2W>,
     /// DeepSpec-trained drafts emit NEXT-token rows (row j predicts the
     /// token after slot j); z-lab drafts fill the mask at row j. Detected
     /// from the dspark metadata the converter writes.
@@ -1073,6 +1102,58 @@ impl DraftModel {
             }
             _ => None,
         };
+        // DFlash2: convs + selector, marked by dflash2.selector_rank
+        let dflash2 = match g.arch_meta("dflash2.selector_rank").and_then(gguf::Value::as_u64) {
+            Some(rank) if rank > 0 => {
+                let rank = rank as u32;
+                let top_k = g
+                    .arch_meta("dflash2.selector_top_k")
+                    .and_then(gguf::Value::as_u64)
+                    .unwrap_or(16) as u32;
+                let taps = g
+                    .arch_meta("dflash2.conv_taps")
+                    .and_then(gguf::Value::as_u64)
+                    .unwrap_or(2) as u32;
+                let group = g
+                    .arch_meta("dflash2.conv_group_size")
+                    .and_then(gguf::Value::as_u64)
+                    .unwrap_or(16) as u32;
+                let n_groups = n_embd / group;
+                let mut conv = Vec::with_capacity(n_layer as usize);
+                for il in 0..n_layer {
+                    let t = |suf: &str| format!("blk.{il}.{suf}");
+                    conv.push((
+                        super::upload_as_f32(&file, &g, &t("attn_conv_base"))?,
+                        up(&t("attn_conv_proj.weight"))?,
+                        super::upload_as_f32(&file, &g, &t("ffn_conv_base"))?,
+                        up(&t("ffn_conv_proj.weight"))?,
+                    ));
+                }
+                eprintln!(
+                    "pulsar: dflash2 active (selector rank {rank} top-{top_k}, conv taps {taps} group {group})"
+                );
+                Some(Dflash2W {
+                    conv,
+                    hproj: up("selector_hproj.weight")?,
+                    pred: super::upload_raw_f16(&file, &g, "selector_pred")?,
+                    succ: super::upload_raw_f16(&file, &g, "selector_succ")?,
+                    rank,
+                    top_k,
+                    taps,
+                    group,
+                    coef: f32s(bs * (2 * taps * n_groups) as usize)?,
+                    hc: f32s(bs * n_embd as usize)?,
+                    ids: DeviceBuf::alloc(bs * top_k as usize * 4)?,
+                    vals: f32s(bs * top_k as usize)?,
+                    hp: f32s(bs * rank as usize)?,
+                    pred_g: f32s(bs * (top_k * rank) as usize)?,
+                    succ_g: f32s(bs * (top_k * rank) as usize)?,
+                    anchor_id: DeviceBuf::alloc(4)?,
+                    anchor_pred: f32s(rank as usize)?,
+                })
+            }
+            _ => None,
+        };
         Ok(DraftModel {
             fc: up("dflash_fc.weight")?,
             hidden_norm: up("dflash_hidden_norm.weight")?,
@@ -1099,6 +1180,7 @@ impl DraftModel {
             ffm: f32s(bs * ff as usize)?,
             tmp: f32s(bs * n_embd as usize)?,
             dspark,
+            dflash2,
             next_rows,
         })
     }
@@ -2080,16 +2162,27 @@ impl Model {
         let kv_dim = d.n_kv * d.head_dim;
         let q_dim = d.n_head * d.head_dim;
         let total_k = (w_eff + bs) as u32;
-        for l in &d.layers {
+        let n_groups = d.dflash2.as_ref().map_or(0, |d2| s.n_embd / d2.group);
+        for (il, l) in d.layers.iter().enumerate() {
             kernels::rms_norm(&mut d.hn, &d.h, &l.attn_norm, s.n_embd, bs as u32, eps)?;
-            // K/V: context rows from features, block rows from hn
+            // DFlash2: grouped block-conv between the norm and the
+            // projections (prepare side); the SAME projection output
+            // also carries the finish side's deltas, kept in d2.coef
+            if let Some(d2) = d.dflash2.as_mut() {
+                let (ab, ap, _, _) = &d2.conv[il];
+                kernels::matmul_q8_0(&mut d2.coef, ap, &d.hn, s.n_embd, 2 * d2.taps * n_groups, bs as u32)?;
+                kernels::qwen35_dflash2_conv(&mut d2.hc, &d.hn, &d2.coef, ab, bs as u32, s.n_embd, d2.taps, d2.group, 0)?;
+            }
+            let blk = d.dflash2.as_ref().map_or(&d.hn, |d2| &d2.hc);
+            // K/V: context rows from features, block rows from the
+            // (possibly convolved) normed block
             kernels::matmul_q8_0(&mut d.kcat, &l.wk, &d.feat, s.n_embd, kv_dim, w_eff as u32)?;
-            kernels::matmul_q8_0_off(&mut d.kcat, w_eff * kv_dim as usize * 4, &l.wk, 0, &d.hn, 0, s.n_embd, kv_dim, bs as u32)?;
+            kernels::matmul_q8_0_off(&mut d.kcat, w_eff * kv_dim as usize * 4, &l.wk, 0, blk, 0, s.n_embd, kv_dim, bs as u32)?;
             kernels::matmul_q8_0(&mut d.vcat, &l.wv, &d.feat, s.n_embd, kv_dim, w_eff as u32)?;
-            kernels::matmul_q8_0_off(&mut d.vcat, w_eff * kv_dim as usize * 4, &l.wv, 0, &d.hn, 0, s.n_embd, kv_dim, bs as u32)?;
+            kernels::matmul_q8_0_off(&mut d.vcat, w_eff * kv_dim as usize * 4, &l.wv, 0, blk, 0, s.n_embd, kv_dim, bs as u32)?;
             kernels::gqa_head_rms_norm(&mut d.kcat, Some(&l.k_norm), total_k * d.n_kv, d.head_dim, eps)?;
             // Q from the block only
-            kernels::matmul_q8_0(&mut d.q, &l.wq, &d.hn, s.n_embd, q_dim, bs as u32)?;
+            kernels::matmul_q8_0(&mut d.q, &l.wq, blk, s.n_embd, q_dim, bs as u32)?;
             kernels::gqa_head_rms_norm(&mut d.q, Some(&l.q_norm), bs as u32 * d.n_head, d.head_dim, eps)?;
             // plain neox rope, full head, rebased positions
             kernels::qwen35_rope_yarn(&mut d.kcat, total_k, d.n_kv, d.head_dim, 0, &d.rope)?;
@@ -2101,14 +2194,37 @@ impl Model {
                 1.0 / (d.head_dim as f32).sqrt(),
             )?;
             kernels::matmul_q8_0(&mut d.tmp, &l.wo, &d.attn, q_dim, s.n_embd, bs as u32)?;
-            kernels::add_assign(&mut d.h, &d.tmp, bs as u32 * s.n_embd)?;
+            if let Some(d2) = d.dflash2.as_mut() {
+                // finish side of the attention conv, then add
+                let (ab, _, _, _) = &d2.conv[il];
+                kernels::qwen35_dflash2_conv(&mut d2.hc, &d.tmp, &d2.coef, ab, bs as u32, s.n_embd, d2.taps, d2.group, 1)?;
+            }
+            if let Some(d2) = d.dflash2.as_ref() {
+                kernels::add_assign(&mut d.h, &d2.hc, bs as u32 * s.n_embd)?;
+            } else {
+                kernels::add_assign(&mut d.h, &d.tmp, bs as u32 * s.n_embd)?;
+            }
             // FFN
             kernels::rms_norm(&mut d.hn, &d.h, &l.ffn_norm, s.n_embd, bs as u32, eps)?;
-            kernels::matmul_q8_0(&mut d.ffa, &l.gate, &d.hn, s.n_embd, d.ff, bs as u32)?;
-            kernels::matmul_q8_0(&mut d.ffb, &l.up, &d.hn, s.n_embd, d.ff, bs as u32)?;
+            if let Some(d2) = d.dflash2.as_mut() {
+                let (_, _, fb, fp) = &d2.conv[il];
+                kernels::matmul_q8_0(&mut d2.coef, fp, &d.hn, s.n_embd, 2 * d2.taps * n_groups, bs as u32)?;
+                kernels::qwen35_dflash2_conv(&mut d2.hc, &d.hn, &d2.coef, fb, bs as u32, s.n_embd, d2.taps, d2.group, 0)?;
+            }
+            let blk = d.dflash2.as_ref().map_or(&d.hn, |d2| &d2.hc);
+            kernels::matmul_q8_0(&mut d.ffa, &l.gate, blk, s.n_embd, d.ff, bs as u32)?;
+            kernels::matmul_q8_0(&mut d.ffb, &l.up, blk, s.n_embd, d.ff, bs as u32)?;
             kernels::swiglu(&mut d.ffm, &d.ffa, &d.ffb, bs as u32 * d.ff, 0.0, 1.0, 0)?;
             kernels::matmul_q8_0(&mut d.tmp, &l.down, &d.ffm, d.ff, s.n_embd, bs as u32)?;
-            kernels::add_assign(&mut d.h, &d.tmp, bs as u32 * s.n_embd)?;
+            if let Some(d2) = d.dflash2.as_mut() {
+                let (_, _, fb, _) = &d2.conv[il];
+                kernels::qwen35_dflash2_conv(&mut d2.hc, &d.tmp, &d2.coef, fb, bs as u32, s.n_embd, d2.taps, d2.group, 1)?;
+            }
+            if let Some(d2) = d.dflash2.as_ref() {
+                kernels::add_assign(&mut d.h, &d2.hc, bs as u32 * s.n_embd)?;
+            } else {
+                kernels::add_assign(&mut d.h, &d.tmp, bs as u32 * s.n_embd)?;
+            }
         }
         // final norm -> target lm head (head_logits reads st.normed)
         kernels::rms_norm(&mut st.normed, &d.h, &d.out_norm, s.n_embd, bs as u32, eps)?;
@@ -2119,6 +2235,54 @@ impl Model {
         // j-1 (row 0 is keyed on the anchor token); z-lab mask-fill rows
         // read slot j from row j.
         let row_of = |j: usize| if d.next_rows { j - 1 } else { j };
+        // DFlash2 candidate selection: per row, top-k head candidates;
+        // then a greedy chain walk where each slot's score is its head
+        // logit plus a bigram edge term (predecessor codebook row of the
+        // previous pick, gated by the hidden projection, dotted with the
+        // candidate's successor row). PULSAR_NO_DFLASH2_SEL=1 falls back
+        // to plain per-row argmax (isolates conv gain from selector gain).
+        if d.dflash2.is_some() && std::env::var_os("PULSAR_NO_DFLASH2_SEL").is_none() {
+            let d2 = d.dflash2.as_mut().unwrap();
+            let k = d2.top_k;
+            for it in 0..k {
+                kernels::qwen35_dflash2_topk_step(&mut st.logits, bs as u32, s.n_vocab, it, k, &mut d2.ids, &mut d2.vals)?;
+            }
+            kernels::matmul_q8_0(&mut d2.hp, &d2.hproj, &st.normed, s.n_embd, d2.rank, bs as u32)?;
+            kernels::qwen35_dflash2_gather(&mut d2.succ_g, &d2.succ, &d2.ids, bs as u32 * k, d2.rank)?;
+            kernels::qwen35_dflash2_gather(&mut d2.pred_g, &d2.pred, &d2.ids, bs as u32 * k, d2.rank)?;
+            d2.anchor_id.write(0, kernels::as_bytes(&[last_tok as i32]))?;
+            kernels::qwen35_dflash2_gather(&mut d2.anchor_pred, &d2.pred, &d2.anchor_id, 1, d2.rank)?;
+            kernels::sync()?;
+            let (ku, ru) = (k as usize, d2.rank as usize);
+            let ids_h = d2.ids.read_i32(bs * ku)?;
+            let vals_h = d2.vals.read_f32(bs * ku)?;
+            let hp_h = d2.hp.read_f32(bs * ru)?;
+            let pred_h = d2.pred_g.read_f32(bs * ku * ru)?;
+            let succ_h = d2.succ_g.read_f32(bs * ku * ru)?;
+            let mut prev: Vec<f32> = d2.anchor_pred.read_f32(ru)?;
+            let mut out = vec![last_tok; bs];
+            for j in 1..bs {
+                let r = row_of(j);
+                let hprow = &hp_h[r * ru..(r + 1) * ru];
+                let mut best = f32::NEG_INFINITY;
+                let mut best_c = 0usize;
+                for c in 0..ku {
+                    let succ_row = &succ_h[(r * ku + c) * ru..(r * ku + c + 1) * ru];
+                    let mut edge = 0.0f32;
+                    for i in 0..ru {
+                        edge += prev[i] * hprow[i] * succ_row[i];
+                    }
+                    let sc = vals_h[r * ku + c] + edge;
+                    if sc > best {
+                        best = sc;
+                        best_c = c;
+                    }
+                }
+                out[j] = ids_h[r * ku + best_c] as u32;
+                prev = pred_h[(r * ku + best_c) * ru..(r * ku + best_c + 1) * ru].to_vec();
+            }
+            return Ok(out);
+        }
         if let Some(dk) = &mut d.dspark {
             // markov-biased greedy: each slot's argmax includes the
             // w2 @ w1[prev] bigram bias, sequenced on the previous pick

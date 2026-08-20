@@ -41,7 +41,20 @@ LAYER_RENAME = {
     "mlp.gate_proj.weight": "ffn_gate.weight",
     "mlp.up_proj.weight": "ffn_up.weight",
     "mlp.down_proj.weight": "ffn_down.weight",
+    # DFlash2 (incoai): grouped block-convs wrapping attention and mlp
+    "attention_conv.base_kernel": "attn_conv_base",
+    "attention_conv.kernel_projection.weight": "attn_conv_proj.weight",
+    "mlp_conv.base_kernel": "ffn_conv_base",
+    "mlp_conv.kernel_projection.weight": "ffn_conv_proj.weight",
 }
+# DFlash2 candidate selector (model level). Codebooks are GATHER tables
+# (indexed by token id), not matmul weights: stored F16 raw.
+RENAME.update({
+    "candidate_selector.hidden_projection.weight": "selector_hproj.weight",
+    "candidate_selector.predecessor_codebook": "selector_pred",
+    "candidate_selector.successor_codebook": "selector_succ",
+})
+F16_RAW = {"selector_pred", "selector_succ"}
 SKIP = {"embed_tokens.weight", "lm_head.weight"}
 
 
@@ -64,13 +77,16 @@ def main():
     rp = cfg.get("rope_parameters") or {}
     rope_theta = float(cfg.get("rope_theta") or rp["rope_theta"])
     w.add_float32("dflash-draft.rope.freq_base", rope_theta)
+    is_dflash2 = "selector_rank" in dfc
     if rp.get("rope_type") == "yarn":
         w.add_float32("dflash-draft.rope.scaling.factor", float(rp["factor"]))
         w.add_uint32(
             "dflash-draft.rope.scaling.original_context_length",
             int(rp["original_max_position_embeddings"]),
         )
-    elif int(cfg.get("max_position_embeddings", 0)) == 262144:
+    elif int(cfg.get("max_position_embeddings", 0)) == 262144 and not is_dflash2:
+        # NOT for DFlash2: the Qwen3.8-27B target is NATIVE 262k (no
+        # yarn), rope_type "default" means what it says there.
         # z-lab drafts train with the TARGET's yarn (factor 64 over a
         # 4096 native window) even though the HF config says "default";
         # the known-good 35B conversion carried exactly these values
@@ -92,6 +108,11 @@ def main():
             "dflash-draft.dspark.confidence_with_markov",
             bool(cfg.get("confidence_head_with_markov")),
         )
+    if is_dflash2:
+        w.add_uint32("dflash-draft.dflash2.selector_rank", int(dfc["selector_rank"]))
+        w.add_uint32("dflash-draft.dflash2.selector_top_k", int(dfc["selector_top_k"]))
+        w.add_uint32("dflash-draft.dflash2.conv_taps", int(dfc["conv_kernel_size"]))
+        w.add_uint32("dflash-draft.dflash2.conv_group_size", int(dfc["conv_group_size"]))
 
     files = sorted(src.glob("*.safetensors"))
     # confidence bias is a scalar: carry it in metadata, not as a tensor
@@ -121,7 +142,12 @@ def main():
                 # matrices must be Q8_0: the engine's upload path passes
                 # F16 through RAW and the q8_0 matmuls would read noise.
                 # confidence_proj stays F16 (host-side reader).
-                if out_name == "confidence_proj.weight":
+                if out_name in F16_RAW:
+                    w.add_tensor(out_name, data.astype(np.float16))
+                elif out_name.endswith("_conv_base"):
+                    # [2][taps][hidden] coefficient bases: f32, read raw
+                    w.add_tensor(out_name, data.astype(np.float32))
+                elif out_name == "confidence_proj.weight":
                     w.add_tensor(out_name, data.astype(np.float16))
                 elif data.ndim >= 2:
                     q = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q8_0)

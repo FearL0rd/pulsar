@@ -166,6 +166,9 @@ mod real {
         fn pulsar_qwen35_gdn_batch(out: *mut c_void, state: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, g: *const c_void, beta: *const c_void, h_v: u32, h_k: u32, dim: u32, n_tok: u32) -> i32;
         fn pulsar_qwen35_row_scale(x: *mut c_void, s: *const c_void, n_rows: u32, dim: u32) -> i32;
         fn pulsar_qwen35_draft_attn(out: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, n_q: u32, n_kv: u32, n_head: u32, n_kv_head: u32, dim: u32, scale: f32) -> i32;
+        fn pulsar_qwen35_dflash2_conv(out: *mut c_void, h: *const c_void, delta: *const c_void, base: *const c_void, n_tok: u32, n_embd: u32, taps: u32, group: u32, side: u32) -> i32;
+        fn pulsar_qwen35_dflash2_topk_step(logits: *mut c_void, n_rows: u32, vocab: u32, it: u32, k: u32, ids: *mut c_void, vals: *mut c_void) -> i32;
+        fn pulsar_qwen35_dflash2_gather(out: *mut c_void, book: *const c_void, ids: *const c_void, n: u32, rank: u32) -> i32;
         fn pulsar_qwen35_rope_yarn(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, pos0: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, n_ctx_orig: u32) -> i32;
         fn pulsar_qwen35_split_qkv(q: *mut c_void, k: *mut c_void, v: *mut c_void, x: *const c_void, n_tok: u32, key_dim: u32, value_dim: u32) -> i32;
         fn pulsar_qwen35_ring_scatter(ring: *mut c_void, src: *const c_void, pos: u32, cap: u32, n_rows: u32, row_elems: u32, ring_stride: u32, ring_off: u32) -> i32;
@@ -1537,6 +1540,23 @@ mod real {
 
     /// Non-causal GQA attention over contiguous K/V rows (DFlash draft).
     #[allow(clippy::too_many_arguments)]
+    /// DFlash2 grouped block-conv (side 0 = prepare, 1 = finish). `delta`
+    /// is the kernel-projection output [n_tok][2][taps][n_embd/group].
+    pub fn qwen35_dflash2_conv(out: &mut DeviceBuf, h: &DeviceBuf, delta: &DeviceBuf, base: &DeviceBuf, n_tok: u32, n_embd: u32, taps: u32, group: u32, side: u32) -> Result {
+        check(unsafe { pulsar_qwen35_dflash2_conv(out.ptr_mut(), h.ptr(), delta.ptr(), base.ptr(), n_tok, n_embd, taps, group, side) }, "qwen35_dflash2_conv")
+    }
+
+    /// One row-wise top-k extraction step: record slot `it` and mask it.
+    /// Destructive on `logits`. k calls give each row's top-k ids/values.
+    pub fn qwen35_dflash2_topk_step(logits: &mut DeviceBuf, n_rows: u32, vocab: u32, it: u32, k: u32, ids: &mut DeviceBuf, vals: &mut DeviceBuf) -> Result {
+        check(unsafe { pulsar_qwen35_dflash2_topk_step(logits.ptr_mut(), n_rows, vocab, it, k, ids.ptr_mut(), vals.ptr_mut()) }, "qwen35_dflash2_topk_step")
+    }
+
+    /// Gather f16 codebook rows by token id into f32: out[i] = book[ids[i]].
+    pub fn qwen35_dflash2_gather(out: &mut DeviceBuf, book: &DeviceBuf, ids: &DeviceBuf, n: u32, rank: u32) -> Result {
+        check(unsafe { pulsar_qwen35_dflash2_gather(out.ptr_mut(), book.ptr(), ids.ptr(), n, rank) }, "qwen35_dflash2_gather")
+    }
+
     pub fn qwen35_draft_attn(out: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, n_q: u32, n_kv: u32, n_head: u32, n_kv_head: u32, dim: u32, scale: f32) -> Result {
         check(unsafe { pulsar_qwen35_draft_attn(out.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), n_q, n_kv, n_head, n_kv_head, dim, scale) }, "qwen35_draft_attn")
     }

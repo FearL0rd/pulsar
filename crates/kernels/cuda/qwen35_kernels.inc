@@ -428,6 +428,124 @@ extern "C" int pulsar_qwen35_draft_attn(
     return cuda_ok(cudaGetLastError(), "qwen35 draft attn launch");
 }
 
+/* ---- DFlash2 (incoai) draft additions ---------------------------------- */
+
+/* Grouped block-conv wrapping the draft's attention and MLP: for row p
+ * of ONE draft block (position == row),
+ *   out[p][c] = sum_t (base[side][t][c] + delta[p][side][t][g(c)]) * h[p-t][c]
+ * for t < taps and p >= t. `delta` is the kernel-projection output row
+ * laid out [p][2][taps][n_groups]; `side` 0 = prepare (before attn/mlp),
+ * 1 = finish (after), selecting both the base plane and the delta half. */
+__global__ static void qwen35_dflash2_conv_kernel(
+        float *out, const float *h, const float *delta, const float *base,
+        uint32_t n_tok, uint32_t n_embd, uint32_t taps, uint32_t group,
+        uint32_t side) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)n_tok * n_embd;
+    if (idx >= total) return;
+    const uint32_t p = idx / n_embd, c = idx % n_embd;
+    const uint32_t n_groups = n_embd / group;
+    const float *dp = delta + ((uint64_t)p * 2u + side) * taps * n_groups;
+    const float *bp = base + (uint64_t)side * taps * n_embd;
+    float acc = 0.0f;
+    for (uint32_t t = 0; t < taps && t <= p; t++) {
+        acc += (bp[t * n_embd + c] + dp[t * n_groups + c / group])
+               * h[(uint64_t)(p - t) * n_embd + c];
+    }
+    out[idx] = acc;
+}
+
+extern "C" int pulsar_qwen35_dflash2_conv(
+        void *out_dev, const void *h_dev, const void *delta_dev,
+        const void *base_dev, uint32_t n_tok, uint32_t n_embd,
+        uint32_t taps, uint32_t group, uint32_t side) {
+    if (!out_dev || !h_dev || !delta_dev || !base_dev || n_tok == 0 ||
+        n_embd == 0 || taps == 0 || taps > 8u || group == 0 ||
+        n_embd % group != 0 || side > 1u || out_dev == h_dev) {
+        return 0;
+    }
+    const uint64_t total = (uint64_t)n_tok * n_embd;
+    qwen35_dflash2_conv_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)out_dev, (const float *)h_dev, (const float *)delta_dev,
+            (const float *)base_dev, n_tok, n_embd, taps, group, side);
+    return cuda_ok(cudaGetLastError(), "qwen35 dflash2 conv launch");
+}
+
+/* One top-k step over the draft's logits rows: per row, argmax over the
+ * vocab, record (id, value) at slot `it`, then mask the id to -inf so
+ * the next call yields the next candidate. k calls = row-wise top-k
+ * with no host round-trips. */
+__global__ static void qwen35_dflash2_topk_step_kernel(
+        float *logits, uint32_t vocab, uint32_t it, uint32_t k,
+        int32_t *ids, float *vals) {
+    const uint32_t row = blockIdx.x;
+    float *lr = logits + (uint64_t)row * vocab;
+    float best = -INFINITY;
+    uint32_t best_i = 0;
+    for (uint32_t i = threadIdx.x; i < vocab; i += blockDim.x) {
+        const float v = lr[i];
+        if (v > best) { best = v; best_i = i; }
+    }
+    __shared__ float sv[256];
+    __shared__ uint32_t si[256];
+    sv[threadIdx.x] = best;
+    si[threadIdx.x] = best_i;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            /* strict > with lower-index tie-break, matching argmax_rows */
+            if (sv[threadIdx.x + stride] > sv[threadIdx.x] ||
+                (sv[threadIdx.x + stride] == sv[threadIdx.x] &&
+                 si[threadIdx.x + stride] < si[threadIdx.x])) {
+                sv[threadIdx.x] = sv[threadIdx.x + stride];
+                si[threadIdx.x] = si[threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        ids[(uint64_t)row * k + it] = (int32_t)si[0];
+        vals[(uint64_t)row * k + it] = sv[0];
+        lr[si[0]] = -INFINITY;
+    }
+}
+
+extern "C" int pulsar_qwen35_dflash2_topk_step(
+        void *logits_dev, uint32_t n_rows, uint32_t vocab, uint32_t it,
+        uint32_t k, void *ids_dev, void *vals_dev) {
+    if (!logits_dev || !ids_dev || !vals_dev || n_rows == 0 || vocab == 0 ||
+        k == 0 || it >= k) {
+        return 0;
+    }
+    qwen35_dflash2_topk_step_kernel<<<n_rows, 256>>>(
+            (float *)logits_dev, vocab, it, k, (int32_t *)ids_dev,
+            (float *)vals_dev);
+    return cuda_ok(cudaGetLastError(), "qwen35 dflash2 topk launch");
+}
+
+/* Gather f16 codebook rows (by token id) into an f32 buffer:
+ * out[i][r] = (float)book[ids[i]][r]. */
+__global__ static void qwen35_dflash2_gather_kernel(
+        float *out, const __half *book, const int32_t *ids,
+        uint32_t n, uint32_t rank) {
+    const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)n * rank;
+    if (idx >= total) return;
+    const uint32_t i = idx / rank, r = idx % rank;
+    out[idx] = __half2float(book[(uint64_t)ids[i] * rank + r]);
+}
+
+extern "C" int pulsar_qwen35_dflash2_gather(
+        void *out_dev, const void *book_dev, const void *ids_dev,
+        uint32_t n, uint32_t rank) {
+    if (!out_dev || !book_dev || !ids_dev || n == 0 || rank == 0) return 0;
+    const uint64_t total = (uint64_t)n * rank;
+    qwen35_dflash2_gather_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)out_dev, (const __half *)book_dev,
+            (const int32_t *)ids_dev, n, rank);
+    return cuda_ok(cudaGetLastError(), "qwen35 dflash2 gather launch");
+}
+
 /* Split the conv output rows [t][2*key+value] into contiguous q/k/v
  * batch buffers in ONE launch (replaces 3*t blocking d2d copies). */
 __global__ static void qwen35_split_qkv_kernel(
