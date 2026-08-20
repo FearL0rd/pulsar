@@ -682,6 +682,113 @@ pub fn quantize_row_q6_k(x: &[f32], out: &mut Vec<u8>) {
 /// Quantize one logical row into `out` as `ty`. `qw` = per-column imatrix
 /// weights; required for iq2_xxs, ignored elsewhere (stage 2 keeps the
 /// K-quant paths imatrix-free like llama-quantize without one).
+// --------------------------------------------------------------- nvfp4
+
+/// The doubled-e2m1 codebook the CUDA side dots with (mxfp4_lookup4):
+/// nibbles 0..7 = {0,1,2,3,4,6,8,12}, 8..15 their negatives. Real
+/// values are half these; the reader's ue4m3_half carries the /2.
+const NVFP4_KV: [i32; 8] = [0, 1, 2, 3, 4, 6, 8, 12];
+
+/// UE4M3 decode, mirroring the CUDA ue4m3_half WITHOUT the /2 (the
+/// encoder works in doubled-codebook space): unsigned, 4 exponent bits
+/// (bias 7), 3 mantissa bits, 0 and 0x7F decode to zero.
+pub fn ue4m3_to_f32(x: u8) -> f32 {
+    if x == 0 || x == 0x7F {
+        return 0.0;
+    }
+    let exp = (x >> 3) & 0xF;
+    let man = (x & 7) as f32;
+    if exp == 0 {
+        man * (-9f32).exp2()
+    } else {
+        (1.0 + man / 8.0) * ((exp as i32 - 7) as f32).exp2()
+    }
+}
+
+/// Smallest UE4M3 value >= `target` (never rounds down: a sub-block's
+/// max must stay encodable as +-6 x scale, so clipping is not allowed).
+fn ue4m3_ceil(target: f32) -> u8 {
+    if target <= 0.0 {
+        return 0;
+    }
+    for byte in 1..0x7Fu8 {
+        if ue4m3_to_f32(byte) >= target {
+            return byte;
+        }
+    }
+    0x7E // largest finite; caller's values clamp into the codebook
+}
+
+/// 64 elems -> 36 bytes (gguf type 40, the layout dev_dot_nvfp4 reads):
+/// 4 UE4M3 sub-block scale bytes, then 4 x 8 nibble bytes; within a
+/// sub-block low nibbles are values 0..7 and high nibbles 8..15.
+/// Per 16-value sub-block: scale = smallest UE4M3 >= max|x|/6 (e2m1
+/// tops out at 6), values snap to the nearest codebook entry.
+pub fn quantize_row_nvfp4(x: &[f32], out: &mut Vec<u8>) {
+    for blk in x.chunks(64) {
+        let mut scales = [0u8; 4];
+        let mut nibs = [0u8; 32];
+        for sub in 0..4 {
+            let lo = sub * 16;
+            if lo >= blk.len() {
+                continue;
+            }
+            let sb = &blk[lo..(lo + 16).min(blk.len())];
+            let amax = sb.iter().fold(0f32, |a, &v| a.max(v.abs()));
+            if amax == 0.0 {
+                continue;
+            }
+            // max |value| the reader can produce is ue4m3_half(s) * 12
+            // = ue4m3(s) * 6, so the scale must satisfy ue4m3(s) >= amax/6
+            let s = ue4m3_ceil(amax / 6.0);
+            scales[sub] = s;
+            let sv = ue4m3_to_f32(s) * 0.5; // ue4m3_half, like the reader
+            if sv == 0.0 {
+                continue;
+            }
+            for (i, &v) in sb.iter().enumerate() {
+                // reader computes value = sv * KV[j], so the target
+                // codebook entry is |v|/sv, compared in doubled units
+                let t = (v / sv).abs();
+                let mut best = 0usize;
+                let mut best_e = f32::INFINITY;
+                for (j, &kv) in NVFP4_KV.iter().enumerate() {
+                    let e = (t - kv as f32).abs();
+                    if e < best_e {
+                        best_e = e;
+                        best = j;
+                    }
+                }
+                let idx = if v < 0.0 && best != 0 { best + 8 } else { best } as u8;
+                let byte = sub * 8 + (i % 8);
+                if i < 8 {
+                    nibs[byte] |= idx; // low nibble: values 0..7
+                } else {
+                    nibs[byte] |= idx << 4; // high nibble: values 8..15
+                }
+            }
+        }
+        out.extend_from_slice(&scales);
+        out.extend_from_slice(&nibs);
+    }
+}
+
+/// CPU mirror of dev_dot's dequant for tests and cross-checks.
+pub fn dequant_row_nvfp4(raw: &[u8], out: &mut Vec<f32>) {
+    for blk in raw.chunks(36) {
+        for sub in 0..4 {
+            let s = ue4m3_to_f32(blk[sub]) * 0.5;
+            for i in 0..16 {
+                let byte = blk[4 + sub * 8 + (i % 8)];
+                let nib = if i < 8 { byte & 0xF } else { byte >> 4 };
+                let mag = NVFP4_KV[(nib & 7) as usize] as f32;
+                let v = if nib & 8 != 0 { -mag } else { mag };
+                out.push(v * s);
+            }
+        }
+    }
+}
+
 pub fn quantize_row(
     ty: gguf::TensorType,
     x: &[f32],
@@ -699,6 +806,7 @@ pub fn quantize_row(
             let qw = qw.ok_or("iq2_xxs requires an imatrix (--imatrix)")?;
             iq::quantize_row_iq2_xxs(x, qw, out);
         }
+        gguf::TensorType::NVFP4 => quantize_row_nvfp4(x, out),
         gguf::TensorType::F32 => out.extend(x.iter().flat_map(|v| v.to_le_bytes())),
         gguf::TensorType::F16 => out.extend(x.iter().flat_map(|v| f32_to_f16(*v).to_le_bytes())),
         other => return Err(format!("no encoder for {other:?}")),
@@ -710,6 +818,41 @@ pub fn quantize_row(
 
 #[cfg(test)]
 mod tests {
+    /// nvfp4 round trip: encode -> CPU mirror of the CUDA dequant. The
+    /// worst-case relative error per value is bounded by the e2m1 grid
+    /// (~25% mid-grid step) but block max values land exactly when the
+    /// UE4M3 ceil is tight; the mean must sit well under one grid step.
+    #[test]
+    fn nvfp4_round_trip() {
+        let mut x = Vec::new();
+        for i in 0..512 {
+            let v = ((i * 37) % 97) as f32 * 0.013 - 0.6;
+            x.push(v * if i % 3 == 0 { -1.0 } else { 1.0 });
+        }
+        let mut enc = Vec::new();
+        super::quantize_row_nvfp4(&x, &mut enc);
+        assert_eq!(enc.len(), 512 / 64 * 36);
+        let mut dec = Vec::new();
+        super::dequant_row_nvfp4(&enc, &mut dec);
+        assert_eq!(dec.len(), 512);
+        // e2m1 is a 8-magnitude grid: values between the bottom grid
+        // points carry ~50% relative error by construction (why the LM
+        // head stays q5_k), so the gate is aggregate RMSE like the other
+        // format tests, not per-value relative error.
+        let mut se = 0.0f64;
+        let mut sx = 0.0f64;
+        for (a, b) in x.iter().zip(&dec) {
+            se += ((a - b) as f64).powi(2);
+            sx += (*a as f64).powi(2);
+        }
+        let ratio = (se / sx).sqrt();
+        assert!(ratio < 0.12, "rmse/rms ratio {ratio}");
+        // zeros stay exactly zero and encode to zero scale bytes
+        let mut ze = Vec::new();
+        super::quantize_row_nvfp4(&[0.0; 64], &mut ze);
+        assert!(ze.iter().all(|&b| b == 0));
+    }
+
     use super::*;
 
     // test-side dequantizers, written from the ggml layout spec (the same

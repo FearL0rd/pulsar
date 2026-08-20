@@ -34,9 +34,10 @@ fn parse_type(s: &str) -> Result<TensorType, String> {
         "q5_k" => TensorType::Q5K,
         "q6_k" => TensorType::Q6K,
         "iq2_xxs" => TensorType::IQ2XXS,
+        "nvfp4" => TensorType::NVFP4,
         "f16" => TensorType::F16,
         "f32" => TensorType::F32,
-        other => return Err(format!("unknown target type {other} (stage 1: q8_0 q2_k..q6_k f16 f32)")),
+        other => return Err(format!("unknown target type {other} (q8_0 q2_k..q6_k iq2_xxs nvfp4 f16 f32)")),
     })
 }
 
@@ -244,6 +245,9 @@ fn run() -> Result<(), String> {
         let ok = match want {
             TensorType::Q2K | TensorType::Q3K | TensorType::Q4K | TensorType::Q5K
             | TensorType::Q6K | TensorType::IQ2XXS => row.is_multiple_of(256),
+            // the kq GEMM/dot paths walk nvfp4 rows in 144B super-blocks
+            // of 256 values, so the row needs the same 256 alignment
+            TensorType::NVFP4 => row.is_multiple_of(256),
             TensorType::Q8_0 => row.is_multiple_of(32),
             _ => true,
         };
