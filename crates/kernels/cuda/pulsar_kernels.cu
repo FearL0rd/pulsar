@@ -894,6 +894,10 @@ extern "C" int pulsar_q8_0_matmul_selftest(void) {
            q8_0_matmul_selftest_one(4256, 40) &&
            q8_0_matmul_selftest_one(4096, 1) &&
            q8_0_matmul_selftest_one(4256, 1) &&
+           /* (4096, 2): blocks%8==0 routes to the v7b cross-word dp4a
+            * GEMV, which is unguarded by cc and had no coverage */
+           q8_0_matmul_selftest_one(4096, 2) &&
+           q8_0_matmul_selftest_one(4256, 2) &&
            q8_0_banked_selftest_one(1) &&
            q8_0_banked_selftest_one(5) &&
            q8_0_banked_selftest_one(16);
