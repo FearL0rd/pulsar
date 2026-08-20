@@ -4677,11 +4677,21 @@ mod real {
             // out-of-distribution and acceptance collapses with depth
             // (Hy3 measured 30% -> 23% -> 10% at depths 1/3/5)
             let mtp_depth = if mtp.is_some() {
-                std::env::var("PULSAR_MTP_DEPTH")
-                    .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .unwrap_or(1)
-                    .clamp(1, 8)
+                let raw = std::env::var("PULSAR_MTP_DEPTH").ok();
+                let parsed = raw.as_deref().and_then(|v| v.parse::<u32>().ok());
+                let d = parsed.unwrap_or(1).clamp(1, 8);
+                if let Some(r) = raw.as_deref() {
+                    if parsed.is_none() {
+                        eprintln!(
+                            "pulsar: PULSAR_MTP_DEPTH='{r}' not a u32 -> using default {d}"
+                        );
+                    } else {
+                        eprintln!("pulsar: MTP depth={d}");
+                    }
+                } else {
+                    eprintln!("pulsar: MTP depth={d} (default, PULSAR_MTP_DEPTH unset)");
+                }
+                d
             } else {
                 0
             };
@@ -9030,15 +9040,21 @@ mod real {
                 // and re-forwards the accepted prefix.
                 let recurrent = model.shape.family == Family::Qwen35;
                 let t0 = std::time::Instant::now();
+                let mut t_snap = std::time::Duration::ZERO;
                 if recurrent {
+                    let ts = std::time::Instant::now();
                     st.qwen35.as_mut().ok_or("qwen35 state missing")?.gdn_snapshot()?;
+                    t_snap = ts.elapsed();
                 }
                 // qwen35: readback-free verify (device argmax, 4 bytes a
                 // row); other spec families keep the logits readback
+                let mut t_amax = std::time::Duration::ZERO;
                 let row_amax: Vec<u32> = if recurrent {
                     st.skip_logit_read = true;
+                    let tf = std::time::Instant::now();
                     let r = model.forward_rows(st, &chain, pos, (k + 1) as u32);
                     st.skip_logit_read = false;
+                    t_amax = tf.elapsed();
                     r?.ok_or("no verify logits")?;
                     std::mem::take(&mut st.last_argmax)
                 } else {
@@ -9048,6 +9064,12 @@ mod real {
                     (0..=k).map(|i| argmax(&all[i * v..(i + 1) * v])).collect()
                 };
                 t_verify += t0.elapsed();
+                if timing {
+                    eprintln!("mtp step: snap {:.2}ms fwd+amax {:.2}ms total {:.2}ms",
+                        t_snap.as_secs_f64() * 1e3,
+                        t_amax.as_secs_f64() * 1e3,
+                        t0.elapsed().as_secs_f64() * 1e3);
+                }
                 // Per-position draft quality, measured INDEPENDENTLY of
                 // the prefix rule: position i counts as a hit when the
                 // verified argmax equals the drafted token there, even if

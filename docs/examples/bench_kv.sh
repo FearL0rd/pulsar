@@ -35,6 +35,7 @@ MIN_VRAM_MB="${PULSAR_MIN_VRAM_MB:-8192}"
 
 ATTN_FAMILY="$(resolve_attn_family "$MODEL")"
 echo "model family for ATTN: $ATTN_FAMILY${GGUF_ARCH:+ (general.architecture=$GGUF_ARCH)}"
+maybe_enable_mtp "$MODEL"
 
 # ---- host expert cache (auto from MemAvailable) ----
 if [ -n "${PULSAR_CACHE_GB:-}" ]; then

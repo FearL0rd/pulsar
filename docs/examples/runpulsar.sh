@@ -47,6 +47,10 @@ HOST="${HOST:-127.0.0.1}"
 ATTN_FAMILY="$(resolve_attn_family "$MODEL")"
 echo "model family for ATTN: $ATTN_FAMILY${GGUF_ARCH:+ (general.architecture=$GGUF_ARCH)}"
 
+# MTP speculative decode: auto-enable when the model carries a nextn block
+# (PULSAR_MTP=0 to force off, PULSAR_MTP=1 to force on for any reason).
+maybe_enable_mtp "$MODEL"
+
 # ---- host expert cache (auto from MemAvailable) ----
 if [ -n "${PULSAR_CACHE_GB:-}" ]; then
   CACHE_GB="$PULSAR_CACHE_GB"

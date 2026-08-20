@@ -45,6 +45,7 @@ fi
 
 ATTN_FAMILY="$(resolve_attn_family "$MODEL")"
 echo "model family for ATTN: $ATTN_FAMILY${GGUF_ARCH:+ (general.architecture=$GGUF_ARCH)}"
+maybe_enable_mtp "$MODEL"
 
 # shellcheck source=kv_bench_topo.sh
 source "$HERE/kv_bench_topo.sh"

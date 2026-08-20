@@ -38,18 +38,18 @@ try:
             elif t == 9:
                 at = struct.unpack("<I", f.read(4))[0]
                 n = struct.unpack("<Q", f.read(8))[0]
-                sizes = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:8,10:1,11:1,12:8}
-                if at in sizes:
-                    f.seek(sizes[at] * n, 1)
-                elif at == 8:
+                sizes = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
+                if at == 8:
                     for _ in range(n):
                         sn = struct.unpack("<Q", f.read(8))[0]
                         f.seek(sn, 1)
+                elif at in sizes:
+                    f.seek(sizes[at] * n, 1)
                 else:
                     for _ in range(n):
                         skip(at)
             else:
-                sizes = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:8,10:1,11:1,12:8}
+                sizes = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,8:0,10:8,11:8,12:8}
                 f.seek(sizes.get(t, 0), 1)
         for _ in range(n_kv):
             kn = struct.unpack("<Q", f.read(8))[0]
@@ -66,6 +66,91 @@ try:
 except Exception:
     pass
 PY
+}
+
+# True when the GGUF carries a nextn/MTP block (blk.<n>.nextn.eh_proj
+# tensor) — i.e. the model supports PULSAR_MTP=1 speculative decode.
+# Empty/missing file → false (never auto-enable on unreadable models).
+gguf_has_nextn() {
+  local path="${1:-}"
+  [ -n "$path" ] && [ -f "$path" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$path" <<'PY' 2>/dev/null
+import struct, sys
+path = sys.argv[1]
+try:
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            sys.exit(1)
+        ver = struct.unpack("<I", f.read(4))[0]
+        if ver < 1 or ver > 3:
+            sys.exit(1)
+        n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+        if n_tensors > 100_000 or n_kv > 100_000:
+            sys.exit(1)
+        def skip(t):
+            if t == 8:
+                n = struct.unpack("<Q", f.read(8))[0]
+                f.seek(n, 1)
+            elif t == 9:
+                at = struct.unpack("<I", f.read(4))[0]
+                n = struct.unpack("<Q", f.read(8))[0]
+                sizes = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
+                if at == 8:
+                    for _ in range(n):
+                        sn = struct.unpack("<Q", f.read(8))[0]
+                        f.seek(sn, 1)
+                elif at in sizes:
+                    f.seek(sizes[at] * n, 1)
+                else:
+                    for _ in range(n):
+                        skip(at)
+            else:
+                sizes = {0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,8:0,10:8,11:8,12:8}
+                f.seek(sizes.get(t, 0), 1)
+        for _ in range(n_kv):
+            kn = struct.unpack("<Q", f.read(8))[0]
+            if kn > 10_000_000:
+                sys.exit(1)
+            key = f.read(kn).decode("utf-8", "replace")
+            t = struct.unpack("<I", f.read(4))[0]
+            skip(t)
+        for _ in range(n_tensors):
+            sn = struct.unpack("<Q", f.read(8))[0]
+            if sn > 10_000_000:
+                sys.exit(1)
+            name = f.read(sn).decode("utf-8", "replace")
+            # GGUF tensor info: name(str), n_dims(u32), dims(n*u64), type(u32), offset(u64)
+            n_dims = struct.unpack("<I", f.read(4))[0]
+            if n_dims > 8:
+                sys.exit(1)
+            f.seek(n_dims * 8, 1)   # dims
+            f.seek(4, 1)            # type
+            f.seek(8, 1)            # offset
+            if name.endswith(".nextn.eh_proj.weight"):
+                sys.exit(0)
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+# Export PULSAR_MTP=1 when the model carries a nextn/MTP block and the
+# caller hasn't set PULSAR_MTP itself (0 forces off, 1 forces on).
+# Echoes the decision for caller logs.
+maybe_enable_mtp() {
+  local model="${1:-}"
+  if [ -n "${PULSAR_MTP:-}" ] && [ "$PULSAR_MTP" != "auto" ]; then
+    echo "PULSAR_MTP=$PULSAR_MTP (user-set)"
+    return 0
+  fi
+  if gguf_has_nextn "$model"; then
+    export PULSAR_MTP=1
+    echo "PULSAR_MTP=1 (auto: nextn block detected)"
+  else
+    unset PULSAR_MTP
+    echo "PULSAR_MTP unset (auto: no nextn block)"
+  fi
 }
 
 # Map architecture string → family bucket: mla | k3 | gqa | primary | unknown
