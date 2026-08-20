@@ -4677,11 +4677,21 @@ mod real {
             // out-of-distribution and acceptance collapses with depth
             // (Hy3 measured 30% -> 23% -> 10% at depths 1/3/5)
             let mtp_depth = if mtp.is_some() {
-                std::env::var("PULSAR_MTP_DEPTH")
-                    .ok()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .unwrap_or(1)
-                    .clamp(1, 8)
+                let raw = std::env::var("PULSAR_MTP_DEPTH").ok();
+                let parsed = raw.as_deref().and_then(|v| v.parse::<u32>().ok());
+                let d = parsed.unwrap_or(1).clamp(1, 8);
+                if let Some(r) = raw.as_deref() {
+                    if parsed.is_none() {
+                        eprintln!(
+                            "pulsar: PULSAR_MTP_DEPTH='{r}' not a u32 -> using default {d}"
+                        );
+                    } else {
+                        eprintln!("pulsar: MTP depth={d}");
+                    }
+                } else {
+                    eprintln!("pulsar: MTP depth={d} (default, PULSAR_MTP_DEPTH unset)");
+                }
+                d
             } else {
                 0
             };
