@@ -9029,7 +9029,18 @@ mod real {
         if spec_sample {
             let v = model.shape.n_vocab as usize;
             let row = model.shape.n_embd as usize * 4;
-            let depth_max = model.mtp_depth.max(1);
+            // sampled spec: verify reads full logits per row, so each
+            // extra draft row is pricey - depth-1 measured optimal
+            // (37.2 vs 32.8 tok/s at depth-2), unlike GREEDY where the
+            // cheap argmax verify makes depth-2 win. Cap here, keep the
+            // model-loaded depth for greedy; PULSAR_MTP_SAMPLE_DEPTH
+            // overrides, never exceeding the loaded depth.
+            let depth_max = std::env::var("PULSAR_MTP_SAMPLE_DEPTH")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1)
+                .max(1)
+                .min(model.mtp_depth.max(1));
             let debug = std::env::var_os("PULSAR_MTP_DEBUG").is_some();
             let mut emitted = 0usize;
             let mut next = sampler.sample(logits.as_deref().ok_or("no logits")?);
