@@ -82,6 +82,8 @@ mod real {
         fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
         fn cudaDeviceGetAttribute(val: *mut i32, attr: i32, dev: i32) -> i32;
         fn cudaMalloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
+        fn pulsar_pack_bf16(out: *mut c_void, inp: *const c_void, n: u32) -> i32;
+        fn pulsar_unpack_bf16(out: *mut c_void, inp: *const c_void, n: u32) -> i32;
         fn cudaFree(ptr: *mut c_void) -> i32;
         fn cudaHostAlloc(ptr: *mut *mut c_void, bytes: usize, flags: u32) -> i32;
         fn cudaFreeHost(ptr: *mut c_void) -> i32;
@@ -797,17 +799,61 @@ mod real {
     pub struct TpLink {
         ev: *mut c_void,
         pin: DeviceBuf,
+        /// bf16 stage on the SENDER's device (pack target)
+        s16: DeviceBuf,
+        /// bf16 stage on the RECEIVER's device (unpack source)
+        r16: DeviceBuf,
+        /// PULSAR_TP_BF16=1: halve the bytes that cross the bus
+        bf16: bool,
     }
 
     unsafe impl Send for TpLink {}
 
     impl TpLink {
-        pub fn new(bytes: usize) -> Result<TpLink> {
+        /// `peer` is the device on the OTHER end of this link. Both bf16
+        /// stages are allocated here, at setup: the hop runs inside CUDA
+        /// graph capture, where cudaMalloc is illegal, so nothing may be
+        /// allocated lazily on the hot path.
+        pub fn new(bytes: usize, peer: i32) -> Result<TpLink> {
             ensure_device();
             const DISABLE_TIMING: u32 = 2;
             let mut ev = std::ptr::null_mut();
             check_rt(unsafe { cudaEventCreateWithFlags(&mut ev, DISABLE_TIMING) }, "tplink event")?;
-            Ok(TpLink { ev, pin: DeviceBuf::alloc_pinned(bytes)? })
+            let pin = DeviceBuf::alloc_pinned(bytes)?;
+            let s16 = DeviceBuf::alloc(bytes / 2 + 4)?;
+            let here = get_device();
+            set_device(peer)?;
+            let r16 = DeviceBuf::alloc(bytes / 2 + 4)?;
+            set_device(here)?;
+            let bf16 = std::env::var_os("PULSAR_TP_BF16").is_some();
+            Ok(TpLink { ev, pin, s16, r16, bf16 })
+        }
+
+        /// Send `n` f32s. With bf16 staging on, packs to bf16 first so
+        /// half the bytes cross; otherwise byte-identical to `send`.
+        pub fn send_f32(&mut self, src: &DeviceBuf, n: usize) -> Result {
+            if !self.bf16 {
+                return self.send(src, n * 4);
+            }
+            check(unsafe { pulsar_pack_bf16(self.s16.ptr_mut(), src.ptr(), n as u32) }, "pack_bf16")?;
+            check_rt(
+                unsafe { cudaMemcpyAsync(self.pin.host, self.s16.ptr(), n * 2, D2H, STREAM_PER_THREAD) },
+                "tplink d2h bf16",
+            )?;
+            check_rt(unsafe { cudaEventRecord(self.ev, STREAM_PER_THREAD) }, "tplink record")
+        }
+
+        /// Receive `n` f32s written by `send_f32`.
+        pub fn recv_f32(&mut self, dst: &mut DeviceBuf, n: usize) -> Result {
+            if !self.bf16 {
+                return self.recv(dst, n * 4);
+            }
+            check_rt(unsafe { cudaStreamWaitEvent(STREAM_PER_THREAD, self.ev, 0) }, "tplink wait")?;
+            check_rt(
+                unsafe { cudaMemcpyAsync(self.r16.ptr_mut(), self.pin.host, n * 2, H2D, STREAM_PER_THREAD) },
+                "tplink h2d bf16",
+            )?;
+            check(unsafe { pulsar_unpack_bf16(dst.ptr_mut(), self.r16.ptr(), n as u32) }, "unpack_bf16")
         }
 
         /// Async D2H of `bytes` from `src` into the pinned stage, on the

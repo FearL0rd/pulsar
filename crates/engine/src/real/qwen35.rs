@@ -484,7 +484,7 @@ impl Qwen35Rt {
                 // FFN, f32 normed for the GDN half), lo on B (the
                 // partial returns), so each is created with that device
                 // current
-                let lx = kernels::TpLink::new(cm * s.n_embd as usize * 4)?;
+                let lx = kernels::TpLink::new(cm * s.n_embd as usize * 4, tp.dev)?;
                 kernels::set_device(tp.dev)?;
                 let mut bstates = Vec::with_capacity(s.n_exec_layer as usize);
                 for il in 0..s.n_exec_layer as usize {
@@ -543,7 +543,7 @@ impl Qwen35Rt {
                         b
                     },
                     lx,
-                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4)?,
+                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
                 };
                 kernels::set_device(primary)?;
                 Some(b)
@@ -558,7 +558,7 @@ impl Qwen35Rt {
                 let w = c.width as usize;
                 // lx records on the primary (it sends), lo on the third
                 // card, so each link is created with its device current
-                let lx = kernels::TpLink::new(cm * q8k(s.n_embd as usize))?;
+                let lx = kernels::TpLink::new(cm * q8k(s.n_embd as usize), c.dev)?;
                 let recv = f32s(cm * s.n_embd as usize)?;
                 kernels::set_device(c.dev)?;
                 let b = FfnBank {
@@ -572,7 +572,7 @@ impl Qwen35Rt {
                     out: f32s(cm * s.n_embd as usize)?,
                     recv,
                     lx,
-                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4)?,
+                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
                 };
                 kernels::set_device(primary)?;
                 Some(b)
@@ -1416,9 +1416,9 @@ impl Model {
             return Ok(false);
         };
         let v2 = s.n_vocab / 2;
-        tb.lx.send(&st.normed, (k * s.n_embd) as usize * 4)?;
+        tb.lx.send_f32(&st.normed, (k * s.n_embd) as usize)?;
         kernels::set_device(tb.dev)?;
-        tb.lx.recv(&mut tb.normed, (k * s.n_embd) as usize * 4)?;
+        tb.lx.recv_f32(&mut tb.normed, (k * s.n_embd) as usize)?;
         kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, k)?;
         kernels::matmul_kq(&mut tb.hlog, &hb.w, &tb.xq, s.n_embd, v2, k, hb.row_bytes, hb.quant)?;
         kernels::argmax_rows_launch(&mut tb.bmax, &tb.hlog, v2, k)?;
@@ -1629,9 +1629,9 @@ impl Model {
                     eprintln!("  PRESEND il={il} t={t} bytes={} A[0] {:?} A[mid] {:?}",
                         (t * s.n_embd) as usize * 4, st.normed.read_f32(2)?, st.normed.read_f32_at(d, 2)?);
                 }
-                tb.lx.send(&st.normed, (t * s.n_embd) as usize * 4)?;
+                tb.lx.send_f32(&st.normed, (t * s.n_embd) as usize)?;
                 kernels::set_device(tb.dev)?;
-                tb.lx.recv(&mut tb.normed, (t * s.n_embd) as usize * 4)?;
+                tb.lx.recv_f32(&mut tb.normed, (t * s.n_embd) as usize)?;
                 if dbg {
                     // does the TpLink hand card B the SAME activations A
                     // computed? A's normed printed by the L2 probe above.
@@ -1713,7 +1713,7 @@ impl Model {
                         dump_f32(&format!("{dir}/tp_b_part.bin"), &tb.out.read_f32((t * s.n_embd) as usize)?);
                     }
                 }
-                tb.lo.send(&tb.out, (t * s.n_embd) as usize * 4)?;
+                tb.lo.send_f32(&tb.out, (t * s.n_embd) as usize)?;
                 kernels::set_device(kernels::primary_device())?;
                 // A's half, overlapping with B's chain
                 matw(&mut rt.qkv, &gdn.wqkv, &st.normed, &st.xq, s.n_embd, cdh, t)?;
@@ -1770,7 +1770,7 @@ impl Model {
                     eprintln!("  TPpartA il={il} Apart {:?} z {:?} gdn_tmp {:?}",
                         st.attn_out.read_f32(2)?, rt.z.read_f32(2)?, rt.gdn_tmp.read_f32(2)?);
                 }
-                tb.lo.recv(&mut tb.recv, (t * s.n_embd) as usize * 4)?;
+                tb.lo.recv_f32(&mut tb.recv, (t * s.n_embd) as usize)?;
                 if dbg {
                     eprintln!("  TPpartB il={il} Bpart {:?}", tb.recv.read_f32(2)?);
                 }
@@ -1886,9 +1886,9 @@ impl Model {
                 let nh2 = s.n_head / 2;
                 let nkv2 = s.n_head_kv / 2;
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
-                tb.lx.send(&st.normed, (t * s.n_embd) as usize * 4)?;
+                tb.lx.send_f32(&st.normed, (t * s.n_embd) as usize)?;
                 kernels::set_device(tb.dev)?;
-                tb.lx.recv(&mut tb.normed, (t * s.n_embd) as usize * 4)?;
+                tb.lx.recv_f32(&mut tb.normed, (t * s.n_embd) as usize)?;
                 if matches!(bw.wq, MatW::Kq(_)) {
                     kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, t)?;
                 }
@@ -1927,7 +1927,7 @@ impl Model {
                     kernels::quantize_q8_k(&mut tb.midq, &tb.aheads, nh2 * hd, t)?;
                 }
                 matw(&mut tb.out, &bw.out, &tb.aheads, &tb.midq, nh2 * hd, s.n_embd, t)?;
-                tb.lo.send(&tb.out, (t * s.n_embd) as usize * 4)?;
+                tb.lo.send_f32(&tb.out, (t * s.n_embd) as usize)?;
                 kernels::set_device(kernels::primary_device())?;
                 // A's heads, overlapping with B's chain
                 matw(&mut rt.qfull, &attn.wq, &st.normed, &st.xq, s.n_embd, 2 * nh2 * hd, t)?;
@@ -1963,7 +1963,7 @@ impl Model {
                     kernels::quantize_q8_k(&mut st.midq, &st.heads, nh2 * hd, t)?;
                 }
                 matw(&mut st.attn_out, &attn.out, &st.heads, &st.midq, nh2 * hd, s.n_embd, t)?;
-                tb.lo.recv(&mut tb.recv, (t * s.n_embd) as usize * 4)?;
+                tb.lo.recv_f32(&mut tb.recv, (t * s.n_embd) as usize)?;
                 kernels::add_assign(&mut st.attn_out, &tb.recv, t * s.n_embd)?;
             } else {
             // ---- sigmoid-gated full attention (partial neox rope)
