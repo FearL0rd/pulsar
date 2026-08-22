@@ -1468,11 +1468,20 @@ impl Model {
                     _ => false,
                 }
         };
+        // Graph instantiation costs ~10ms per span, so capture only pays
+        // for token counts that RECUR. Decode and spec-verify blocks (small
+        // t) and full prefill chunks (t == T_MAX) repeat for the life of the
+        // process; a prefill TAIL chunk is an arbitrary remainder that
+        // differs per request, so capturing it burns ~10ms x spans on every
+        // novel prompt length and grows the cache without bound. Those run
+        // as plain launches instead (~850ns each, ~0.6ms for a whole span).
+        const GRAPH_T_SMALL: u32 = 32;
+        let graph_t = t == T_MAX as u32 || t <= GRAPH_T_SMALL;
         let mut graphs = std::mem::take(&mut rt.graphs);
         let mut il = lo;
         let r = (|| -> Result {
             while il < hi {
-                if rt.graphs_on && !dbg && graphable(il) {
+                if rt.graphs_on && graph_t && !dbg && graphable(il) {
                     let mut end = il + 1;
                     while end < hi && graphable(end) {
                         end += 1;
@@ -2211,6 +2220,15 @@ impl Model {
         let q_dim = d.n_head * d.head_dim;
         let total_k = (w_eff + bs) as u32;
         let n_groups = d.dflash2.as_ref().map_or(0, |d2| s.n_embd / d2.group);
+        let dbg_t = std::env::var_os("PULSAR_DFLASH_DEBUG").is_some();
+        let mark = |label: &str, t: &mut std::time::Instant| {
+            if dbg_t {
+                let _ = kernels::sync();
+                eprintln!("  dflash_draft {label}: {:.2}ms", t.elapsed().as_secs_f64() * 1e3);
+                *t = std::time::Instant::now();
+            }
+        };
+        let mut dt = std::time::Instant::now();
         for (il, l) in d.layers.iter().enumerate() {
             kernels::rms_norm(&mut d.hn, &d.h, &l.attn_norm, s.n_embd, bs as u32, eps)?;
             // DFlash2: grouped block-conv between the norm and the
@@ -2274,9 +2292,11 @@ impl Model {
                 kernels::add_assign(&mut d.h, &d.tmp, bs as u32 * s.n_embd)?;
             }
         }
+        mark("layers", &mut dt);
         // final norm -> target lm head (head_logits reads st.normed)
         kernels::rms_norm(&mut st.normed, &d.h, &d.out_norm, s.n_embd, bs as u32, eps)?;
         self.head_logits(st, bs as u32)?;
+        mark("head", &mut dt);
         let v = s.n_vocab as usize;
         let mut out: Vec<u32>;
         // DeepSpec next-token rows: draft slot j comes from logits row
@@ -2329,6 +2349,7 @@ impl Model {
                 out[j] = ids_h[r * ku + best_c] as u32;
                 prev = pred_h[(r * ku + best_c) * ru..(r * ku + best_c + 1) * ru].to_vec();
             }
+            mark("selector", &mut dt);
             return Ok(out);
         }
         if let Some(dk) = &mut d.dspark {
