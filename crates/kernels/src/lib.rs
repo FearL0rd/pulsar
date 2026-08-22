@@ -81,6 +81,8 @@ mod real {
         fn cudaGetDeviceCount(count: *mut i32) -> i32;
         fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
         fn cudaDeviceGetAttribute(val: *mut i32, attr: i32, dev: i32) -> i32;
+        fn cudaDeviceCanAccessPeer(can: *mut i32, dev: i32, peer: i32) -> i32;
+        fn cudaDeviceEnablePeerAccess(peer: i32, flags: u32) -> i32;
         fn cudaMalloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
         fn pulsar_pack_bf16(out: *mut c_void, inp: *const c_void, n: u32) -> i32;
         fn pulsar_unpack_bf16(out: *mut c_void, inp: *const c_void, n: u32) -> i32;
@@ -325,6 +327,41 @@ mod real {
                 best.0
             });
             PRIMARY_DEV.store(dev, std::sync::atomic::Ordering::Relaxed);
+            // PULSAR_P2P=1: establish peer access HERE, inside the same
+            // once-block that picks the device, i.e. before a single
+            // DeviceBuf exists. Enabling it later (from TpLink::new, after
+            // the weight pool is allocated) surfaced as a failing kernel
+            // launch two calls downstream, which is what a deferred CUDA
+            // error looks like. Consumer cards report can-access only with
+            // a patched driver; where they do not, this is a no-op.
+            if std::env::var_os("PULSAR_P2P").is_some() {
+                let mut n = 0;
+                unsafe { cudaGetDeviceCount(&mut n) };
+                let mut pairs = 0;
+                for a in 0..n {
+                    if unsafe { cudaSetDevice(a) } != 0 {
+                        continue;
+                    }
+                    for b in 0..n {
+                        if a == b {
+                            continue;
+                        }
+                        let mut can = 0;
+                        unsafe { cudaDeviceCanAccessPeer(&mut can, a, b) };
+                        if can != 1 {
+                            continue;
+                        }
+                        let e = unsafe { cudaDeviceEnablePeerAccess(b, 0) };
+                        // 704 = cudaErrorPeerAccessAlreadyEnabled
+                        if e == 0 || e == 704 {
+                            pairs += 1;
+                        }
+                    }
+                }
+                if pairs > 0 && std::env::var_os("PULSAR_QUIET").is_none() {
+                    eprintln!("pulsar: p2p peer access enabled on {pairs} ordered pair(s)");
+                }
+            }
             if unsafe { cudaSetDevice(dev) } != 0 {
                 eprintln!("pulsar: cudaSetDevice({dev}) failed, falling back to CUDA default");
             } else if std::env::var_os("PULSAR_QUIET").is_none() {
@@ -799,6 +836,14 @@ mod real {
     pub struct TpLink {
         ev: *mut c_void,
         pin: DeviceBuf,
+        /// this link's source and consumer devices
+        dev_src: i32,
+        dev_dst: i32,
+        /// real peer access both ways (needs PULSAR_P2P + a driver that
+        /// allows it). When set, the pinned bounce is skipped entirely.
+        p2p: bool,
+        /// source parked by `send` for the peer `recv` to read from
+        pending: std::cell::Cell<(*const c_void, usize)>,
         /// bf16 stage on the SENDER's device (pack target)
         s16: DeviceBuf,
         /// bf16 stage on the RECEIVER's device (unpack source)
@@ -826,13 +871,31 @@ mod real {
             let r16 = DeviceBuf::alloc(bytes / 2 + 4)?;
             set_device(here)?;
             let bf16 = std::env::var_os("PULSAR_TP_BF16").is_some();
-            Ok(TpLink { ev, pin, s16, r16, bf16 })
+            // Peer access itself is established once in ensure_device, before
+            // any allocation; here we only ASK whether it took, both ways.
+            let mut p2p = false;
+            if std::env::var_os("PULSAR_P2P").is_some() && here != peer {
+                let (mut ab, mut ba) = (0i32, 0i32);
+                unsafe {
+                    cudaDeviceCanAccessPeer(&mut ab, here, peer);
+                    cudaDeviceCanAccessPeer(&mut ba, peer, here);
+                }
+                p2p = ab == 1 && ba == 1;
+            }
+            Ok(TpLink {
+                ev, pin, s16, r16, bf16,
+                dev_src: here, dev_dst: peer, p2p,
+                pending: std::cell::Cell::new((std::ptr::null(), 0)),
+            })
         }
 
         /// Send `n` f32s. With bf16 staging on, packs to bf16 first so
         /// half the bytes cross; otherwise byte-identical to `send`.
         pub fn send_f32(&mut self, src: &DeviceBuf, n: usize) -> Result {
-            if !self.bf16 {
+            // p2p wins over bf16: a direct card-to-card copy beats halving
+            // bytes that still have to round-trip through host memory, and
+            // it keeps f32 exactness.
+            if !self.bf16 || self.p2p {
                 return self.send(src, n * 4);
             }
             check(unsafe { pulsar_pack_bf16(self.s16.ptr_mut(), src.ptr(), n as u32) }, "pack_bf16")?;
@@ -845,7 +908,7 @@ mod real {
 
         /// Receive `n` f32s written by `send_f32`.
         pub fn recv_f32(&mut self, dst: &mut DeviceBuf, n: usize) -> Result {
-            if !self.bf16 {
+            if !self.bf16 || self.p2p {
                 return self.recv(dst, n * 4);
             }
             check_rt(unsafe { cudaStreamWaitEvent(STREAM_PER_THREAD, self.ev, 0) }, "tplink wait")?;
@@ -863,6 +926,12 @@ mod real {
         /// illegal), event behind it.
         pub fn send(&self, src: &DeviceBuf, bytes: usize) -> Result {
             assert!(bytes <= self.pin.bytes() && bytes <= src.bytes());
+            if self.p2p {
+                // Nothing crosses here: park the source and fence, so the
+                // consumer's peer read orders after this card's kernels.
+                self.pending.set((src.ptr(), bytes));
+                return check_rt(unsafe { cudaEventRecord(self.ev, STREAM_PER_THREAD) }, "tplink record");
+            }
             check_rt(
                 unsafe { cudaMemcpyAsync(self.pin.host, src.ptr(), bytes, D2H, STREAM_PER_THREAD) },
                 "tplink d2h",
@@ -877,6 +946,24 @@ mod real {
         pub fn recv(&self, dst: &mut DeviceBuf, bytes: usize) -> Result {
             assert!(bytes <= self.pin.bytes() && bytes <= dst.bytes());
             check_rt(unsafe { cudaStreamWaitEvent(STREAM_PER_THREAD, self.ev, 0) }, "tplink wait")?;
+            if self.p2p {
+                let (src, n) = self.pending.get();
+                if src.is_null() {
+                    return Err(Error("tplink: p2p recv with no parked send"));
+                }
+                // NOT cudaMemcpyPeerAsync: it returns 900
+                // (cudaErrorStreamCaptureUnsupported) inside graph capture,
+                // which is where every decode hop runs. A plain async memcpy
+                // with cudaMemcpyDefault resolves both pointers through
+                // unified addressing and, with peer access enabled, moves the
+                // bytes card-to-card directly - and it captures fine.
+                return check_rt(
+                    unsafe {
+                        cudaMemcpyAsync(dst.ptr_mut(), src, n, MEMCPY_DEFAULT, STREAM_PER_THREAD)
+                    },
+                    "tplink peer copy",
+                );
+            }
             check_rt(
                 unsafe { cudaMemcpyAsync(dst.ptr_mut(), self.pin.host, bytes, H2D, STREAM_PER_THREAD) },
                 "tplink h2d",
@@ -1866,7 +1953,7 @@ mod tests {
         set_device(primary).unwrap();
         let mut a = DeviceBuf::alloc(n * 4).unwrap();
         a.write(0, as_bytes(&src_host)).unwrap();
-        let link = TpLink::new(n * 4).unwrap();
+        let link = TpLink::new(n * 4, other).unwrap();
 
         set_device(other).unwrap();
         let mut b = DeviceBuf::alloc(n * 4).unwrap();
