@@ -892,13 +892,17 @@ mod real {
         /// Send `n` f32s. With bf16 staging on, packs to bf16 first so
         /// half the bytes cross; otherwise byte-identical to `send`.
         pub fn send_f32(&mut self, src: &DeviceBuf, n: usize) -> Result {
-            // p2p wins over bf16: a direct card-to-card copy beats halving
-            // bytes that still have to round-trip through host memory, and
-            // it keeps f32 exactness.
-            if !self.bf16 || self.p2p {
+            if !self.bf16 {
                 return self.send(src, n * 4);
             }
+            // bf16 COMPOSES with p2p: peer access removed the host round trip,
+            // it did not shrink what crosses the bus, and PCIe is still the
+            // slow link. Pack once on the source card either way.
             check(unsafe { pulsar_pack_bf16(self.s16.ptr_mut(), src.ptr(), n as u32) }, "pack_bf16")?;
+            if self.p2p {
+                self.pending.set((self.s16.ptr(), n * 2));
+                return check_rt(unsafe { cudaEventRecord(self.ev, STREAM_PER_THREAD) }, "tplink record");
+            }
             check_rt(
                 unsafe { cudaMemcpyAsync(self.pin.host, self.s16.ptr(), n * 2, D2H, STREAM_PER_THREAD) },
                 "tplink d2h bf16",
@@ -908,14 +912,27 @@ mod real {
 
         /// Receive `n` f32s written by `send_f32`.
         pub fn recv_f32(&mut self, dst: &mut DeviceBuf, n: usize) -> Result {
-            if !self.bf16 || self.p2p {
+            if !self.bf16 {
                 return self.recv(dst, n * 4);
             }
             check_rt(unsafe { cudaStreamWaitEvent(STREAM_PER_THREAD, self.ev, 0) }, "tplink wait")?;
-            check_rt(
-                unsafe { cudaMemcpyAsync(self.r16.ptr_mut(), self.pin.host, n * 2, H2D, STREAM_PER_THREAD) },
-                "tplink h2d bf16",
-            )?;
+            if self.p2p {
+                let (psrc, pn) = self.pending.get();
+                if psrc.is_null() {
+                    return Err(Error("tplink: p2p bf16 recv with no parked send"));
+                }
+                check_rt(
+                    unsafe {
+                        cudaMemcpyAsync(self.r16.ptr_mut(), psrc, pn, MEMCPY_DEFAULT, STREAM_PER_THREAD)
+                    },
+                    "tplink peer copy bf16",
+                )?;
+            } else {
+                check_rt(
+                    unsafe { cudaMemcpyAsync(self.r16.ptr_mut(), self.pin.host, n * 2, H2D, STREAM_PER_THREAD) },
+                    "tplink h2d bf16",
+                )?;
+            }
             check(unsafe { pulsar_unpack_bf16(dst.ptr_mut(), self.r16.ptr(), n as u32) }, "unpack_bf16")
         }
 
