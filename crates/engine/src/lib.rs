@@ -9139,6 +9139,19 @@ mod real {
             let depth_max = model.mtp_depth.max(1);
             let debug = std::env::var_os("PULSAR_MTP_DEBUG").is_some();
             let timing = std::env::var_os("PULSAR_MTP_TIMING").is_some();
+            // Lookup-augmented block: extend the MTP draft chain up to this
+            // many total rows with tokens pulled straight from the context
+            // (PULSAR_SPEC_LOOKUP=<block>, e.g. 16). MTP drafts the first
+            // few (its strength: generative continuation); context lookup
+            // fills the rest (its strength: verbatim copy). One verify step
+            // then accepts many tokens on copy-heavy work. Capped by
+            // spec_rows (16 on qwen35). 0/unset = plain MTP, unchanged.
+            let lookup_block = std::env::var("PULSAR_SPEC_LOOKUP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+                .min(st.spec_rows as usize);
+            let mut hist: Vec<u32> = if lookup_block > 0 { prompt.to_vec() } else { Vec::new() };
             let (mut t_draft, mut t_verify, mut t_refwd, mut t_fill) =
                 (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
             let mut emitted = 0usize;
@@ -9151,6 +9164,9 @@ mod real {
                 }
                 on_token(next);
                 emitted += 1;
+                if lookup_block > 0 {
+                    hist.push(next);
+                }
 
                 // Draft a chain: each step self-feeds the MTP layer's own
                 // output hidden (approximate but cheap - one layer/step).
@@ -9167,6 +9183,19 @@ mod real {
                     if stop(d) {
                         break; // no point speculating past a stop token
                     }
+                }
+                // Extend the block from context (lookup drafts need no MTP
+                // hidden - the verify forward computes real hiddens and the
+                // fill re-anchors on the accepted prefix). Cap the whole
+                // chain at both lookup_block and the ctx headroom.
+                if lookup_block > chain.len() && !stop(chain[chain.len() - 1]) {
+                    let room = (st.ctx() - pos - 2) as usize;
+                    let want = lookup_block.min(room + 1).saturating_sub(chain.len());
+                    let mut lseq = hist.clone();
+                    lseq.extend_from_slice(&chain[1..]);
+                    let ext = ngram_continuation(&lseq, want);
+                    st.mtp_drafted += ext.len() as u64;
+                    chain.extend(ext);
                 }
                 t_draft += t0.elapsed();
                 let k = chain.len() - 1; // drafts in flight
@@ -9266,6 +9295,9 @@ mod real {
                     }
                     on_token(d);
                     emitted += 1;
+                    if lookup_block > 0 {
+                        hist.push(d);
+                    }
                 }
             }
             if timing {
@@ -9326,6 +9358,41 @@ mod real {
             pos += 1;
         }
         Ok(pos)
+    }
+
+    /// Lookup-augmented draft continuation (prompt-lookup / n-gram): find
+    /// the most recent earlier occurrence of `seq`'s 2..=4-token suffix and
+    /// return up to `want` of the tokens that FOLLOWED it. On copy-heavy
+    /// work (RAG, doc reproduction, applying an edit) this fills the draft
+    /// block straight from the context, so one verify step accepts many
+    /// tokens - the trick behind the 15/16-accept "reproduce a document"
+    /// throughput. Returns empty when nothing matches (generative text),
+    /// so the caller falls back to the model's own drafts.
+    pub fn ngram_continuation(seq: &[u32], want: usize) -> Vec<u32> {
+        if want == 0 || seq.len() < 4 {
+            return Vec::new();
+        }
+        // min 3-token match: 2-token suffixes match spuriously on
+        // generative text (drafts get rejected, wasting verify rows);
+        // real context runs (docs, code) match 3+ exactly.
+        for m in (3..=4usize.min(seq.len() - 1)).rev() {
+            let suf = &seq[seq.len() - m..];
+            let limit = seq.len() - m;
+            for i in (0..limit).rev() {
+                if &seq[i..i + m] == suf {
+                    let mut out = Vec::new();
+                    let mut j = i + m;
+                    while out.len() < want && j < seq.len() {
+                        out.push(seq[j]);
+                        j += 1;
+                    }
+                    if !out.is_empty() {
+                        return out;
+                    }
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// First-max argmax, matching ds4's sample_argmax.
