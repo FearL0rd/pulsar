@@ -484,7 +484,7 @@ impl Qwen35Rt {
                 // FFN, f32 normed for the GDN half), lo on B (the
                 // partial returns), so each is created with that device
                 // current
-                let lx = kernels::TpLink::new(cm * s.n_embd as usize * 4)?;
+                let lx = kernels::TpLink::new(cm * s.n_embd as usize * 4, tp.dev)?;
                 kernels::set_device(tp.dev)?;
                 let mut bstates = Vec::with_capacity(s.n_exec_layer as usize);
                 for il in 0..s.n_exec_layer as usize {
@@ -543,7 +543,7 @@ impl Qwen35Rt {
                         b
                     },
                     lx,
-                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4)?,
+                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
                 };
                 kernels::set_device(primary)?;
                 Some(b)
@@ -558,7 +558,7 @@ impl Qwen35Rt {
                 let w = c.width as usize;
                 // lx records on the primary (it sends), lo on the third
                 // card, so each link is created with its device current
-                let lx = kernels::TpLink::new(cm * q8k(s.n_embd as usize))?;
+                let lx = kernels::TpLink::new(cm * q8k(s.n_embd as usize), c.dev)?;
                 let recv = f32s(cm * s.n_embd as usize)?;
                 kernels::set_device(c.dev)?;
                 let b = FfnBank {
@@ -572,7 +572,7 @@ impl Qwen35Rt {
                     out: f32s(cm * s.n_embd as usize)?,
                     recv,
                     lx,
-                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4)?,
+                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
                 };
                 kernels::set_device(primary)?;
                 Some(b)
@@ -1416,9 +1416,9 @@ impl Model {
             return Ok(false);
         };
         let v2 = s.n_vocab / 2;
-        tb.lx.send(&st.normed, (k * s.n_embd) as usize * 4)?;
+        tb.lx.send_f32(&st.normed, (k * s.n_embd) as usize)?;
         kernels::set_device(tb.dev)?;
-        tb.lx.recv(&mut tb.normed, (k * s.n_embd) as usize * 4)?;
+        tb.lx.recv_f32(&mut tb.normed, (k * s.n_embd) as usize)?;
         kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, k)?;
         kernels::matmul_kq(&mut tb.hlog, &hb.w, &tb.xq, s.n_embd, v2, k, hb.row_bytes, hb.quant)?;
         kernels::argmax_rows_launch(&mut tb.bmax, &tb.hlog, v2, k)?;
@@ -1468,11 +1468,20 @@ impl Model {
                     _ => false,
                 }
         };
+        // Graph instantiation costs ~10ms per span, so capture only pays
+        // for token counts that RECUR. Decode and spec-verify blocks (small
+        // t) and full prefill chunks (t == T_MAX) repeat for the life of the
+        // process; a prefill TAIL chunk is an arbitrary remainder that
+        // differs per request, so capturing it burns ~10ms x spans on every
+        // novel prompt length and grows the cache without bound. Those run
+        // as plain launches instead (~850ns each, ~0.6ms for a whole span).
+        const GRAPH_T_SMALL: u32 = 32;
+        let graph_t = t == T_MAX as u32 || t <= GRAPH_T_SMALL;
         let mut graphs = std::mem::take(&mut rt.graphs);
         let mut il = lo;
         let r = (|| -> Result {
             while il < hi {
-                if rt.graphs_on && !dbg && graphable(il) {
+                if rt.graphs_on && graph_t && !dbg && graphable(il) {
                     let mut end = il + 1;
                     while end < hi && graphable(end) {
                         end += 1;
@@ -1620,9 +1629,9 @@ impl Model {
                     eprintln!("  PRESEND il={il} t={t} bytes={} A[0] {:?} A[mid] {:?}",
                         (t * s.n_embd) as usize * 4, st.normed.read_f32(2)?, st.normed.read_f32_at(d, 2)?);
                 }
-                tb.lx.send(&st.normed, (t * s.n_embd) as usize * 4)?;
+                tb.lx.send_f32(&st.normed, (t * s.n_embd) as usize)?;
                 kernels::set_device(tb.dev)?;
-                tb.lx.recv(&mut tb.normed, (t * s.n_embd) as usize * 4)?;
+                tb.lx.recv_f32(&mut tb.normed, (t * s.n_embd) as usize)?;
                 if dbg {
                     // does the TpLink hand card B the SAME activations A
                     // computed? A's normed printed by the L2 probe above.
@@ -1704,7 +1713,7 @@ impl Model {
                         dump_f32(&format!("{dir}/tp_b_part.bin"), &tb.out.read_f32((t * s.n_embd) as usize)?);
                     }
                 }
-                tb.lo.send(&tb.out, (t * s.n_embd) as usize * 4)?;
+                tb.lo.send_f32(&tb.out, (t * s.n_embd) as usize)?;
                 kernels::set_device(kernels::primary_device())?;
                 // A's half, overlapping with B's chain
                 matw(&mut rt.qkv, &gdn.wqkv, &st.normed, &st.xq, s.n_embd, cdh, t)?;
@@ -1761,7 +1770,7 @@ impl Model {
                     eprintln!("  TPpartA il={il} Apart {:?} z {:?} gdn_tmp {:?}",
                         st.attn_out.read_f32(2)?, rt.z.read_f32(2)?, rt.gdn_tmp.read_f32(2)?);
                 }
-                tb.lo.recv(&mut tb.recv, (t * s.n_embd) as usize * 4)?;
+                tb.lo.recv_f32(&mut tb.recv, (t * s.n_embd) as usize)?;
                 if dbg {
                     eprintln!("  TPpartB il={il} Bpart {:?}", tb.recv.read_f32(2)?);
                 }
@@ -1877,9 +1886,9 @@ impl Model {
                 let nh2 = s.n_head / 2;
                 let nkv2 = s.n_head_kv / 2;
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
-                tb.lx.send(&st.normed, (t * s.n_embd) as usize * 4)?;
+                tb.lx.send_f32(&st.normed, (t * s.n_embd) as usize)?;
                 kernels::set_device(tb.dev)?;
-                tb.lx.recv(&mut tb.normed, (t * s.n_embd) as usize * 4)?;
+                tb.lx.recv_f32(&mut tb.normed, (t * s.n_embd) as usize)?;
                 if matches!(bw.wq, MatW::Kq(_)) {
                     kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, t)?;
                 }
@@ -1918,7 +1927,7 @@ impl Model {
                     kernels::quantize_q8_k(&mut tb.midq, &tb.aheads, nh2 * hd, t)?;
                 }
                 matw(&mut tb.out, &bw.out, &tb.aheads, &tb.midq, nh2 * hd, s.n_embd, t)?;
-                tb.lo.send(&tb.out, (t * s.n_embd) as usize * 4)?;
+                tb.lo.send_f32(&tb.out, (t * s.n_embd) as usize)?;
                 kernels::set_device(kernels::primary_device())?;
                 // A's heads, overlapping with B's chain
                 matw(&mut rt.qfull, &attn.wq, &st.normed, &st.xq, s.n_embd, 2 * nh2 * hd, t)?;
@@ -1954,7 +1963,7 @@ impl Model {
                     kernels::quantize_q8_k(&mut st.midq, &st.heads, nh2 * hd, t)?;
                 }
                 matw(&mut st.attn_out, &attn.out, &st.heads, &st.midq, nh2 * hd, s.n_embd, t)?;
-                tb.lo.recv(&mut tb.recv, (t * s.n_embd) as usize * 4)?;
+                tb.lo.recv_f32(&mut tb.recv, (t * s.n_embd) as usize)?;
                 kernels::add_assign(&mut st.attn_out, &tb.recv, t * s.n_embd)?;
             } else {
             // ---- sigmoid-gated full attention (partial neox rope)
@@ -2211,6 +2220,15 @@ impl Model {
         let q_dim = d.n_head * d.head_dim;
         let total_k = (w_eff + bs) as u32;
         let n_groups = d.dflash2.as_ref().map_or(0, |d2| s.n_embd / d2.group);
+        let dbg_t = std::env::var_os("PULSAR_DFLASH_DEBUG").is_some();
+        let mark = |label: &str, t: &mut std::time::Instant| {
+            if dbg_t {
+                let _ = kernels::sync();
+                eprintln!("  dflash_draft {label}: {:.2}ms", t.elapsed().as_secs_f64() * 1e3);
+                *t = std::time::Instant::now();
+            }
+        };
+        let mut dt = std::time::Instant::now();
         for (il, l) in d.layers.iter().enumerate() {
             kernels::rms_norm(&mut d.hn, &d.h, &l.attn_norm, s.n_embd, bs as u32, eps)?;
             // DFlash2: grouped block-conv between the norm and the
@@ -2274,9 +2292,11 @@ impl Model {
                 kernels::add_assign(&mut d.h, &d.tmp, bs as u32 * s.n_embd)?;
             }
         }
+        mark("layers", &mut dt);
         // final norm -> target lm head (head_logits reads st.normed)
         kernels::rms_norm(&mut st.normed, &d.h, &d.out_norm, s.n_embd, bs as u32, eps)?;
         self.head_logits(st, bs as u32)?;
+        mark("head", &mut dt);
         let v = s.n_vocab as usize;
         let mut out: Vec<u32>;
         // DeepSpec next-token rows: draft slot j comes from logits row
@@ -2329,6 +2349,7 @@ impl Model {
                 out[j] = ids_h[r * ku + best_c] as u32;
                 prev = pred_h[(r * ku + best_c) * ru..(r * ku + best_c + 1) * ru].to_vec();
             }
+            mark("selector", &mut dt);
             return Ok(out);
         }
         if let Some(dk) = &mut d.dspark {

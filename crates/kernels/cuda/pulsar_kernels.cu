@@ -7541,3 +7541,41 @@ extern "C" int pulsar_mla_selftest(void) {
 #include "dsv4_kernels.inc"
 #include "qwen35_kernels.inc"
 #include "k3_kernels.inc"
+
+/* ---- bf16 staging for TP hops -------------------------------------
+ * Consumer GeForce cards have no P2P, so every tensor-parallel hop is
+ * staged D2H -> pinned -> H2D. That traffic is the prefill critical
+ * path (measured: 15.2GB per 2545-token prefill, 535ms of primary-card
+ * stall). Activations do not need 24 mantissa bits to cross a bus, so
+ * pack to bf16 on the sender and unpack on the receiver: same shape,
+ * half the bytes. Round-to-nearest-even, not truncation - truncation
+ * biases every value toward zero and that bias compounds over 64
+ * layers of residual adds. */
+__device__ static inline uint16_t f32_to_bf16_rne(float f) {
+    uint32_t x = __float_as_uint(f);
+    if ((x & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((x >> 16) | 0x0040u); /* NaN */
+    uint32_t lsb = (x >> 16) & 1u;
+    return (uint16_t)((x + 0x7fffu + lsb) >> 16);
+}
+
+__global__ static void pack_bf16_kernel(uint16_t *out, const float *in, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = f32_to_bf16_rne(in[i]);
+}
+
+__global__ static void unpack_bf16_kernel(float *out, const uint16_t *in, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __uint_as_float((uint32_t)in[i] << 16);
+}
+
+extern "C" int pulsar_pack_bf16(void *out, const void *in, uint32_t n) {
+    if (!out || !in || n == 0) return 0;
+    pack_bf16_kernel<<<(n + 255u) / 256u, 256>>>((uint16_t *)out, (const float *)in, n);
+    return cuda_ok(cudaGetLastError(), "pack bf16");
+}
+
+extern "C" int pulsar_unpack_bf16(void *out, const void *in, uint32_t n) {
+    if (!out || !in || n == 0) return 0;
+    unpack_bf16_kernel<<<(n + 255u) / 256u, 256>>>((float *)out, (const uint16_t *)in, n);
+    return cuda_ok(cudaGetLastError(), "unpack bf16");
+}
