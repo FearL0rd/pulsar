@@ -295,6 +295,14 @@ mod real {
         PRIMARY_DEV.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Default-ON env flag: unset or any value but "0" means on. Both TP
+    /// hop levers (PULSAR_P2P, PULSAR_TP_BF16) measured strictly faster
+    /// (11.15 -> 10.12s on the 7.4k TP prefill) and p2p self-detects
+    /// driver support, so opt-OUT is the safe polarity.
+    fn env_on(name: &str) -> bool {
+        std::env::var(name).map_or(true, |v| v != "0")
+    }
+
     fn ensure_device() {
         use std::sync::Once;
         static ONCE: Once = Once::new();
@@ -327,14 +335,15 @@ mod real {
                 best.0
             });
             PRIMARY_DEV.store(dev, std::sync::atomic::Ordering::Relaxed);
-            // PULSAR_P2P=1: establish peer access HERE, inside the same
+            // P2P on by default (PULSAR_P2P=0 disables): establish peer
+            // access HERE, inside the same
             // once-block that picks the device, i.e. before a single
             // DeviceBuf exists. Enabling it later (from TpLink::new, after
             // the weight pool is allocated) surfaced as a failing kernel
             // launch two calls downstream, which is what a deferred CUDA
             // error looks like. Consumer cards report can-access only with
             // a patched driver; where they do not, this is a no-op.
-            if std::env::var_os("PULSAR_P2P").is_some() {
+            if env_on("PULSAR_P2P") {
                 let mut n = 0;
                 unsafe { cudaGetDeviceCount(&mut n) };
                 let mut pairs = 0;
@@ -848,7 +857,8 @@ mod real {
         s16: DeviceBuf,
         /// bf16 stage on the RECEIVER's device (unpack source)
         r16: DeviceBuf,
-        /// PULSAR_TP_BF16=1: halve the bytes that cross the bus
+        /// bf16 hop staging, on by default (PULSAR_TP_BF16=0 for exact
+        /// f32 hops): halves the bytes that cross the bus
         bf16: bool,
     }
 
@@ -870,11 +880,11 @@ mod real {
             set_device(peer)?;
             let r16 = DeviceBuf::alloc(bytes / 2 + 4)?;
             set_device(here)?;
-            let bf16 = std::env::var_os("PULSAR_TP_BF16").is_some();
+            let bf16 = env_on("PULSAR_TP_BF16");
             // Peer access itself is established once in ensure_device, before
             // any allocation; here we only ASK whether it took, both ways.
             let mut p2p = false;
-            if std::env::var_os("PULSAR_P2P").is_some() && here != peer {
+            if env_on("PULSAR_P2P") && here != peer {
                 let (mut ab, mut ba) = (0i32, 0i32);
                 unsafe {
                     cudaDeviceCanAccessPeer(&mut ab, here, peer);
