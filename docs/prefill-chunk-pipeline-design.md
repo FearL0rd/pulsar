@@ -61,6 +61,35 @@ behind chunk c:
   If the 262k-ctx KV auto-sizer cannot afford it, run pipe with
   PULSAR_PREFILL_CHUNK=256 (two 256 lanes ~= one 512 chunk).
 
+## Stage-2 shape (refined after stage 1 landed, d78425d)
+
+- Lanes live as lane-indexed scratch: Qwen35Rt.sc -> Vec<RtScratch>,
+  TpBank.sc -> Vec<TbScratch>, FfnBank.sc -> Vec<FcScratch> (TbScratch/
+  FcScratch already carry their own TpLinks and pos cells, so a lane is
+  hop-self-contained on cards B/C by construction).
+- Driver: std::thread::scope; split_at_mut hands each worker thread
+  exclusive &mut to ITS lane's scratch before spawn (no aliasing), plus
+  a shared view for the truly shared mutables.
+- Shared mutables needing the narrow unsafe (raw ptr + device-event
+  ordering contract): KV caches (st.kcache/vcache/tp_kcache), GdnState
+  s/conv buffers, and nothing else. st.tok and weights are read-only;
+  config scalars (ctx, kvq, prof, dev) copy per thread.
+- State chunk-scratch that must move into the lane (from st.* usage
+  census): cur, normed, attn_out, after_attn, q, k, v, heads, xq,
+  gate_act, up_act, ffn_mid, midq, ffn_out, plus the rope/MoE set
+  qrot, krot, shared_out, moe_out, router_logits, router_selected,
+  router_weights. Head-stage buffers (last_row, head_xq, logits,
+  amax_out, st.normed's head use) stay on State - the head runs outside
+  the pipe after both lanes drain.
+- eval_qwen35_layer signature becomes (&self, lane: LaneView, shared,
+  il, l, pos, t); the non-pipe path builds a LaneView over lane 0 so
+  decode and single-chunk prefill are untouched.
+- Per-(chunk,layer) events: ring of 2 XEvents per layer; lane p waits
+  the other lane's event[il] before layer il, records its own after.
+  XEvent records on the recording THREAD's default stream and gates the
+  waiter's - exactly the cross-thread edge needed (verified in kernels
+  lib: XEvent/DeviceBuf/TpLink are Send).
+
 ## Targets
 
 - Baseline 3-card with default hop levers: 10.11s (735 tok/s).
