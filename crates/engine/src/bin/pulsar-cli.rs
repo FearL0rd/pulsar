@@ -987,7 +987,7 @@ fn run() -> engine::Result {
     let mut logits = None;
     let mut pos0 = 0u32;
     let prof_chunks = std::env::var_os("PULSAR_PROFILE").is_some();
-    for chunk in prompt_ids.chunks(st.max_batch() as usize) {
+    for chunk in prompt_ids.chunks(model.prefill_cap(&st)) {
         let last = pos0 as usize + chunk.len() == prompt_ids.len();
         let tc = std::time::Instant::now();
         logits = model.forward_batch(&mut st, chunk, pos0, last)?;

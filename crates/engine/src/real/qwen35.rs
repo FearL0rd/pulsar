@@ -195,6 +195,212 @@ impl RtScratch {
     }
 }
 
+// ---------------- PULSAR_PIPE: two-lane prefill chunk pipeline ----------------
+//
+// Design: docs/prefill-chunk-pipeline-design.md. Two prefill chunks in
+// flight, chunk c+1 exactly one layer behind chunk c: both cross-chunk
+// dependencies (KV rows, GDN/conv state) are layer-i-to-layer-i, so one
+// primary-device event per (layer, lane-slot) orders them, transitively
+// covering the card-B stream through the existing lx/lo link edges.
+// Concurrency comes from two HOST threads (the build is
+// --default-stream=per-thread, so each thread owns a stream per device);
+// lane 1 runs on bitwise-aliased State/Qwen35Rt "shells" whose chunk
+// scratch is swapped for the lane's own buffers, so the 800-line eval
+// path needs no signature change at all.
+
+pub(super) fn pipe_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PULSAR_PIPE").ok().as_deref() == Some("1"))
+}
+
+/// Lane-1 copies of the State chunk scratch the qwen35 eval path writes.
+/// Sizes mirror State::new with mb = chunk_max(); head-stage buffers
+/// (last_row, head_xq, logits, amax_out) are NOT here - the head runs
+/// after both lanes drain, on State's own set.
+struct StLane {
+    cur: DeviceBuf,
+    normed: DeviceBuf,
+    q: DeviceBuf,
+    k: DeviceBuf,
+    v: DeviceBuf,
+    heads: DeviceBuf,
+    attn_out: DeviceBuf,
+    after_attn: DeviceBuf,
+    gate_act: DeviceBuf,
+    up_act: DeviceBuf,
+    ffn_mid: DeviceBuf,
+    ffn_out: DeviceBuf,
+    shared_out: DeviceBuf,
+    router_logits: DeviceBuf,
+    router_selected: DeviceBuf,
+    router_weights: DeviceBuf,
+    moe_out: DeviceBuf,
+    xq: DeviceBuf,
+    midq: DeviceBuf,
+    krot: DeviceBuf,
+    qrot: DeviceBuf,
+}
+
+impl StLane {
+    fn new(st: &State, s: &super::Shape) -> Result<StLane> {
+        let cm = chunk_max() as u32;
+        let f32s = |n: u32| DeviceBuf::alloc(n as usize * 4);
+        let q8k = |n: usize| n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES;
+        let n_used = s.n_expert_used.max(1);
+        let nf = s.n_ff_dense.max(s.n_ff_exp);
+        Ok(StLane {
+            cur: f32s(cm * s.n_embd)?,
+            normed: f32s(cm * s.n_embd)?,
+            q: f32s(cm * s.n_head * s.head_dim.max(s.qk_dim()))?,
+            k: f32s(cm * s.n_head_kv * s.head_dim)?,
+            v: f32s(cm * s.n_head_kv * s.head_dim)?,
+            heads: f32s(cm * s.heads_dim().max(s.n_head * s.head_dim))?,
+            attn_out: f32s(cm * s.n_embd)?,
+            after_attn: f32s(cm * s.n_embd)?,
+            gate_act: f32s(cm * nf)?,
+            up_act: f32s(cm * nf)?,
+            ffn_mid: f32s(cm * nf)?,
+            ffn_out: f32s(cm * s.n_embd)?,
+            shared_out: f32s(cm * s.n_embd)?,
+            router_logits: f32s(cm * (s.n_expert + s.n_shexp_sink))?,
+            router_selected: DeviceBuf::alloc(cm as usize * n_used as usize * 4)?,
+            router_weights: f32s(cm * s.n_expert_used.max(1))?,
+            moe_out: f32s(cm * s.n_embd)?,
+            xq: DeviceBuf::alloc(cm as usize * q8k(s.n_embd as usize))?,
+            midq: DeviceBuf::alloc(cm as usize * n_used as usize * q8k(s.n_ff_exp as usize))?,
+            krot: if st.kvq_rot { f32s(cm * s.n_head_kv * s.head_dim)? } else { f32s(1)? },
+            qrot: if st.kvq_rot { f32s(cm * s.n_head * s.head_dim)? } else { f32s(1)? },
+        })
+    }
+}
+
+/// Everything lane 1 owns: primary-card State + Rt scratch plus the
+/// per-lane halves on cards B and C (which carry their own TpLinks and
+/// position cells, so a lane is hop-self-contained by construction).
+struct PipeLane {
+    st: StLane,
+    sc: RtScratch,
+    tb: Option<TbScratch>,
+    fc: Option<FcScratch>,
+}
+
+impl PipeLane {
+    fn new(m: &Model, st: &State) -> Result<PipeLane> {
+        Ok(PipeLane {
+            st: StLane::new(st, &m.shape)?,
+            sc: RtScratch::new(&m.shape)?,
+            tb: match &m.tp { Some(_) => Some(TbScratch::new(m)?), None => None },
+            fc: match &m.tp_c { Some(_) => Some(FcScratch::new(m)?), None => None },
+        })
+    }
+}
+
+/// Per-layer event hook eval_qwen35_span consults in pipe mode. `evs`
+/// points at the driver-owned [(slot0, slot1); n_layers] ring; `slot` is
+/// constant per thread (T0 runs even chunks = slot 0). An event that was
+/// never recorded waits as a no-op, which covers the very first chunk.
+#[derive(Clone, Copy)]
+struct PipeHook {
+    evs: *const (kernels::XEvent, kernels::XEvent),
+    slot: u8,
+}
+
+struct PipeCtx {
+    m: *const Model,
+    st: *mut State,
+    rt: *mut Qwen35Rt,
+}
+unsafe impl Send for PipeCtx {}
+
+/// Bitwise-aliased State/Qwen35Rt shells for lane 1.
+///
+/// SAFETY contract: the shells are ptr::read copies wrapped in
+/// ManuallyDrop (their fields never drop; the Box frees only its own
+/// allocation). Chunk scratch is mem::swapped for the lane's own
+/// buffers, so the two threads never write the same scratch. What stays
+/// bitwise-ALIASED and is mutated by both threads - KV caches, GDN/conv
+/// states - is ordered on-device by the PipeHook events plus the lx/lo
+/// link edges; host-side both threads only enqueue FFI work through the
+/// aliased pointers, never touch container structure. Collections that
+/// eval mutates structurally (graphs via mem::take, banks) get FRESH
+/// empty instances ptr::written over the alias (empty HashMap/Vec do not
+/// allocate, so the shell leaks nothing).
+struct ShellGuard {
+    sh_st: Box<std::mem::ManuallyDrop<State>>,
+    sh_rt: Box<std::mem::ManuallyDrop<Qwen35Rt>>,
+    lane: *mut PipeLane,
+    done: bool,
+}
+
+impl ShellGuard {
+    unsafe fn new(st: &mut State, rt: &mut Qwen35Rt) -> ShellGuard {
+        let lane: *mut PipeLane = &mut **rt.pipe_lane.as_mut().unwrap();
+        let mut sh_st = Box::new(std::mem::ManuallyDrop::new(std::ptr::read(st as *const State)));
+        let mut sh_rt = Box::new(std::mem::ManuallyDrop::new(std::ptr::read(rt as *const Qwen35Rt)));
+        std::ptr::write(&mut sh_rt.graphs, std::collections::HashMap::new());
+        std::ptr::write(&mut sh_rt.banks, Vec::new());
+        std::ptr::write(&mut sh_rt.dflash, None);
+        std::ptr::write(&mut sh_rt.pipe_lane, None);
+        sh_rt.graphs_on = false;
+        // silence the unused warning on sh_st's DerefMut path
+        let _ = &mut sh_st;
+        let mut g = ShellGuard { sh_st, sh_rt, lane, done: false };
+        g.swap_all();
+        g
+    }
+
+    /// Symmetric: called once at build (lane buffers IN) and once at
+    /// teardown (lane buffers back OUT, aliases restored to the shells
+    /// where they are then forgotten).
+    fn swap_all(&mut self) {
+        use std::mem::swap;
+        let ln = unsafe { &mut *self.lane };
+        let st: &mut State = &mut self.sh_st;
+        swap(&mut st.cur, &mut ln.st.cur);
+        swap(&mut st.normed, &mut ln.st.normed);
+        swap(&mut st.q, &mut ln.st.q);
+        swap(&mut st.k, &mut ln.st.k);
+        swap(&mut st.v, &mut ln.st.v);
+        swap(&mut st.heads, &mut ln.st.heads);
+        swap(&mut st.attn_out, &mut ln.st.attn_out);
+        swap(&mut st.after_attn, &mut ln.st.after_attn);
+        swap(&mut st.gate_act, &mut ln.st.gate_act);
+        swap(&mut st.up_act, &mut ln.st.up_act);
+        swap(&mut st.ffn_mid, &mut ln.st.ffn_mid);
+        swap(&mut st.ffn_out, &mut ln.st.ffn_out);
+        swap(&mut st.shared_out, &mut ln.st.shared_out);
+        swap(&mut st.router_logits, &mut ln.st.router_logits);
+        swap(&mut st.router_selected, &mut ln.st.router_selected);
+        swap(&mut st.router_weights, &mut ln.st.router_weights);
+        swap(&mut st.moe_out, &mut ln.st.moe_out);
+        swap(&mut st.xq, &mut ln.st.xq);
+        swap(&mut st.midq, &mut ln.st.midq);
+        swap(&mut st.krot, &mut ln.st.krot);
+        swap(&mut st.qrot, &mut ln.st.qrot);
+        let rt: &mut Qwen35Rt = &mut self.sh_rt;
+        swap(&mut rt.sc, &mut ln.sc);
+        if let (Some(tb), Some(lb)) = (rt.tpb.as_mut(), ln.tb.as_mut()) {
+            swap(&mut tb.sc, lb);
+        }
+        if let (Some(c), Some(lc)) = (rt.tpc.as_mut(), ln.fc.as_mut()) {
+            swap(&mut c.sc, lc);
+        }
+    }
+
+    fn teardown(&mut self) {
+        if !self.done {
+            self.swap_all();
+            self.done = true;
+        }
+    }
+}
+
+impl Drop for ShellGuard {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
 struct DenseBank {
     /// one past this bank's last layer (exclusive); banks tile the
     /// non-primary layer ranges in order
@@ -258,13 +464,9 @@ impl DenseBank {
 
     fn one(m: &Model, first: usize, end: usize) -> Result<DenseBank> {
         let cm = chunk_max();
-        let primary = kernels::get_device();
         let s = m.shape;
         let primary = kernels::get_device();
         let dev = m.layer_dev(first);
-        let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
-        let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
-        let conv_dim = 2 * key_dim + value_dim;
         let n_ff = s.n_ff_exp as usize;
         let n_embd = s.n_embd as usize;
         kernels::set_device(dev)?;
@@ -352,6 +554,37 @@ struct FcScratch {
     lo: kernels::TpLink,
 }
 
+impl FcScratch {
+    /// Third-card per-lane FFN scratch incl. its own links. Leaves the
+    /// PRIMARY device current on return.
+    fn new(m: &Model) -> Result<FcScratch> {
+        let c = m.tp_c.as_ref().ok_or("FcScratch::new without tp_c")?;
+        let s = m.shape;
+        let cm = chunk_max();
+        let primary = kernels::get_device();
+        let f32s = |n: usize| DeviceBuf::alloc(n * 4);
+        let q8k = |n: usize| n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES;
+        let w = c.width as usize;
+        // lx records on the primary (it sends), lo on the third card
+        let lx = kernels::TpLink::new(cm * q8k(s.n_embd as usize), c.dev)?;
+        let recv = f32s(cm * s.n_embd as usize)?;
+        kernels::set_device(c.dev)?;
+        let b = FcScratch {
+            xq: DeviceBuf::alloc(cm * q8k(s.n_embd as usize))?,
+            gate: f32s(cm * w)?,
+            up: f32s(cm * w)?,
+            mid: f32s(cm * w)?,
+            midq: DeviceBuf::alloc(cm * q8k(w))?,
+            out: f32s(cm * s.n_embd as usize)?,
+            recv,
+            lx,
+            lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
+        };
+        kernels::set_device(primary)?;
+        Ok(b)
+    }
+}
+
 struct FfnBank {
     dev: i32,
     width: u32,
@@ -410,6 +643,72 @@ struct TbScratch {
     lo: kernels::TpLink,
 }
 
+impl TbScratch {
+    /// Card-B per-lane scratch incl. its own links and position cells.
+    /// Leaves the PRIMARY device current on return.
+    fn new(m: &Model) -> Result<TbScratch> {
+        let tp = m.tp.as_ref().ok_or("TbScratch::new without tp")?;
+        let s = m.shape;
+        let cm = chunk_max();
+        let primary = kernels::get_device();
+        let f32s = |n: usize| DeviceBuf::alloc(n * 4);
+        let q8k = |n: usize| n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES;
+        let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
+        let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
+        // tp.half is A's share; B holds the rest
+        let half = (s.n_ff_exp - tp.half) as usize;
+        let (kdh, vdh) = (key_dim / 2, value_dim / 2);
+        let cdh = 2 * kdh + vdh;
+        let vh = s.ssm_v_heads as usize / 2;
+        let recv = f32s(cm * s.n_embd as usize)?; // on the primary
+        // an event records only on its OWN device's streams: lx records
+        // on A (the activation sends), lo on B (the partial returns), so
+        // each is created with that device current
+        let lx = kernels::TpLink::new(cm * s.n_embd as usize * 4, tp.dev)?;
+        kernels::set_device(tp.dev)?;
+        let b = TbScratch {
+            xq: DeviceBuf::alloc(cm * q8k(s.n_embd as usize))?,
+            gate: f32s(cm * half)?,
+            up: f32s(cm * half)?,
+            mid: f32s(cm * half)?,
+            midq: DeviceBuf::alloc(cm * q8k(half))?,
+            out: f32s(cm * s.n_embd as usize)?,
+            recv,
+            normed: f32s(cm * s.n_embd as usize)?,
+            qkv: f32s(cm * cdh)?,
+            conv_out: f32s(cm * cdh)?,
+            z: f32s(cm * vdh)?,
+            gq: f32s(cm * kdh)?,
+            gk: f32s(cm * kdh)?,
+            gv: f32s(cm * vdh)?,
+            g: f32s(cm * vh)?,
+            beta: f32s(cm * vh)?,
+            gb: f32s(2 * vh)?,
+            gdn_o: f32s(cm * vdh)?,
+            gdn_tmp: f32s(cm * vdh)?,
+            aqf: f32s(cm * (s.n_head * s.head_dim) as usize)?,
+            aq: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
+            agate: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
+            ak: f32s(cm * (s.n_head_kv / 2 * s.head_dim) as usize)?,
+            av: f32s(cm * (s.n_head_kv / 2 * s.head_dim) as usize)?,
+            aheads: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
+            pos_b: DeviceBuf::alloc(4)?,
+            hlog: f32s(16 * (s.n_vocab / 2) as usize)?,
+            bmax: DeviceBuf::alloc(16 * 8)?,
+            pos_a: {
+                kernels::set_device(primary)?;
+                let b = DeviceBuf::alloc(4)?;
+                kernels::set_device(tp.dev)?;
+                b
+            },
+            lx,
+            lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
+        };
+        kernels::set_device(primary)?;
+        Ok(b)
+    }
+}
+
 struct TpBank {
     dev: i32,
     states: Vec<Option<GdnState>>,
@@ -435,12 +734,15 @@ pub(super) struct Qwen35Rt {
     tpc: Option<FfnBank>,
     /// per-chunk primary-card scratch (one lane; PULSAR_PIPE adds one)
     sc: RtScratch,
+    /// two-lane prefill pipeline: per-layer event hook consulted by
+    /// eval_qwen35_span, and lane 1's scratch (lazily allocated)
+    pipe: Option<PipeHook>,
+    pipe_lane: Option<Box<PipeLane>>,
     dflash: Option<DflashRt>,
 }
 
 impl Qwen35Rt {
     pub fn new(m: &Model) -> Result<Qwen35Rt> {
-        let cm = chunk_max();
         let s = m.shape;
         let primary = kernels::get_device();
         let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
@@ -472,32 +774,21 @@ impl Qwen35Rt {
         }
         kernels::set_device(primary)?;
         let banks = DenseBank::all(m)?;
-        let f32s = |n: usize| DeviceBuf::alloc(n * 4);
         let graphs_on = std::env::var("PULSAR_GRAPHS").ok().as_deref() != Some("0")
             && m.layers.iter().any(|l| {
                 matches!(l.ffn, super::Ffn::DenseKq { .. } | super::Ffn::Dense { .. })
             });
         let tpb = match &m.tp {
             Some(tp) => {
-                let q8k = |n: usize| {
-                    n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
-                };
-                // tp.half is A's share; B holds the rest
-                let half = (s.n_ff_exp - tp.half) as usize;
-                let (kdh, vdh) = (key_dim / 2, value_dim / 2);
-                let cdh = 2 * kdh + vdh;
                 let vh = s.ssm_v_heads as usize / 2;
-                let recv = f32s(cm * s.n_embd as usize)?; // on the primary
-                // an event records only on its OWN device's streams: lx
-                // records on A (the activation sends: q8_K rows for the
-                // FFN, f32 normed for the GDN half), lo on B (the
-                // partial returns), so each is created with that device
-                // current
-                let lx = kernels::TpLink::new(cm * s.n_embd as usize * 4, tp.dev)?;
                 kernels::set_device(tp.dev)?;
                 let mut bstates = Vec::with_capacity(s.n_exec_layer as usize);
                 for il in 0..s.n_exec_layer as usize {
                     if m.tp_gdn(il).is_some() {
+                        let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
+                        let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
+                        let (kdh, vdh) = (key_dim / 2, value_dim / 2);
+                        let cdh = 2 * kdh + vdh;
                         let sbytes = vh * s.ssm_state as usize * s.ssm_state as usize * 4;
                         let cbytes = (s.ssm_conv_k as usize - 1) * cdh * 4;
                         let mut st2 = GdnState {
@@ -514,82 +805,21 @@ impl Qwen35Rt {
                         bstates.push(None);
                     }
                 }
-                let b = TpBank {
+                kernels::set_device(primary)?;
+                Some(TpBank {
                     dev: tp.dev,
                     states: bstates,
-                    sc: TbScratch {
-                    xq: DeviceBuf::alloc(cm * q8k(s.n_embd as usize))?,
-                    gate: f32s(cm * half)?,
-                    up: f32s(cm * half)?,
-                    mid: f32s(cm * half)?,
-                    midq: DeviceBuf::alloc(cm * q8k(half))?,
-                    out: f32s(cm * s.n_embd as usize)?,
-                    recv,
-                    normed: f32s(cm * s.n_embd as usize)?,
-                    qkv: f32s(cm * cdh)?,
-                    conv_out: f32s(cm * cdh)?,
-                    z: f32s(cm * vdh)?,
-                    gq: f32s(cm * kdh)?,
-                    gk: f32s(cm * kdh)?,
-                    gv: f32s(cm * vdh)?,
-                    g: f32s(cm * vh)?,
-                    beta: f32s(cm * vh)?,
-                    gb: f32s(2 * vh)?,
-                    gdn_o: f32s(cm * vdh)?,
-                    gdn_tmp: f32s(cm * vdh)?,
-                    aqf: f32s(cm * (s.n_head * s.head_dim) as usize)?,
-                    aq: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
-                    agate: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
-                    ak: f32s(cm * (s.n_head_kv / 2 * s.head_dim) as usize)?,
-                    av: f32s(cm * (s.n_head_kv / 2 * s.head_dim) as usize)?,
-                    aheads: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
-                    pos_b: DeviceBuf::alloc(4)?,
-                    hlog: f32s(16 * (s.n_vocab / 2) as usize)?,
-                    bmax: DeviceBuf::alloc(16 * 8)?,
-                    pos_a: {
-                        kernels::set_device(primary)?;
-                        let b = DeviceBuf::alloc(4)?;
-                        kernels::set_device(tp.dev)?;
-                        b
-                    },
-                    lx,
-                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
-                    },
-                };
-                kernels::set_device(primary)?;
-                Some(b)
+                    sc: TbScratch::new(m)?,
+                })
             }
             None => None,
         };
         let tpc = match &m.tp_c {
-            Some(c) => {
-                let q8k = |n: usize| {
-                    n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
-                };
-                let w = c.width as usize;
-                // lx records on the primary (it sends), lo on the third
-                // card, so each link is created with its device current
-                let lx = kernels::TpLink::new(cm * q8k(s.n_embd as usize), c.dev)?;
-                let recv = f32s(cm * s.n_embd as usize)?;
-                kernels::set_device(c.dev)?;
-                let b = FfnBank {
-                    dev: c.dev,
-                    width: c.width,
-                    sc: FcScratch {
-                    xq: DeviceBuf::alloc(cm * q8k(s.n_embd as usize))?,
-                    gate: f32s(cm * w)?,
-                    up: f32s(cm * w)?,
-                    mid: f32s(cm * w)?,
-                    midq: DeviceBuf::alloc(cm * q8k(w))?,
-                    out: f32s(cm * s.n_embd as usize)?,
-                    recv,
-                    lx,
-                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
-                    },
-                };
-                kernels::set_device(primary)?;
-                Some(b)
-            }
+            Some(c) => Some(FfnBank {
+                dev: c.dev,
+                width: c.width,
+                sc: FcScratch::new(m)?,
+            }),
             None => None,
         };
         Ok(Qwen35Rt {
@@ -600,6 +830,8 @@ impl Qwen35Rt {
             tpb,
             states,
             sc: RtScratch::new(&s)?,
+            pipe: None,
+            pipe_lane: None,
             dflash: None,
         })
     }
@@ -1268,6 +1500,7 @@ impl Model {
             st.tok = kernels::DeviceBuf::alloc(ids.len() * 4)?;
         }
         st.tok.write(0, kernels::as_bytes(&ids))?;
+        let banks_empty = banks.is_empty();
         let mut run = |st: &mut State, rt: &mut Qwen35Rt, t: u32, tok_off: u32, pos: u32, last: bool| -> Result {
             // per-token position cells (TP graph capture): the captured
             // attention kernels dereference these, so a replayed graph
@@ -1364,11 +1597,28 @@ impl Model {
         };
         let cm = chunk_max();
         let n_chunks = tokens.chunks(cm).count();
-        for (ci, chunk) in tokens.chunks(cm).enumerate() {
-            let t = chunk.len() as u32;
-            run(st, rt, t, (ci * cm) as u32, pos, ci + 1 == n_chunks)?;
-            pos += t;
-            last_t = t;
+        let pipe = pipe_on()
+            && self.tp.is_some()
+            && banks_empty
+            && rt.dflash.is_none()
+            && n_chunks >= 3
+            && self.layers.iter().all(|l| {
+                matches!(l.ffn, super::Ffn::DenseKq { .. } | super::Ffn::Dense { .. })
+            })
+            && std::env::var_os("PULSAR_PROFILE").is_none()
+            && std::env::var_os("PULSAR_DEBUG_L2").is_none()
+            && std::env::var_os("PULSAR_DENSE_PROF").is_none();
+        if pipe {
+            last_t = self.qwen35_pipe_chunks(st, rt, tokens, pos0, n0)?;
+            pos = pos0 + tokens.len() as u32;
+            let _ = pos;
+        } else {
+            for (ci, chunk) in tokens.chunks(cm).enumerate() {
+                let t = chunk.len() as u32;
+                run(st, rt, t, (ci * cm) as u32, pos, ci + 1 == n_chunks)?;
+                pos += t;
+                last_t = t;
+            }
         }
         rt.banks = banks;
         if rows == 0 {
@@ -1435,6 +1685,126 @@ impl Model {
             .map(|(a, b)| if b.0 > a.0 { b.1 + v2 } else { a.1 })
             .collect();
         Ok(true)
+    }
+
+    /// PULSAR_PIPE driver: runs every cm-chunk of `tokens` through two
+    /// lanes on two host threads, chunk c+1 one layer behind chunk c via
+    /// the PipeHook events. Returns the final chunk's row count; the
+    /// final residual always ends in State's own `cur` (copied back when
+    /// the last chunk ran on the shell lane). Caller guarantees: TP on,
+    /// banks empty, no dflash, dense layers only, >= 3 chunks.
+    fn qwen35_pipe_chunks(
+        &self,
+        st: &mut State,
+        rt: &mut Qwen35Rt,
+        tokens: &[u32],
+        pos0: u32,
+        n0: usize,
+    ) -> Result<u32> {
+        let cm = chunk_max();
+        let s = self.shape;
+        if rt.pipe_lane.is_none() {
+            rt.pipe_lane = Some(Box::new(PipeLane::new(self, st)?));
+            eprintln!("pulsar: pipe lane allocated (PULSAR_PIPE two-chunk prefill)");
+        }
+        let n_layers = self.layers.len();
+        let mut evs: Vec<(kernels::XEvent, kernels::XEvent)> = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            evs.push((kernels::XEvent::new()?, kernels::XEvent::new()?));
+        }
+        // the octet-tile GEMM scratch is process-global; two lanes would
+        // clobber it mid-flight, so the pipe runs with it disabled
+        let oct_prev = std::env::var_os("PULSAR_NO_OCT");
+        std::env::set_var("PULSAR_NO_OCT", "1");
+        let graphs_prev = rt.graphs_on;
+        rt.graphs_on = false;
+        rt.pipe = Some(PipeHook { evs: evs.as_ptr(), slot: 0 });
+        let mut guard = unsafe { ShellGuard::new(st, rt) };
+        guard.sh_rt.pipe = Some(PipeHook { evs: evs.as_ptr(), slot: 1 });
+        let ctx = PipeCtx {
+            m: self as *const Model,
+            st: (&mut **guard.sh_st) as *mut State,
+            rt: (&mut **guard.sh_rt) as *mut Qwen35Rt,
+        };
+        let n_chunks = tokens.chunks(cm).count();
+        let pipe_res: std::result::Result<(), String> = std::thread::scope(|scope| {
+            let h = scope.spawn(move || -> std::result::Result<(), String> {
+                let ctx = ctx;
+                kernels::set_device(kernels::primary_device()).map_err(|e| e.to_string())?;
+                let (m, sst, srt) = unsafe { (&*ctx.m, &mut *ctx.st, &mut *ctx.rt) };
+                for (ci, chunk) in tokens.chunks(cm).enumerate() {
+                    if ci % 2 != 1 {
+                        continue;
+                    }
+                    m.pipe_chunk(sst, srt, chunk.len() as u32, (ci * cm) as u32,
+                                 pos0 + (ci * cm) as u32, n0)
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            });
+            let mut main_res: std::result::Result<(), String> = Ok(());
+            for (ci, chunk) in tokens.chunks(cm).enumerate() {
+                if ci % 2 != 0 {
+                    continue;
+                }
+                if let Err(e) = self.pipe_chunk(st, rt, chunk.len() as u32, (ci * cm) as u32,
+                                                pos0 + (ci * cm) as u32, n0) {
+                    main_res = Err(e.to_string());
+                    break;
+                }
+            }
+            let tres = h
+                .join()
+                .map_err(|_| "pipe thread panicked".to_string())
+                .and_then(|r| r);
+            main_res.and(tres)
+        });
+        let last = n_chunks - 1;
+        let last_t = tokens.chunks(cm).last().map_or(0, |c| c.len()) as u32;
+        if pipe_res.is_ok() && last % 2 == 1 {
+            // final chunk lives on the shell lane: order the copy after
+            // its last-layer record, then hand the residual to State's
+            // cur for the head
+            unsafe {
+                let e = &*evs.as_ptr().add(n_layers - 1);
+                e.1.wait()?;
+            }
+            let bytes = last_t as usize * s.n_embd as usize * 4;
+            kernels::copy_d2d(&mut st.cur, 0, &guard.sh_st.cur, 0, bytes)?;
+        }
+        guard.teardown();
+        drop(guard);
+        rt.pipe = None;
+        rt.graphs_on = graphs_prev;
+        match oct_prev {
+            Some(v) => std::env::set_var("PULSAR_NO_OCT", v),
+            None => std::env::remove_var("PULSAR_NO_OCT"),
+        }
+        pipe_res?;
+        Ok(last_t)
+    }
+
+    /// One pipe chunk: position cells + embed + the full layer span.
+    /// Mirrors the non-bank body of forward_qwen35_inner's `run`.
+    fn pipe_chunk(
+        &self,
+        st: &mut State,
+        rt: &mut Qwen35Rt,
+        t: u32,
+        tok_off: u32,
+        pos: u32,
+        n0: usize,
+    ) -> Result {
+        let s = self.shape;
+        let primary = kernels::primary_device();
+        if let Some(tb) = rt.tpb.as_mut() {
+            kernels::set_u32(&mut tb.sc.pos_a, pos)?;
+            kernels::set_device(tb.dev)?;
+            kernels::set_u32(&mut tb.sc.pos_b, pos)?;
+            kernels::set_device(primary)?;
+        }
+        kernels::embed_q8_0_at(&mut st.cur, &self.token_embd, &st.tok, tok_off, s.n_embd, s.n_vocab, t)?;
+        self.eval_qwen35_span(st, rt, 0, n0, pos, t)
     }
 
     /// Eval layers [lo, hi) on the current device. Runs of GDN+DenseKq
@@ -1534,7 +1904,24 @@ impl Model {
                     graphs[&key].launch()?;
                     il = end;
                 } else {
+                    if let Some(p) = rt.pipe {
+                        // pipe lane handoff: layer il may start only after
+                        // the OTHER lane finished ITS layer il (KV rows +
+                        // GDN/conv state; card-B streams follow through
+                        // the lx/lo link edges). Never-recorded events
+                        // wait as no-ops, covering the first chunk.
+                        unsafe {
+                            let e = &*p.evs.add(il);
+                            (if p.slot == 0 { &e.1 } else { &e.0 }).wait()?;
+                        }
+                    }
                     self.eval_qwen35_layer(st, rt, il, &self.layers[il], pos, t)?;
+                    if let Some(p) = rt.pipe {
+                        unsafe {
+                            let e = &*p.evs.add(il);
+                            (if p.slot == 0 { &e.0 } else { &e.1 }).record()?;
+                        }
+                    }
                     if std::env::var_os("PULSAR_DEBUG_L2").is_some() {
                         let a = st.after_attn.read_f32(4)?;
                         let v = st.cur.read_f32(4)?;

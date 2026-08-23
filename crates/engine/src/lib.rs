@@ -6999,6 +6999,19 @@ mod real {
         /// Forward `tokens` at absolute positions pos0..pos0+n. Union
         /// expert fetch per layer across the whole batch. Logits (when
         /// requested) are for the LAST token only.
+        /// How many prompt tokens one forward_batch call may take. The
+        /// generic State scratch is max_batch-sized, so that is the cap -
+        /// EXCEPT qwen35 under PULSAR_PIPE, whose inner loop re-chunks to
+        /// chunk_max() anyway and needs the whole prompt in one call to
+        /// overlap chunks across two lanes.
+        pub fn prefill_cap(&self, st: &State) -> usize {
+            if self.shape.family == Family::Qwen35 && qwen35::pipe_on() {
+                usize::MAX
+            } else {
+                st.max_batch() as usize
+            }
+        }
+
         pub fn forward_batch(
             &self,
             st: &mut State,
@@ -8999,7 +9012,10 @@ mod real {
         let chunk_cap = if mtp_prefill && model.shape.family == Family::Qwen35 {
             (st.max_batch() as usize).min(qwen35::chunk_max())
         } else {
-            st.max_batch() as usize
+            // PULSAR_PIPE makes this usize::MAX for qwen35: the pipe
+            // overlaps chunks INSIDE one forward call (prefix checkpoints
+            // get coarser in exchange)
+            model.prefill_cap(st)
         };
         let prof_chunks = std::env::var_os("PULSAR_PROFILE").is_some();
         if pos0 == 0 {
