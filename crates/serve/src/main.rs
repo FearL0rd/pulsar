@@ -182,7 +182,8 @@ fn run() -> engine::Result {
         .unwrap_or_else(|| "pulsar".into());
 
     eprintln!("pulsar-serve: loading {model_path}");
-    let model = engine::Model::load(std::path::Path::new(&model_path))?;
+    // pass --ctx down: the multi-GPU planner sizes its KV reserve from it
+    let model = engine::Model::load_with_ctx(std::path::Path::new(&model_path), ctx)?;
     let tok = {
         let (_, g) = engine::parse_header(std::path::Path::new(&model_path))?;
         tokenizer::Tokenizer::from_gguf(&g)?

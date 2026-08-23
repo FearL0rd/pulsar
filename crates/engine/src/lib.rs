@@ -3002,7 +3002,17 @@ mod real {
         pub(crate) fn tp_ffn3(&self, il: usize) -> Option<&TpFfnW> {
             self.tp_c.as_ref()?.ffn.get(il)?.as_ref()
         }
+        /// No ctx hint: the multi-GPU planner falls back to a flat KV
+        /// reserve. Prefer `load_with_ctx` whenever the caller knows --ctx.
         pub fn load(path: &Path) -> Result<Model> {
+            Self::load_with_ctx(path, 0)
+        }
+
+        /// `ctx_hint` > 0 lets the TP/PP planner size its KV reserve for the
+        /// ctx `State::new` will actually request. The planner runs at load
+        /// time, before ctx exists, so without the hint it guesses flat and
+        /// keeps every layer on the TP pair - then prefill OOMs at long ctx.
+        pub fn load_with_ctx(path: &Path, ctx_hint: u32) -> Result<Model> {
             let (shards, gguf) = parse_header(path)?;
             let file = VFile::open(&shards)?;
             let shape = Shape::from_gguf(&gguf)?;
@@ -3398,10 +3408,35 @@ mod real {
                                 .iter()
                                 .filter_map(|t| t.byte_size())
                                 .sum();
-                            // TP halves the per-layer matrices, so each of
-                            // the pair holds ~half; leave room for KV and
-                            // the prefill hop/scratch buffers
-                            let need = total / 2 + (4u64 << 30);
+                            // KV reserve sized for the ctx the caller asked
+                            // for, not a flat guess. Only layers that own an
+                            // attn_k tensor hold KV - on a hybrid stack the
+                            // linear-attention layers do not - so count those
+                            // rather than trusting block_count (this family
+                            // ships head_count_kv as a scalar, so a per-layer
+                            // array is not available to count zeros in).
+                            // 1 byte/elem is the fp8 floor the KV auto-sizer
+                            // compresses to: if it does not fit even there,
+                            // the pair genuinely cannot host this ctx and the
+                            // tail spill below is the only way to serve it.
+                            let kv_reserve = if ctx_hint > 0 {
+                                let kv_layers = (0..shape.n_exec_layer)
+                                    .filter(|il| {
+                                        gguf.tensor(&format!("blk.{il}.attn_k.weight")).is_some()
+                                    })
+                                    .count() as u64;
+                                let per_pos = 2
+                                    * shape.n_head_kv as u64
+                                    * shape.head_dim as u64
+                                    * kv_layers;
+                                // TP shards KV heads across the pair
+                                let kv = per_pos.saturating_mul(ctx_hint as u64) / 2;
+                                // prefill hop/scratch on top of the cache
+                                kv + (2u64 << 30)
+                            } else {
+                                4u64 << 30
+                            };
+                            let need = total / 2 + kv_reserve;
                             [primary, dev_b].iter().all(|&d| {
                                 kernels::mem_info(d).map_or(false, |(free, _)| free as u64 >= need)
                             })
@@ -3420,7 +3455,55 @@ mod real {
                                 .filter(|t| t.name.starts_with("blk.0."))
                                 .filter_map(|t| t.byte_size())
                                 .sum();
-                            if let (Ok((free, _)), true) = (kernels::mem_info(third), per > 0) {
+                            if ctx_hint > 0 && per > 0 {
+                                // Spill the FEWEST layers that make the pair
+                                // fit. A tail costs decode - its layers read
+                                // weights from one card while TP layers read
+                                // from two, and layers are sequential within
+                                // a token - so filling the third card to
+                                // capacity trades far more speed than the KV
+                                // math demands (measured: 24.8 tok/s at a
+                                // 32-layer tail vs 42.2 at 12 on the 27B).
+                                let free_pair = [primary, dev_b]
+                                    .iter()
+                                    .map(|&d| {
+                                        kernels::mem_info(d).map(|(f, _)| f as u64).unwrap_or(0)
+                                    })
+                                    .min()
+                                    .unwrap_or(0);
+                                let total: u64 = gguf
+                                    .tensors
+                                    .iter()
+                                    .filter_map(|t| t.byte_size())
+                                    .sum();
+                                // layer indices that actually own a KV cache
+                                let kv_idx: Vec<usize> = (0..n_layers)
+                                    .filter(|il| {
+                                        gguf.tensor(&format!("blk.{il}.attn_k.weight")).is_some()
+                                    })
+                                    .collect();
+                                let per_pos_layer =
+                                    2 * shape.n_head_kv as u64 * shape.head_dim as u64;
+                                let scratch = 2u64 << 30;
+                                let mut t = 0usize;
+                                while t < n_layers / 2 {
+                                    let kept = n_layers - t;
+                                    let w = total.saturating_sub(per * t as u64) / 2;
+                                    let kv_kept =
+                                        kv_idx.iter().filter(|&&i| i < kept).count() as u64;
+                                    let kv = per_pos_layer
+                                        .saturating_mul(kv_kept)
+                                        .saturating_mul(ctx_hint as u64)
+                                        / 2;
+                                    if w + kv + scratch <= free_pair {
+                                        break;
+                                    }
+                                    t += 1;
+                                }
+                                n_tail = t;
+                            } else if let (Ok((free, _)), true) =
+                                (kernels::mem_info(third), per > 0)
+                            {
                                 let reserve = 3u64 << 30;
                                 let usable = (free as u64).saturating_sub(reserve);
                                 n_tail = (usable / per) as usize;
