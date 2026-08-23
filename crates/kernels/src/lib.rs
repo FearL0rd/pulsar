@@ -285,6 +285,7 @@ mod real {
     /// The primary (stream) device ensure_device picked; get_device()
     /// drifts with per-layer set_device calls, this does not.
     static PRIMARY_DEV: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static PRIMARY_H2D_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     /// The measured-best primary device chosen at startup. Unlike
     /// get_device() this is stable across the engine's per-layer device
@@ -293,6 +294,14 @@ mod real {
     pub fn primary_device() -> i32 {
         ensure_device();
         PRIMARY_DEV.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Pinned 64MB H2D probe of the primary stream device, GB/s. Zero until
+    /// `ensure_device` has run. Used by q* so the miss split matches the
+    /// link that was actually measured, not a spec-sheet default.
+    pub fn primary_h2d_gbs() -> f64 {
+        ensure_device();
+        f64::from_bits(PRIMARY_H2D_BITS.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn ensure_device() {
@@ -327,6 +336,10 @@ mod real {
                 best.0
             });
             PRIMARY_DEV.store(dev, std::sync::atomic::Ordering::Relaxed);
+            if probed <= 0.0 {
+                probed = raw_h2d_probe(dev);
+            }
+            PRIMARY_H2D_BITS.store(probed.to_bits(), std::sync::atomic::Ordering::Relaxed);
             // PULSAR_P2P=1: establish peer access HERE, inside the same
             // once-block that picks the device, i.e. before a single
             // DeviceBuf exists. Enabling it later (from TpLink::new, after
