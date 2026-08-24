@@ -6,9 +6,14 @@ beats the 2-card TP3=off reference (9.33s) with the third card kept;
 50k tokens 129.45 -> 114.32s (-12%). Output ids bit-identical every
 run; check.sh PASS. v2 (7893e12): per-lane scratch
 arenas restored octet tiles inside the pipe (7.8s) and made PIPE+FP4
-race-free: 7.17-7.76s (best 1,037 tok/s). Remaining headroom:
-per-parity graphs, MTP-prefill interleave, arena prewarm (one-off
-cold-start alloc stall), then tensor-core attention / chunked GDN. Evidence below is from the
+race-free: 7.17-7.76s (best 1,037 tok/s). Tensor-core attention
+SHIPPED (b34f259, PULSAR_ATTN_MMA=1, on in the serve config): FA1-style
+fp16 mma for both GEMMs, smem-S softmax, hd 128/256 (TK 64/32). 50k
+prefill 108.8 -> 71.9s (-34%); 7.4k pipe+mma+FP4 = 5.82s (1,278 tok/s
+vs 667 at session start). Ids bit-identical, phase-11 selftest both
+widths. v2 headroom: ldmatrix fragments, register softmax, per-parity
+graphs. Still open: chunked GDN (the last prefill rewrite, next
+session), MTP-prefill interleave DONE earlier, arena prewarm DONE. Evidence below is from the
 2026-08-23 profiling session (nsys sqlite at ~/prefill-tp.sqlite on
 substrate, 7,436-token prompt, ctx 16384, MTP off, 3-card FFN TP).
 
