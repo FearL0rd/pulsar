@@ -836,6 +836,86 @@ impl Qwen35Rt {
         })
     }
 
+    /// Device of each state slot in ckpt() order (primary chain then
+    /// card-B); -1 for absent slots. Prefix persist uses this to place
+    /// checkpoint buffers on reload.
+    pub(super) fn ckpt_devs(&self) -> Vec<i32> {
+        self.states
+            .iter()
+            .chain(self.tpb.iter().flat_map(|b| b.states.iter()))
+            .map(|gs| gs.as_ref().map_or(-1, |g| g.dev))
+            .collect()
+    }
+
+    /// Serialize the LIVE GDN/conv states (the recurrent state at the
+    /// current position) in ckpt() order, for prefix persist.
+    pub(super) fn save_live_states(&self) -> Result<Vec<u8>> {
+        let primary = kernels::get_device();
+        let mut out = Vec::new();
+        let chain = self.states.iter().chain(self.tpb.iter().flat_map(|b| b.states.iter()));
+        let all: Vec<_> = chain.collect();
+        out.extend_from_slice(&(all.len() as u32).to_le_bytes());
+        for gs in all {
+            match gs {
+                Some(g) => {
+                    out.push(1);
+                    kernels::set_device(g.dev)?;
+                    for b in [&g.s, &g.conv] {
+                        let mut host = vec![0u8; b.bytes()];
+                        b.read(0, &mut host)?;
+                        out.extend_from_slice(&(host.len() as u64).to_le_bytes());
+                        out.extend_from_slice(&host);
+                    }
+                }
+                None => out.push(0),
+            }
+        }
+        kernels::set_device(primary)?;
+        Ok(out)
+    }
+
+    /// Restore what save_live_states wrote into the existing buffers.
+    pub(super) fn load_live_states(&mut self, inp: &mut &[u8]) -> Result {
+        let primary = kernels::get_device();
+        let n = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+        *inp = &inp[4..];
+        let chain = self.states.iter_mut().chain(self.tpb.iter_mut().flat_map(|b| b.states.iter_mut()));
+        let mut seen = 0usize;
+        for gs in chain {
+            if seen == n {
+                break;
+            }
+            seen += 1;
+            let flag = inp[0];
+            *inp = &inp[1..];
+            match (flag, gs) {
+                (1, Some(g)) => {
+                    kernels::set_device(g.dev)?;
+                    for b in [&mut g.s, &mut g.conv] {
+                        let m = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+                        *inp = &inp[8..];
+                        if m != b.bytes() {
+                            kernels::set_device(primary)?;
+                            return Err("prefix file: gdn state size mismatch".into());
+                        }
+                        b.write(0, &inp[..m])?;
+                        *inp = &inp[m..];
+                    }
+                }
+                (0, None) => {}
+                _ => {
+                    kernels::set_device(primary)?;
+                    return Err("prefix file: gdn state layout mismatch".into());
+                }
+            }
+        }
+        kernels::set_device(primary)?;
+        if seen != n {
+            return Err("prefix file: gdn state count mismatch".into());
+        }
+        Ok(())
+    }
+
     /// Snapshot every GDN state (nextn-MTP verify rounds; buffers live
     /// beside their state, so the copies never cross cards).
     pub(super) fn gdn_snapshot(&mut self) -> Result {
@@ -1687,6 +1767,25 @@ impl Model {
         Ok(true)
     }
 
+    /// Generate-side twin of the forward's pipe gate: true when a
+    /// qwen35 prefill through forward_batch will take the two-lane pipe
+    /// for a multi-chunk prompt, so the caller may hand the WHOLE prompt
+    /// (with MTP fills done inside). Keep in lockstep with the gate in
+    /// forward_qwen35_inner.
+    pub(super) fn pipe_ready(&self, st: &State) -> bool {
+        pipe_on()
+            && self.shape.family == super::Family::Qwen35
+            && self.tp.is_some()
+            && st.qwen35.as_ref().is_some_and(|rt| rt.dflash.is_none() && rt.banks.is_empty())
+            && self
+                .layers
+                .iter()
+                .all(|l| matches!(l.ffn, super::Ffn::DenseKq { .. } | super::Ffn::Dense { .. }))
+            && std::env::var_os("PULSAR_PROFILE").is_none()
+            && std::env::var_os("PULSAR_DEBUG_L2").is_none()
+            && std::env::var_os("PULSAR_DENSE_PROF").is_none()
+    }
+
     /// PULSAR_PIPE driver: runs every cm-chunk of `tokens` through two
     /// lanes on two host threads, chunk c+1 one layer behind chunk c via
     /// the PipeHook events. Returns the final chunk's row count; the
@@ -1705,11 +1804,25 @@ impl Model {
         let s = self.shape;
         if rt.pipe_lane.is_none() {
             rt.pipe_lane = Some(Box::new(PipeLane::new(self, st)?));
+            // arena prewarm: move the first-use cudaMalloc stalls (a
+            // measured one-off ~2s) out of the steady-state chunks
+            let primary = kernels::get_device();
+            for d in [Some(primary), self.tp.as_ref().map(|t| t.dev), self.tp_c.as_ref().map(|c| c.dev)]
+                .into_iter()
+                .flatten()
+            {
+                kernels::set_device(d)?;
+                kernels::lane_prewarm();
+            }
+            kernels::set_device(primary)?;
             eprintln!("pulsar: pipe lane allocated (PULSAR_PIPE two-chunk prefill)");
         }
         let n_layers = self.layers.len();
-        let mut evs: Vec<(kernels::XEvent, kernels::XEvent)> = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
+        // +1: the MTP prefill fill runs as a virtual layer n_layers in the
+        // same handoff chain, so the draft layer's state and the hidden
+        // carry update in exact chunk order across the two lanes
+        let mut evs: Vec<(kernels::XEvent, kernels::XEvent)> = Vec::with_capacity(n_layers + 1);
+        for _ in 0..=n_layers {
             evs.push((kernels::XEvent::new()?, kernels::XEvent::new()?));
         }
         let graphs_prev = rt.graphs_on;
@@ -1731,6 +1844,14 @@ impl Model {
                 // this thread must never share a staging buffer with T0
                 kernels::set_lane(1);
                 let (m, sst, srt) = unsafe { (&*ctx.m, &mut *ctx.st, &mut *ctx.rt) };
+                for d in [Some(kernels::primary_device()), m.tp.as_ref().map(|t| t.dev), m.tp_c.as_ref().map(|c| c.dev)]
+                    .into_iter()
+                    .flatten()
+                {
+                    kernels::set_device(d).map_err(|e| e.to_string())?;
+                    kernels::lane_prewarm();
+                }
+                kernels::set_device(kernels::primary_device()).map_err(|e| e.to_string())?;
                 for (ci, chunk) in tokens.chunks(cm).enumerate() {
                     if ci % 2 != 1 {
                         continue;
@@ -1799,7 +1920,26 @@ impl Model {
             kernels::set_device(primary)?;
         }
         kernels::embed_q8_0_at(&mut st.cur, &self.token_embd, &st.tok, tok_off, s.n_embd, s.n_vocab, t)?;
-        self.eval_qwen35_span(st, rt, 0, n0, pos, t)
+        self.eval_qwen35_span(st, rt, 0, n0, pos, t)?;
+        if self.mtp.is_some() {
+            // MTP fill = virtual layer n0 in the handoff chain: the draft
+            // layer's KV/GDN state and the mtp_hidden carry (aliased State
+            // fields on the shell) then update in exact chunk order
+            if let Some(p) = rt.pipe {
+                unsafe {
+                    let e = &*p.evs.add(n0);
+                    (if p.slot == 0 { &e.1 } else { &e.0 }).wait()?;
+                }
+            }
+            self.mtp_prefill_fill_rt(st, rt, t, tok_off, pos)?;
+            if let Some(p) = rt.pipe {
+                unsafe {
+                    let e = &*p.evs.add(n0);
+                    (if p.slot == 0 { &e.0 } else { &e.1 }).record()?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Eval layers [lo, hi) on the current device. Runs of GDN+DenseKq

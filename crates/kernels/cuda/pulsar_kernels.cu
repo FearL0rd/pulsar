@@ -617,6 +617,18 @@ static void *preq_scratch(uint64_t bytes) {
 
 /* prewarm the per-device preq scratch OUTSIDE any graph capture, so
  * the first matmul_q8_0 inside the capture hits the cached pointer */
+/* Allocate this thread-lane's arenas on the CURRENT device at their
+ * floors, so the first pipe prefill does not eat the cudaMalloc stalls
+ * mid-flight (measured as a one-off ~2s outlier). The FP4 activation
+ * arena only when the a4 path can run (PULSAR_FP4 set). */
+static void *oct_scratch(uint64_t bytes);
+static void *nvfp4_act_scratch(uint64_t bytes);
+extern "C" void pulsar_lane_prewarm(void) {
+    (void)preq_scratch(1);
+    (void)oct_scratch(1);
+    if (getenv("PULSAR_FP4")) (void)nvfp4_act_scratch(1);
+}
+
 extern "C" int pulsar_preq_scratch_reserve(uint64_t bytes) {
     return preq_scratch(bytes) != NULL;
 }

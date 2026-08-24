@@ -100,6 +100,7 @@ mod real {
         fn pulsar_q8_0_matmul(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_preq_scratch_reserve(bytes: u64) -> i32;
         fn pulsar_set_lane(lane: i32);
+        fn pulsar_lane_prewarm();
         fn pulsar_q8_0_matmul_banked(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_bank: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_f32(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_kq(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
@@ -1245,6 +1246,13 @@ mod real {
     /// lanes never share a staging buffer mid-flight.
     pub fn set_lane(lane: u32) {
         unsafe { pulsar_set_lane(lane as i32) }
+    }
+
+    /// Allocates the current thread-lane's scratch arenas on the CURRENT
+    /// device at their floors (first-use cudaMalloc stalls move out of
+    /// the timed prefill). Call once per (device, lane).
+    pub fn lane_prewarm() {
+        unsafe { pulsar_lane_prewarm() }
     }
 
     pub fn preq_scratch_reserve(bytes: u64) -> Result {
