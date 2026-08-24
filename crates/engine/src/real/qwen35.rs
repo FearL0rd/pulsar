@@ -738,6 +738,8 @@ pub(super) struct Qwen35Rt {
     /// eval_qwen35_span, and lane 1's scratch (lazily allocated)
     pipe: Option<PipeHook>,
     pipe_lane: Option<Box<PipeLane>>,
+    /// lane allocation failed once (VRAM): run plain from then on
+    pipe_dead: bool,
     dflash: Option<DflashRt>,
 }
 
@@ -832,6 +834,7 @@ impl Qwen35Rt {
             sc: RtScratch::new(&s)?,
             pipe: None,
             pipe_lane: None,
+            pipe_dead: false,
             dflash: None,
         })
     }
@@ -1678,6 +1681,7 @@ impl Model {
         let cm = chunk_max();
         let n_chunks = tokens.chunks(cm).count();
         let pipe = pipe_on()
+            && !rt.pipe_dead
             && self.tp.is_some()
             && banks_empty
             && rt.dflash.is_none()
@@ -1689,11 +1693,21 @@ impl Model {
             && std::env::var_os("PULSAR_DEBUG_L2").is_none()
             && std::env::var_os("PULSAR_DENSE_PROF").is_none();
         let owe_fill = pipe && st.fill_in_forward && self.mtp.is_some();
+        let mut ran_pipe = false;
         if pipe {
-            last_t = self.qwen35_pipe_chunks(st, rt, tokens, pos0, n0)?;
-            pos = pos0 + tokens.len() as u32;
-            let _ = pos;
-        } else {
+            match self.qwen35_pipe_chunks(st, rt, tokens, pos0, n0) {
+                Ok(t) => {
+                    last_t = t;
+                    pos = pos0 + tokens.len() as u32;
+                    ran_pipe = true;
+                }
+                // lane alloc failure marks pipe_dead: fall back to the
+                // plain loop below instead of failing the prefill
+                Err(_) if rt.pipe_dead => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !ran_pipe {
             for (ci, chunk) in tokens.chunks(cm).enumerate() {
                 let t = chunk.len() as u32;
                 run(st, rt, t, (ci * cm) as u32, pos, ci + 1 == n_chunks)?;
@@ -1818,7 +1832,17 @@ impl Model {
         let cm = chunk_max();
         let s = self.shape;
         if rt.pipe_lane.is_none() {
-            rt.pipe_lane = Some(Box::new(PipeLane::new(self, st)?));
+            match PipeLane::new(self, st) {
+                Ok(l) => rt.pipe_lane = Some(Box::new(l)),
+                Err(e) => {
+                    // lane scratch did not fit (262k-ctx KV budgets):
+                    // permanently fall back to the plain chunk loop
+                    // rather than failing the prefill
+                    eprintln!("pulsar: pipe lane alloc failed ({e}); PULSAR_PIPE disabled for this run");
+                    rt.pipe_dead = true;
+                    return Err("pipe lane alloc failed".into());
+                }
+            }
             // arena prewarm: move the first-use cudaMalloc stalls (a
             // measured one-off ~2s) out of the steady-state chunks
             let primary = kernels::get_device();
