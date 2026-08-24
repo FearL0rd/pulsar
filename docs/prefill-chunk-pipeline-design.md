@@ -12,8 +12,12 @@ fp16 mma for both GEMMs, smem-S softmax, hd 128/256 (TK 64/32). 50k
 prefill 108.8 -> 71.9s (-34%); 7.4k pipe+mma+FP4 = 5.82s (1,278 tok/s
 vs 667 at session start). Ids bit-identical, phase-11 selftest both
 widths. v2 headroom: ldmatrix fragments, register softmax, per-parity
-graphs. Still open: chunked GDN (the last prefill rewrite, next
-session), MTP-prefill interleave DONE earlier, arena prewarm DONE. Evidence below is from the
+graphs. Chunked GDN SHIPPED (b17d02c,
+PULSAR_GDN_CHUNK=1, on in serve): gated-delta-rule substitution, C=32
+chunks (C=64 lost - the C^2 FLOP tax), 7.4k 7.04->6.45s, full stack
+pipe+mma+gdn+FP4 = 5.78s (1,287 tok/s). The rewrite territory is
+CLOSED; v2s if ever needed: mma the GDN chunk stages, ldmatrix +
+register softmax in the attention kernel, per-parity graphs. Evidence below is from the
 2026-08-23 profiling session (nsys sqlite at ~/prefill-tp.sqlite on
 substrate, 7,436-token prompt, ctx 16384, MTP off, 3-card FFN TP).
 
