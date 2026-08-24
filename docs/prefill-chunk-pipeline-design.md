@@ -15,9 +15,29 @@ widths. v2 headroom: ldmatrix fragments, register softmax, per-parity
 graphs. Chunked GDN SHIPPED (b17d02c,
 PULSAR_GDN_CHUNK=1, on in serve): gated-delta-rule substitution, C=32
 chunks (C=64 lost - the C^2 FLOP tax), 7.4k 7.04->6.45s, full stack
-pipe+mma+gdn+FP4 = 5.78s (1,287 tok/s). The rewrite territory is
-CLOSED; v2s if ever needed: mma the GDN chunk stages, ldmatrix +
-register softmax in the attention kernel, per-parity graphs. Evidence below is from the
+pipe+mma+gdn+FP4 = 5.78s (1,287 tok/s). Attention mma v2 SHIPPED
+(0ac766d, 2026-08-24): ldmatrix fragments (Q x4 / K x2 / V x2.trans)
+plus in-register online softmax with quad shuffles - the S tile never
+touches smem, one barrier per chunk instead of three, no 64-idle-thread
+serial softmax. 7.4k 6.96 -> 6.55s, 50k 71.9 -> 65.5s (-8.9%), full
+stack 5.62s (1,323 tok/s); ids bit-identical, clean check.sh PASS.
+GDN chunk mma v2 SHIPPED (ccd01e0, PULSAR_GDN_CHUNK=2, on in serve):
+the five GEMM-shaped chunk stages on fp16 mma (fp32 state stays the
+carrier, FLA recipe), register substitution column (zero solve
+barriers, was 31), 4 barriers/chunk vs ~36. 7.4k 6.22 -> 5.60s, 50k
+63.87 -> 59.95s, full stack pipe+mma2+gdn-mma+FP4 = 5.04s (1,475
+tok/s; 2.21x on the session, 50k 129 -> 60s). Per-parity graphs are
+CLOSED BY MEASUREMENT, not built: non-pipe 7.4k prefill with full
+multi-layer span graphs vs PULSAR_GRAPHS=0 = 7.65/7.65 vs 7.66/7.65s
+- zero. At t=512 the kernels are milliseconds and launch overhead is
+noise; graphs pay in decode (t<=32), which the pipe never touches.
+Per-layer pipe graphs are strictly weaker than the spans measured, so
+the ceiling on that work is zero and it stays unbuilt. Remaining v2
+headroom if ever needed: TK 32 -> 48 for the hd-256 attention width
+(smem fits at 84.5KB). Two gate-harness lessons now twice-paid: bench
+env exported at script top LEAKS into check.sh and reroutes
+exact-kernel selftest phases through fp16 (phases 0/2/6 "fail" at
+~5e-4); scrub the env before the commit gate. Evidence below is from the
 2026-08-23 profiling session (nsys sqlite at ~/prefill-tp.sqlite on
 substrate, 7,436-token prompt, ctx 16384, MTP off, 3-card FFN TP).
 
