@@ -917,7 +917,7 @@ fn run() -> engine::Result {
         if let Some(pp) = &prefix_path {
             if hist.len() >= last_saved + 2048 {
                 let t0 = std::time::Instant::now();
-                match st.save_prefix(&model, &hist, pp) {
+                match st.save_prefix_async(&model, &hist, pp) {
                     Ok(()) => {
                         eprintln!(
                             "pulsar-serve: prefix saved ({} tokens, {:.1}s)",
@@ -1896,7 +1896,7 @@ fn handle_chat(
     // only extend the exact forwarded stream; pure-KV families can rewind
     // to the divergence and overwrite. Speculative modes rewrite KV in
     // ways this bookkeeping does not model - caching disables itself.
-    let cache_ok = model.mtp_depth == 0
+    let cache_ok = (model.mtp_depth == 0 || model.spec_safe_prefix_cache())
         && std::env::var_os("PULSAR_NGRAM").is_none()
         && std::env::var_os("PULSAR_NO_PREFIX_CACHE").is_none();
     let mut common = 0usize;

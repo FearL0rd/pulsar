@@ -5178,6 +5178,11 @@ mod real {
         /// greedy decode); pub: the CLI's one-shot loop drives them
         pub last_argmax: Vec<u32>,
         pub skip_logit_read: bool,
+        /// generate() sets this across its prefill loop: the qwen35
+        /// forward runs the MTP prefill fill itself per inner chunk
+        /// (inside the pipe as a virtual layer; in the plain loop after
+        /// each chunk), so the caller must not fill again.
+        fill_in_forward: bool,
         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
         /// 5=q4_0, 6=turbo3, 7=turbo2, 8=turbo3_tcq, 9=turbo2_tcq,
@@ -5486,6 +5491,34 @@ mod real {
         /// re-prefill. kvq is in the header - a lossy-KV format change
         /// invalidates the file.
         fn save_prefix_qwen35(&self, m: &Model, hist: &[u32], path: &Path) -> Result {
+            let out = self.prefix_bytes_qwen35(m, hist)?;
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &out)?;
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        }
+
+        /// save_prefix with the file write on a detached thread: the D2H
+        /// reads (state consistency) stay synchronous, the disk write
+        /// (the slow half on this box's NVMe) overlaps the next request.
+        /// qwen35 only; other families fall back to the sync path.
+        pub fn save_prefix_async(&self, m: &Model, hist: &[u32], path: &Path) -> Result {
+            if m.shape.family != Family::Qwen35 {
+                return self.save_prefix(m, hist, path);
+            }
+            let out = self.prefix_bytes_qwen35(m, hist)?;
+            let path = path.to_path_buf();
+            std::thread::spawn(move || {
+                let tmp = path.with_extension("tmp");
+                let r = std::fs::write(&tmp, &out).and_then(|_| std::fs::rename(&tmp, &path));
+                if let Err(e) = r {
+                    eprintln!("pulsar: prefix save (background) failed: {e}");
+                }
+            });
+            Ok(())
+        }
+
+        fn prefix_bytes_qwen35(&self, m: &Model, hist: &[u32]) -> Result<Vec<u8>> {
             let s = m.shape;
             let rt = self.qwen35.as_ref().ok_or("qwen35 state missing")?;
             let primary = kernels::get_device();
@@ -5550,10 +5583,7 @@ mod real {
             }
             out.extend_from_slice(&rt.save_live_states()?);
             put(&mut out, &self.mtp_hidden)?;
-            let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, &out)?;
-            std::fs::rename(&tmp, path)?;
-            Ok(())
+            Ok(out)
         }
 
         fn load_prefix_qwen35(&mut self, m: &Model, data: &[u8]) -> Result<Vec<u32>> {
@@ -6910,6 +6940,7 @@ mod real {
                 amax_out: DeviceBuf::alloc(spec_rows.max(1) as usize * 8)?,
                 last_argmax: Vec::new(),
                 skip_logit_read: false,
+                fill_in_forward: false,
                 kvq,
                 kv_devs,
                 kvq_lat,
@@ -7196,7 +7227,11 @@ mod real {
         /// overlap chunks across two lanes.
         pub fn prefill_cap(&self, st: &State) -> usize {
             if self.shape.family == Family::Qwen35 && qwen35::pipe_on() {
-                usize::MAX
+                // window, not the whole prompt: the pipe overlaps chunks
+                // inside each window, and the caller's maybe_checkpoint
+                // between windows keeps divergence-rewind granularity
+                // (one drain bubble per window, well under 1%)
+                4096usize.max(3 * qwen35::chunk_max())
             } else {
                 st.max_batch() as usize
             }
@@ -7361,6 +7396,16 @@ mod real {
         /// cache (dsv4 compressor/HC lanes, qwen35 GDN, inkling
         /// shortconv). A prefix-cache may only APPEND to the forwarded
         /// stream for these; pure-KV families can rewind and overwrite.
+        /// Whether the prefix cache may stay on with speculative decode.
+        /// qwen35's spec loop rewinds GDN state on partial acceptance and
+        /// its KV (main and draft slots) is position-masked, so the
+        /// request ends with state consistent at the final position;
+        /// draft-feature drift after a reuse costs accept rate only,
+        /// never output correctness (the target model verifies).
+        pub fn spec_safe_prefix_cache(&self) -> bool {
+            self.shape.family == Family::Qwen35
+        }
+
         pub fn recurrent_state(&self) -> bool {
             // Exhaustive: answering `false` for a family that does carry
             // recurrent state lets the prefix cache rewind something that
@@ -9251,15 +9296,14 @@ mod real {
         // often than needed, and the MTP prefill path was 5.4x slower
         // than the same prompt with MTP off (61s vs 11s on 7120 tokens).
         // The MTP scratch is max_batch-sized, so it was never the limit.
-        // MTP prefill through the pipe: the fills happen INSIDE the
-        // forward (a virtual layer in the lane handoff chain), so the
-        // whole prompt goes down in one call and the per-chunk fill
-        // below is skipped. The >=3 mirrors the forward's own gate.
-        let pipe_fill = mtp_prefill
-            && model.pipe_ready(st)
-            && prompt.len().div_ceil(qwen35::chunk_max()) >= 3;
+        // MTP prefill through the pipe: the forward runs the fills
+        // itself (a virtual layer inside the pipe; per inner chunk in
+        // the plain loop for a short tail window), so the prompt goes
+        // down in 4096-token windows and the per-chunk fill below is
+        // skipped.
+        let pipe_fill = mtp_prefill && model.pipe_ready(st);
         let chunk_cap = if pipe_fill {
-            prompt.len().max(1)
+            model.prefill_cap(st)
         } else if mtp_prefill && model.shape.family == Family::Qwen35 {
             (st.max_batch() as usize).min(qwen35::chunk_max())
         } else {
@@ -9272,8 +9316,10 @@ mod real {
         if pos0 == 0 {
             st.clear_ckpts();
         }
+        st.fill_in_forward = pipe_fill;
         for chunk in prompt.chunks(chunk_cap) {
             if cancel() {
+                st.fill_in_forward = false;
                 return Ok(pos);
             }
             let t0 = std::time::Instant::now();
@@ -9291,6 +9337,7 @@ mod real {
             pos += chunk.len() as u32;
             st.maybe_checkpoint(model, pos)?;
         }
+        st.fill_in_forward = false;
 
         // Draft-free n-gram speculation (PULSAR_NGRAM=depth, greedy only):
         // propose the tokens that followed the longest recent-suffix match

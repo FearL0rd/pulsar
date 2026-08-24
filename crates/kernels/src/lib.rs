@@ -305,6 +305,21 @@ mod real {
         std::env::var(name).map_or(true, |v| v != "0")
     }
 
+    /// P2P's effective default: ON, EXCEPT when the two-lane prefill
+    /// pipe is armed. The patched consumer-P2P kernel module faults
+    /// (libcuda SIGSEGV in cuStreamWaitEvent) when replayed decode
+    /// graphs carrying peer copies mix with the pipe's event/alloc
+    /// churn - the repro needs p2p+bf16+graphs+MTP+growing prompts
+    /// together (2026-08-23). Under the pipe p2p measured ZERO prefill
+    /// win (hops hide behind the other lane), so off is free. An
+    /// explicit PULSAR_P2P=1 still forces it on.
+    fn p2p_on() -> bool {
+        match std::env::var("PULSAR_P2P") {
+            Ok(v) => v != "0",
+            Err(_) => std::env::var("PULSAR_PIPE").ok().as_deref() != Some("1"),
+        }
+    }
+
     fn ensure_device() {
         use std::sync::Once;
         static ONCE: Once = Once::new();
@@ -345,7 +360,7 @@ mod real {
             // launch two calls downstream, which is what a deferred CUDA
             // error looks like. Consumer cards report can-access only with
             // a patched driver; where they do not, this is a no-op.
-            if env_on("PULSAR_P2P") {
+            if p2p_on() {
                 let mut n = 0;
                 unsafe { cudaGetDeviceCount(&mut n) };
                 let mut pairs = 0;
@@ -886,7 +901,7 @@ mod real {
             // Peer access itself is established once in ensure_device, before
             // any allocation; here we only ASK whether it took, both ways.
             let mut p2p = false;
-            if env_on("PULSAR_P2P") && here != peer {
+            if p2p_on() && here != peer {
                 let (mut ab, mut ba) = (0i32, 0i32);
                 unsafe {
                     cudaDeviceCanAccessPeer(&mut ab, here, peer);

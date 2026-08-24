@@ -1688,6 +1688,7 @@ impl Model {
             && std::env::var_os("PULSAR_PROFILE").is_none()
             && std::env::var_os("PULSAR_DEBUG_L2").is_none()
             && std::env::var_os("PULSAR_DENSE_PROF").is_none();
+        let owe_fill = pipe && st.fill_in_forward && self.mtp.is_some();
         if pipe {
             last_t = self.qwen35_pipe_chunks(st, rt, tokens, pos0, n0)?;
             pos = pos0 + tokens.len() as u32;
@@ -1696,12 +1697,21 @@ impl Model {
             for (ci, chunk) in tokens.chunks(cm).enumerate() {
                 let t = chunk.len() as u32;
                 run(st, rt, t, (ci * cm) as u32, pos, ci + 1 == n_chunks)?;
+                // short tail window of a pipelined MTP prefill: the pipe
+                // declined (< 3 chunks) but the caller still expects the
+                // fills to happen in here
+                if st.fill_in_forward && self.mtp.is_some() {
+                    self.mtp_prefill_fill_rt(st, rt, t, (ci * cm) as u32, pos)?;
+                }
                 pos += t;
                 last_t = t;
             }
         }
         rt.banks = banks;
         if rows == 0 {
+            if owe_fill {
+                self.pipe_final_fill(st, rt, tokens, pos0)?;
+            }
             return Ok(None);
         }
         if rows > last_t {
@@ -1710,6 +1720,11 @@ impl Model {
         let k = rows;
         let row = s.n_embd as usize * 4;
         kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (last_t - k) as usize * row, k as usize * row)?;
+        if owe_fill {
+            // the pipe deferred its final chunk's fill: cur is copied out,
+            // the fill may clobber it now
+            self.pipe_final_fill(st, rt, tokens, pos0)?;
+        }
         kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, s.rms_eps)?;
         if st.skip_logit_read {
             if self.head_argmax_split(st, rt, k)? {
@@ -1857,7 +1872,7 @@ impl Model {
                         continue;
                     }
                     m.pipe_chunk(sst, srt, chunk.len() as u32, (ci * cm) as u32,
-                                 pos0 + (ci * cm) as u32, n0)
+                                 pos0 + (ci * cm) as u32, n0, ci + 1 < n_chunks)
                         .map_err(|e| e.to_string())?;
                 }
                 Ok(())
@@ -1868,7 +1883,7 @@ impl Model {
                     continue;
                 }
                 if let Err(e) = self.pipe_chunk(st, rt, chunk.len() as u32, (ci * cm) as u32,
-                                                pos0 + (ci * cm) as u32, n0) {
+                                                pos0 + (ci * cm) as u32, n0, ci + 1 < n_chunks) {
                     main_res = Err(e.to_string());
                     break;
                 }
@@ -1879,6 +1894,12 @@ impl Model {
                 .and_then(|r| r);
             main_res.and(tres)
         });
+        // the hook points at this frame's evs: clear it (and the shell)
+        // BEFORE any fallible tail work, so no error path can leave a
+        // dangling event pointer armed on the runtime
+        guard.teardown();
+        rt.pipe = None;
+        rt.graphs_on = graphs_prev;
         let last = n_chunks - 1;
         let last_t = tokens.chunks(cm).last().map_or(0, |c| c.len()) as u32;
         if pipe_res.is_ok() && last % 2 == 1 {
@@ -1890,14 +1911,28 @@ impl Model {
                 e.1.wait()?;
             }
             let bytes = last_t as usize * s.n_embd as usize * 4;
-            kernels::copy_d2d(&mut st.cur, 0, &guard.sh_st.cur, 0, bytes)?;
+            // teardown already swapped the lane back: the final chunk's
+            // residual now lives in the LANE's cur buffer
+            let lane_cur = &rt.pipe_lane.as_ref().unwrap().st.cur;
+            kernels::copy_d2d(&mut st.cur, 0, lane_cur, 0, bytes)?;
         }
-        guard.teardown();
         drop(guard);
-        rt.pipe = None;
-        rt.graphs_on = graphs_prev;
         pipe_res?;
         Ok(last_t)
+    }
+
+    /// Runs the fill the pipe deferred for its FINAL chunk (the fill
+    /// overwrites `cur`, so it must wait until the head has read the
+    /// residual). Serial by now - rt.pipe is None, no events involved.
+    fn pipe_final_fill(&self, st: &mut State, rt: &mut Qwen35Rt, tokens: &[u32], pos0: u32) -> Result {
+        let cm = chunk_max();
+        let n_chunks = tokens.chunks(cm).count();
+        let last_t = tokens.chunks(cm).last().map_or(0, |c| c.len()) as u32;
+        if last_t == 0 {
+            return Ok(());
+        }
+        let off = ((n_chunks - 1) * cm) as u32;
+        self.mtp_prefill_fill_rt(st, rt, last_t, off, pos0 + off)
     }
 
     /// One pipe chunk: position cells + embed + the full layer span.
@@ -1910,6 +1945,7 @@ impl Model {
         tok_off: u32,
         pos: u32,
         n0: usize,
+        fill: bool,
     ) -> Result {
         let s = self.shape;
         let primary = kernels::primary_device();
@@ -1921,7 +1957,7 @@ impl Model {
         }
         kernels::embed_q8_0_at(&mut st.cur, &self.token_embd, &st.tok, tok_off, s.n_embd, s.n_vocab, t)?;
         self.eval_qwen35_span(st, rt, 0, n0, pos, t)?;
-        if self.mtp.is_some() {
+        if fill && st.fill_in_forward && self.mtp.is_some() {
             // MTP fill = virtual layer n0 in the handoff chain: the draft
             // layer's KV/GDN state and the mtp_hidden carry (aliased State
             // fields on the shell) then update in exact chunk order
