@@ -59,6 +59,11 @@ static int ds4_gpu_tensor_read(const ds4_gpu_tensor *t, uint64_t off,
                               cudaMemcpyDeviceToHost), "d2h");
 }
 
+/* Per-host-thread scratch-arena lane (see the preq_scratch comment):
+ * defined ahead of every .inc include so all arenas can index it. */
+static thread_local int t_lane = 0;
+extern "C" void pulsar_set_lane(int lane) { t_lane = lane & 1; }
+
 #include "gqa_kernels.inc"
 
 static float f16_to_f32_host(uint16_t h) {
@@ -576,17 +581,20 @@ static int pulsar_device_cc_major(void) {
 /* grow-only PER-DEVICE scratch for activation prequant: matmuls run on
  * whichever device is current (attn GPU vs expert GPU), and VRAM is only
  * dereferenceable on its own device without P2P.
- * ponytail: single scratch per device, single-stream engine; pool it
- * per-stream if pulsar ever runs concurrent graphs. */
+ * Arenas are [device][lane]: the PULSAR_PIPE prefill runs two lanes on
+ * two host threads, and a shared arena would let lane B clobber lane
+ * A\'s staged data between its build and its consuming kernel. The lane
+ * SELECTOR is thread_local (a plain int - pipe threads leak nothing);
+ * the allocations stay process-global and persist across pipe runs. */
 #define PULSAR_MAX_DEVICES 16
-static void *g_preq_scratch[PULSAR_MAX_DEVICES];
-static uint64_t g_preq_scratch_cap[PULSAR_MAX_DEVICES];
+static void *g_preq_scratch[PULSAR_MAX_DEVICES][2];
+static uint64_t g_preq_scratch_cap[PULSAR_MAX_DEVICES][2];
 
 static void *preq_scratch(uint64_t bytes) {
     int dev = 0;
     (void)cudaGetDevice(&dev);
     if (dev < 0 || dev >= PULSAR_MAX_DEVICES) return NULL;
-    if (bytes <= g_preq_scratch_cap[dev]) return g_preq_scratch[dev];
+    if (bytes <= g_preq_scratch_cap[dev][t_lane]) return g_preq_scratch[dev][t_lane];
     /* cudaMalloc is illegal mid graph-capture and pulsar captures the
      * GDN+FFN chain (qwen35 graphs); grow only outside capture, with a
      * floor so it happens once - a later grow would cudaFree the
@@ -599,16 +607,28 @@ static void *preq_scratch(uint64_t bytes) {
     }
     const uint64_t floor_bytes = 64u << 20;
     if (bytes < floor_bytes) bytes = floor_bytes;
-    if (g_preq_scratch[dev]) (void)cudaFree(g_preq_scratch[dev]);
-    g_preq_scratch[dev] = NULL;
-    g_preq_scratch_cap[dev] = 0;
-    if (!cuda_ok(cudaMalloc(&g_preq_scratch[dev], bytes), "preq scratch alloc")) return NULL;
-    g_preq_scratch_cap[dev] = bytes;
-    return g_preq_scratch[dev];
+    if (g_preq_scratch[dev][t_lane]) (void)cudaFree(g_preq_scratch[dev][t_lane]);
+    g_preq_scratch[dev][t_lane] = NULL;
+    g_preq_scratch_cap[dev][t_lane] = 0;
+    if (!cuda_ok(cudaMalloc(&g_preq_scratch[dev][t_lane], bytes), "preq scratch alloc")) return NULL;
+    g_preq_scratch_cap[dev][t_lane] = bytes;
+    return g_preq_scratch[dev][t_lane];
 }
 
 /* prewarm the per-device preq scratch OUTSIDE any graph capture, so
  * the first matmul_q8_0 inside the capture hits the cached pointer */
+/* Allocate this thread-lane's arenas on the CURRENT device at their
+ * floors, so the first pipe prefill does not eat the cudaMalloc stalls
+ * mid-flight (measured as a one-off ~2s outlier). The FP4 activation
+ * arena only when the a4 path can run (PULSAR_FP4 set). */
+static void *oct_scratch(uint64_t bytes);
+static void *nvfp4_act_scratch(uint64_t bytes);
+extern "C" void pulsar_lane_prewarm(void) {
+    (void)preq_scratch(1);
+    (void)oct_scratch(1);
+    if (getenv("PULSAR_FP4")) (void)nvfp4_act_scratch(1);
+}
+
 extern "C" int pulsar_preq_scratch_reserve(uint64_t bytes) {
     return preq_scratch(bytes) != NULL;
 }
@@ -4166,14 +4186,14 @@ __global__ static void q8K_to_octet_kernel(
     }
 }
 
-static void *g_oct_scratch[16];
-static uint64_t g_oct_cap[16];
+static void *g_oct_scratch[16][2];
+static uint64_t g_oct_cap[16][2];
 
 static void *oct_scratch(uint64_t bytes) {
     int dev = 0;
     (void)cudaGetDevice(&dev);
     if (dev < 0 || dev >= 16) return NULL;
-    if (bytes <= g_oct_cap[dev]) return g_oct_scratch[dev];
+    if (bytes <= g_oct_cap[dev][t_lane]) return g_oct_scratch[dev][t_lane];
     /* cudaMalloc is illegal mid graph-capture and pulsar captures the
      * forward; grow only outside capture, with a floor so it happens once */
     cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
@@ -4183,12 +4203,12 @@ static void *oct_scratch(uint64_t bytes) {
     }
     const uint64_t floor_bytes = 128u << 20;
     if (bytes < floor_bytes) bytes = floor_bytes;
-    if (g_oct_scratch[dev]) (void)cudaFree(g_oct_scratch[dev]);
-    g_oct_scratch[dev] = NULL;
-    g_oct_cap[dev] = 0;
-    if (!cuda_ok(cudaMalloc(&g_oct_scratch[dev], bytes), "oct scratch")) return NULL;
-    g_oct_cap[dev] = bytes;
-    return g_oct_scratch[dev];
+    if (g_oct_scratch[dev][t_lane]) (void)cudaFree(g_oct_scratch[dev][t_lane]);
+    g_oct_scratch[dev][t_lane] = NULL;
+    g_oct_cap[dev][t_lane] = 0;
+    if (!cuda_ok(cudaMalloc(&g_oct_scratch[dev][t_lane], bytes), "oct scratch")) return NULL;
+    g_oct_cap[dev][t_lane] = bytes;
+    return g_oct_scratch[dev][t_lane];
 }
 
 /* tensor-core flavor of the prefill GEMM (sm_80+). Reuses the MoE MMA
@@ -4779,14 +4799,14 @@ __global__ static void nvfp4_from_q8K_kernel(
 
 /* per-device, grow-on-demand activation scratch (same shape as the gqa
  * split scratch): the converted tile is transient and sized by n_tok */
-static void *g_nvfp4_act[16];
-static uint64_t g_nvfp4_act_cap[16];
+static void *g_nvfp4_act[16][2];
+static uint64_t g_nvfp4_act_cap[16][2];
 
 static void *nvfp4_act_scratch(uint64_t bytes) {
     int dev = 0;
     (void)cudaGetDevice(&dev);
     if (dev < 0 || dev >= 16) return NULL;
-    if (bytes <= g_nvfp4_act_cap[dev]) return g_nvfp4_act[dev];
+    if (bytes <= g_nvfp4_act_cap[dev][t_lane]) return g_nvfp4_act[dev][t_lane];
     /* cudaMalloc is illegal mid graph-capture and pulsar captures the
      * forward, so grow only when free to do so and take a generous floor
      * to make that happen exactly once. A call that finds the buffer
@@ -4798,12 +4818,12 @@ static void *nvfp4_act_scratch(uint64_t bytes) {
     }
     const uint64_t floor_bytes = 64u << 20;
     if (bytes < floor_bytes) bytes = floor_bytes;
-    if (g_nvfp4_act[dev]) (void)cudaFree(g_nvfp4_act[dev]);
-    g_nvfp4_act[dev] = NULL;
-    g_nvfp4_act_cap[dev] = 0;
-    if (!cuda_ok(cudaMalloc(&g_nvfp4_act[dev], bytes), "nvfp4 act scratch")) return NULL;
-    g_nvfp4_act_cap[dev] = bytes;
-    return g_nvfp4_act[dev];
+    if (g_nvfp4_act[dev][t_lane]) (void)cudaFree(g_nvfp4_act[dev][t_lane]);
+    g_nvfp4_act[dev][t_lane] = NULL;
+    g_nvfp4_act_cap[dev][t_lane] = 0;
+    if (!cuda_ok(cudaMalloc(&g_nvfp4_act[dev][t_lane], bytes), "nvfp4 act scratch")) return NULL;
+    g_nvfp4_act_cap[dev][t_lane] = bytes;
+    return g_nvfp4_act[dev][t_lane];
 }
 
 /* W4A4 is per CALL SITE, not global. The calibrated NVFP4 checkpoint

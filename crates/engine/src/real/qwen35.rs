@@ -141,6 +141,266 @@ struct Stage2 {
 /// State/Qwen35Rt at the ownership boundary so eval_qwen35_layer runs
 /// unchanged, then swapped back for the tail. The residual stream
 /// crosses cards exactly twice per chunk.
+/// Primary-card per-chunk eval scratch: everything [chunk_max()]-shaped
+/// and chunk-local for the GDN/attention/FFN chain. Grouped into one
+/// struct so a bank swap exchanges the whole set atomically (the gb bug
+/// class: a field allocated per-bank but missed in the swap silently
+/// reads across devices) and so a second in-flight prefill chunk
+/// (PULSAR_PIPE lane) is just one more instance.
+struct RtScratch {
+    qkv: DeviceBuf,      // [T][conv_dim] raw projection
+    conv_out: DeviceBuf, // [T][conv_dim] conv+silu, layout [q|k|v] per row
+    z: DeviceBuf,        // [T][value_dim]
+    gq: DeviceBuf,       // [T][key_dim] delta-rule inputs
+    gk: DeviceBuf,       // [T][key_dim]
+    gv: DeviceBuf,       // [T][value_dim]
+    small: DeviceBuf,    // [T][ssm_v_heads] alpha/beta matvec scratch
+    /// packed [g | beta] row for the concatenated coefficient matmul
+    /// (decode fast path)
+    gb: DeviceBuf,
+    g: DeviceBuf,        // [T][ssm_v_heads] log-decay upload
+    beta: DeviceBuf,     // [T][ssm_v_heads]
+    gdn_o: DeviceBuf,    // [T][value_dim]
+    gdn_tmp: DeviceBuf,  // [T][value_dim]
+    qfull: DeviceBuf,    // [T][2*n_head*head_dim] fused q+gate
+    gate: DeviceBuf,     // [T][n_head*head_dim]
+    shg: DeviceBuf,      // [T] shared-expert gate logits
+}
+
+impl RtScratch {
+    /// Allocates on the CURRENT device.
+    fn new(s: &super::Shape) -> Result<RtScratch> {
+        let cm = chunk_max();
+        let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
+        let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
+        let conv_dim = 2 * key_dim + value_dim;
+        let f32s = |n: usize| DeviceBuf::alloc(n * 4);
+        Ok(RtScratch {
+            qkv: f32s(cm * conv_dim)?,
+            conv_out: f32s(cm * conv_dim)?,
+            z: f32s(cm * value_dim)?,
+            gq: f32s(cm * key_dim)?,
+            gk: f32s(cm * key_dim)?,
+            gv: f32s(cm * value_dim)?,
+            small: f32s(cm * s.ssm_v_heads as usize)?,
+            gb: f32s(2 * s.ssm_v_heads as usize)?,
+            g: f32s(cm * s.ssm_v_heads as usize)?,
+            beta: f32s(cm * s.ssm_v_heads as usize)?,
+            gdn_o: f32s(cm * value_dim)?,
+            gdn_tmp: f32s(cm * value_dim)?,
+            qfull: f32s(cm * 2 * (s.n_head * s.head_dim) as usize)?,
+            gate: f32s(cm * (s.n_head * s.head_dim) as usize)?,
+            shg: f32s(cm)?,
+        })
+    }
+}
+
+// ---------------- PULSAR_PIPE: two-lane prefill chunk pipeline ----------------
+//
+// Design: docs/prefill-chunk-pipeline-design.md. Two prefill chunks in
+// flight, chunk c+1 exactly one layer behind chunk c: both cross-chunk
+// dependencies (KV rows, GDN/conv state) are layer-i-to-layer-i, so one
+// primary-device event per (layer, lane-slot) orders them, transitively
+// covering the card-B stream through the existing lx/lo link edges.
+// Concurrency comes from two HOST threads (the build is
+// --default-stream=per-thread, so each thread owns a stream per device);
+// lane 1 runs on bitwise-aliased State/Qwen35Rt "shells" whose chunk
+// scratch is swapped for the lane's own buffers, so the 800-line eval
+// path needs no signature change at all.
+
+pub(super) fn pipe_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PULSAR_PIPE").ok().as_deref() == Some("1"))
+}
+
+/// Lane-1 copies of the State chunk scratch the qwen35 eval path writes.
+/// Sizes mirror State::new with mb = chunk_max(); head-stage buffers
+/// (last_row, head_xq, logits, amax_out) are NOT here - the head runs
+/// after both lanes drain, on State's own set.
+struct StLane {
+    cur: DeviceBuf,
+    normed: DeviceBuf,
+    q: DeviceBuf,
+    k: DeviceBuf,
+    v: DeviceBuf,
+    heads: DeviceBuf,
+    attn_out: DeviceBuf,
+    after_attn: DeviceBuf,
+    gate_act: DeviceBuf,
+    up_act: DeviceBuf,
+    ffn_mid: DeviceBuf,
+    ffn_out: DeviceBuf,
+    shared_out: DeviceBuf,
+    router_logits: DeviceBuf,
+    router_selected: DeviceBuf,
+    router_weights: DeviceBuf,
+    moe_out: DeviceBuf,
+    xq: DeviceBuf,
+    midq: DeviceBuf,
+    krot: DeviceBuf,
+    qrot: DeviceBuf,
+}
+
+impl StLane {
+    fn new(st: &State, s: &super::Shape) -> Result<StLane> {
+        let cm = chunk_max() as u32;
+        let f32s = |n: u32| DeviceBuf::alloc(n as usize * 4);
+        let q8k = |n: usize| n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES;
+        let n_used = s.n_expert_used.max(1);
+        let nf = s.n_ff_dense.max(s.n_ff_exp);
+        Ok(StLane {
+            cur: f32s(cm * s.n_embd)?,
+            normed: f32s(cm * s.n_embd)?,
+            q: f32s(cm * s.n_head * s.head_dim.max(s.qk_dim()))?,
+            k: f32s(cm * s.n_head_kv * s.head_dim)?,
+            v: f32s(cm * s.n_head_kv * s.head_dim)?,
+            heads: f32s(cm * s.heads_dim().max(s.n_head * s.head_dim))?,
+            attn_out: f32s(cm * s.n_embd)?,
+            after_attn: f32s(cm * s.n_embd)?,
+            gate_act: f32s(cm * nf)?,
+            up_act: f32s(cm * nf)?,
+            ffn_mid: f32s(cm * nf)?,
+            ffn_out: f32s(cm * s.n_embd)?,
+            shared_out: f32s(cm * s.n_embd)?,
+            router_logits: f32s(cm * (s.n_expert + s.n_shexp_sink))?,
+            router_selected: DeviceBuf::alloc(cm as usize * n_used as usize * 4)?,
+            router_weights: f32s(cm * s.n_expert_used.max(1))?,
+            moe_out: f32s(cm * s.n_embd)?,
+            xq: DeviceBuf::alloc(cm as usize * q8k(s.n_embd as usize))?,
+            midq: DeviceBuf::alloc(cm as usize * n_used as usize * q8k(s.n_ff_exp as usize))?,
+            krot: if st.kvq_rot { f32s(cm * s.n_head_kv * s.head_dim)? } else { f32s(1)? },
+            qrot: if st.kvq_rot { f32s(cm * s.n_head * s.head_dim)? } else { f32s(1)? },
+        })
+    }
+}
+
+/// Everything lane 1 owns: primary-card State + Rt scratch plus the
+/// per-lane halves on cards B and C (which carry their own TpLinks and
+/// position cells, so a lane is hop-self-contained by construction).
+struct PipeLane {
+    st: StLane,
+    sc: RtScratch,
+    tb: Option<TbScratch>,
+    fc: Option<FcScratch>,
+}
+
+impl PipeLane {
+    fn new(m: &Model, st: &State) -> Result<PipeLane> {
+        Ok(PipeLane {
+            st: StLane::new(st, &m.shape)?,
+            sc: RtScratch::new(&m.shape)?,
+            tb: match &m.tp { Some(_) => Some(TbScratch::new(m)?), None => None },
+            fc: match &m.tp_c { Some(_) => Some(FcScratch::new(m)?), None => None },
+        })
+    }
+}
+
+/// Per-layer event hook eval_qwen35_span consults in pipe mode. `evs`
+/// points at the driver-owned [(slot0, slot1); n_layers] ring; `slot` is
+/// constant per thread (T0 runs even chunks = slot 0). An event that was
+/// never recorded waits as a no-op, which covers the very first chunk.
+#[derive(Clone, Copy)]
+struct PipeHook {
+    evs: *const (kernels::XEvent, kernels::XEvent),
+    slot: u8,
+}
+
+struct PipeCtx {
+    m: *const Model,
+    st: *mut State,
+    rt: *mut Qwen35Rt,
+}
+unsafe impl Send for PipeCtx {}
+
+/// Bitwise-aliased State/Qwen35Rt shells for lane 1.
+///
+/// SAFETY contract: the shells are ptr::read copies wrapped in
+/// ManuallyDrop (their fields never drop; the Box frees only its own
+/// allocation). Chunk scratch is mem::swapped for the lane's own
+/// buffers, so the two threads never write the same scratch. What stays
+/// bitwise-ALIASED and is mutated by both threads - KV caches, GDN/conv
+/// states - is ordered on-device by the PipeHook events plus the lx/lo
+/// link edges; host-side both threads only enqueue FFI work through the
+/// aliased pointers, never touch container structure. Collections that
+/// eval mutates structurally (graphs via mem::take, banks) get FRESH
+/// empty instances ptr::written over the alias (empty HashMap/Vec do not
+/// allocate, so the shell leaks nothing).
+struct ShellGuard {
+    sh_st: Box<std::mem::ManuallyDrop<State>>,
+    sh_rt: Box<std::mem::ManuallyDrop<Qwen35Rt>>,
+    lane: *mut PipeLane,
+    done: bool,
+}
+
+impl ShellGuard {
+    unsafe fn new(st: &mut State, rt: &mut Qwen35Rt) -> ShellGuard {
+        let lane: *mut PipeLane = &mut **rt.pipe_lane.as_mut().unwrap();
+        let mut sh_st = Box::new(std::mem::ManuallyDrop::new(std::ptr::read(st as *const State)));
+        let mut sh_rt = Box::new(std::mem::ManuallyDrop::new(std::ptr::read(rt as *const Qwen35Rt)));
+        std::ptr::write(&mut sh_rt.graphs, std::collections::HashMap::new());
+        std::ptr::write(&mut sh_rt.banks, Vec::new());
+        std::ptr::write(&mut sh_rt.dflash, None);
+        std::ptr::write(&mut sh_rt.pipe_lane, None);
+        sh_rt.graphs_on = false;
+        // silence the unused warning on sh_st's DerefMut path
+        let _ = &mut sh_st;
+        let mut g = ShellGuard { sh_st, sh_rt, lane, done: false };
+        g.swap_all();
+        g
+    }
+
+    /// Symmetric: called once at build (lane buffers IN) and once at
+    /// teardown (lane buffers back OUT, aliases restored to the shells
+    /// where they are then forgotten).
+    fn swap_all(&mut self) {
+        use std::mem::swap;
+        let ln = unsafe { &mut *self.lane };
+        let st: &mut State = &mut self.sh_st;
+        swap(&mut st.cur, &mut ln.st.cur);
+        swap(&mut st.normed, &mut ln.st.normed);
+        swap(&mut st.q, &mut ln.st.q);
+        swap(&mut st.k, &mut ln.st.k);
+        swap(&mut st.v, &mut ln.st.v);
+        swap(&mut st.heads, &mut ln.st.heads);
+        swap(&mut st.attn_out, &mut ln.st.attn_out);
+        swap(&mut st.after_attn, &mut ln.st.after_attn);
+        swap(&mut st.gate_act, &mut ln.st.gate_act);
+        swap(&mut st.up_act, &mut ln.st.up_act);
+        swap(&mut st.ffn_mid, &mut ln.st.ffn_mid);
+        swap(&mut st.ffn_out, &mut ln.st.ffn_out);
+        swap(&mut st.shared_out, &mut ln.st.shared_out);
+        swap(&mut st.router_logits, &mut ln.st.router_logits);
+        swap(&mut st.router_selected, &mut ln.st.router_selected);
+        swap(&mut st.router_weights, &mut ln.st.router_weights);
+        swap(&mut st.moe_out, &mut ln.st.moe_out);
+        swap(&mut st.xq, &mut ln.st.xq);
+        swap(&mut st.midq, &mut ln.st.midq);
+        swap(&mut st.krot, &mut ln.st.krot);
+        swap(&mut st.qrot, &mut ln.st.qrot);
+        let rt: &mut Qwen35Rt = &mut self.sh_rt;
+        swap(&mut rt.sc, &mut ln.sc);
+        if let (Some(tb), Some(lb)) = (rt.tpb.as_mut(), ln.tb.as_mut()) {
+            swap(&mut tb.sc, lb);
+        }
+        if let (Some(c), Some(lc)) = (rt.tpc.as_mut(), ln.fc.as_mut()) {
+            swap(&mut c.sc, lc);
+        }
+    }
+
+    fn teardown(&mut self) {
+        if !self.done {
+            self.swap_all();
+            self.done = true;
+        }
+    }
+}
+
+impl Drop for ShellGuard {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
 struct DenseBank {
     /// one past this bank's last layer (exclusive); banks tile the
     /// non-primary layer ranges in order
@@ -171,21 +431,8 @@ struct DenseBank {
     ffn_mid: DeviceBuf,
     midq: DeviceBuf,
     ffn_out: DeviceBuf,
-    // Qwen35Rt scratch halves
-    qkv: DeviceBuf,
-    conv_out: DeviceBuf,
-    z: DeviceBuf,
-    gq: DeviceBuf,
-    gk: DeviceBuf,
-    gv: DeviceBuf,
-    small: DeviceBuf,
-    g: DeviceBuf,
-    beta: DeviceBuf,
-    gb: DeviceBuf,
-    gdn_o: DeviceBuf,
-    gdn_tmp: DeviceBuf,
-    qfull: DeviceBuf,
-    gate: DeviceBuf,
+    // Qwen35Rt scratch halves, exchanged as one struct
+    sc: RtScratch,
 }
 
 impl DenseBank {
@@ -217,13 +464,9 @@ impl DenseBank {
 
     fn one(m: &Model, first: usize, end: usize) -> Result<DenseBank> {
         let cm = chunk_max();
-        let primary = kernels::get_device();
         let s = m.shape;
         let primary = kernels::get_device();
         let dev = m.layer_dev(first);
-        let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
-        let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
-        let conv_dim = 2 * key_dim + value_dim;
         let n_ff = s.n_ff_exp as usize;
         let n_embd = s.n_embd as usize;
         kernels::set_device(dev)?;
@@ -257,20 +500,7 @@ impl DenseBank {
             ffn_mid: f32s(cm * n_ff)?,
             midq: q8k(cm * n_ff)?,
             ffn_out: f32s(cm * n_embd)?,
-            qkv: f32s(cm * conv_dim)?,
-            conv_out: f32s(cm * conv_dim)?,
-            z: f32s(cm * value_dim)?,
-            gq: f32s(cm * key_dim)?,
-            gk: f32s(cm * key_dim)?,
-            gv: f32s(cm * value_dim)?,
-            small: f32s(cm * s.ssm_v_heads as usize)?,
-            gb: f32s(2 * s.ssm_v_heads as usize)?,
-            g: f32s(cm * s.ssm_v_heads as usize)?,
-            beta: f32s(cm * s.ssm_v_heads as usize)?,
-            gdn_o: f32s(cm * value_dim)?,
-            gdn_tmp: f32s(cm * value_dim)?,
-            qfull: f32s(cm * 2 * (s.n_head * s.head_dim) as usize)?,
-            gate: f32s(cm * (s.n_head * s.head_dim) as usize)?,
+            sc: RtScratch::new(&s)?,
         };
         kernels::set_device(primary)?;
         Ok(b)
@@ -294,27 +524,11 @@ impl DenseBank {
         swap(&mut self.ffn_mid, &mut st.ffn_mid);
         swap(&mut self.midq, &mut st.midq);
         swap(&mut self.ffn_out, &mut st.ffn_out);
-        swap(&mut self.qkv, &mut rt_scratch.qkv);
-        swap(&mut self.conv_out, &mut rt_scratch.conv_out);
-        swap(&mut self.z, &mut rt_scratch.z);
-        swap(&mut self.gq, &mut rt_scratch.gq);
-        swap(&mut self.gk, &mut rt_scratch.gk);
-        swap(&mut self.gv, &mut rt_scratch.gv);
-        swap(&mut self.small, &mut rt_scratch.small);
-        swap(&mut self.g, &mut rt_scratch.g);
-        swap(&mut self.beta, &mut rt_scratch.beta);
-        swap(&mut self.gdn_o, &mut rt_scratch.gdn_o);
-        swap(&mut self.gdn_tmp, &mut rt_scratch.gdn_tmp);
-        swap(&mut self.qfull, &mut rt_scratch.qfull);
-        swap(&mut self.gate, &mut rt_scratch.gate);
-        // gb (packed GDN a/dt_bias coeffs) was allocated on the bank but
-        // never exchanged, so every GDN layer of the split tail wrote and
-        // read it ACROSS devices: garbage gate coefficients on 3 of every
-        // 4 layers. Attention layers were unaffected, so the model kept
-        // emitting grammatical text and the corruption read as "degenerate
-        // looping output" rather than a crash - and check.sh never
-        // exercises the qwen35 dense split, so it stayed green.
-        swap(&mut self.gb, &mut rt_scratch.gb);
+        // ONE swap for the whole scratch set: the gb bug (a field
+        // allocated per-bank but missed in this list read across devices
+        // and corrupted 3 of every 4 layers, invisibly to check.sh) is
+        // impossible by construction now.
+        swap(&mut self.sc, &mut rt_scratch.sc);
     }
 }
 
@@ -327,9 +541,8 @@ impl DenseBank {
 /// carries no recurrent state, no KV and no position cells: just the
 /// activation it receives, its slice of the FFN, and the partial it
 /// sends back.
-struct FfnBank {
-    dev: i32,
-    width: u32,
+/// FfnBank's per-chunk half (PULSAR_PIPE lane); dev/width stay above.
+struct FcScratch {
     xq: DeviceBuf,
     gate: DeviceBuf,
     up: DeviceBuf,
@@ -341,8 +554,47 @@ struct FfnBank {
     lo: kernels::TpLink,
 }
 
-struct TpBank {
+impl FcScratch {
+    /// Third-card per-lane FFN scratch incl. its own links. Leaves the
+    /// PRIMARY device current on return.
+    fn new(m: &Model) -> Result<FcScratch> {
+        let c = m.tp_c.as_ref().ok_or("FcScratch::new without tp_c")?;
+        let s = m.shape;
+        let cm = chunk_max();
+        let primary = kernels::get_device();
+        let f32s = |n: usize| DeviceBuf::alloc(n * 4);
+        let q8k = |n: usize| n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES;
+        let w = c.width as usize;
+        // lx records on the primary (it sends), lo on the third card
+        let lx = kernels::TpLink::new(cm * q8k(s.n_embd as usize), c.dev)?;
+        let recv = f32s(cm * s.n_embd as usize)?;
+        kernels::set_device(c.dev)?;
+        let b = FcScratch {
+            xq: DeviceBuf::alloc(cm * q8k(s.n_embd as usize))?,
+            gate: f32s(cm * w)?,
+            up: f32s(cm * w)?,
+            mid: f32s(cm * w)?,
+            midq: DeviceBuf::alloc(cm * q8k(w))?,
+            out: f32s(cm * s.n_embd as usize)?,
+            recv,
+            lx,
+            lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
+        };
+        kernels::set_device(primary)?;
+        Ok(b)
+    }
+}
+
+struct FfnBank {
     dev: i32,
+    width: u32,
+    sc: FcScratch,
+}
+
+/// TpBank's per-chunk half (PULSAR_PIPE lane): everything here is
+/// chunk-local scratch or a per-chunk link/position cell; the GDN
+/// recurrent states and the device id stay on TpBank itself.
+struct TbScratch {
     xq: DeviceBuf,
     gate: DeviceBuf,
     up: DeviceBuf,
@@ -365,7 +617,6 @@ struct TpBank {
     gb: DeviceBuf,
     gdn_o: DeviceBuf,
     gdn_tmp: DeviceBuf,
-    states: Vec<Option<GdnState>>,
     /// attention half (phase 3b): B's fused q|gate, split q/gate, k/v,
     /// and gated heads over its 12 q / 2 kv heads
     aqf: DeviceBuf,
@@ -392,6 +643,78 @@ struct TpBank {
     lo: kernels::TpLink,
 }
 
+impl TbScratch {
+    /// Card-B per-lane scratch incl. its own links and position cells.
+    /// Leaves the PRIMARY device current on return.
+    fn new(m: &Model) -> Result<TbScratch> {
+        let tp = m.tp.as_ref().ok_or("TbScratch::new without tp")?;
+        let s = m.shape;
+        let cm = chunk_max();
+        let primary = kernels::get_device();
+        let f32s = |n: usize| DeviceBuf::alloc(n * 4);
+        let q8k = |n: usize| n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES;
+        let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
+        let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
+        // tp.half is A's share; B holds the rest
+        let half = (s.n_ff_exp - tp.half) as usize;
+        let (kdh, vdh) = (key_dim / 2, value_dim / 2);
+        let cdh = 2 * kdh + vdh;
+        let vh = s.ssm_v_heads as usize / 2;
+        let recv = f32s(cm * s.n_embd as usize)?; // on the primary
+        // an event records only on its OWN device's streams: lx records
+        // on A (the activation sends), lo on B (the partial returns), so
+        // each is created with that device current
+        let lx = kernels::TpLink::new(cm * s.n_embd as usize * 4, tp.dev)?;
+        kernels::set_device(tp.dev)?;
+        let b = TbScratch {
+            xq: DeviceBuf::alloc(cm * q8k(s.n_embd as usize))?,
+            gate: f32s(cm * half)?,
+            up: f32s(cm * half)?,
+            mid: f32s(cm * half)?,
+            midq: DeviceBuf::alloc(cm * q8k(half))?,
+            out: f32s(cm * s.n_embd as usize)?,
+            recv,
+            normed: f32s(cm * s.n_embd as usize)?,
+            qkv: f32s(cm * cdh)?,
+            conv_out: f32s(cm * cdh)?,
+            z: f32s(cm * vdh)?,
+            gq: f32s(cm * kdh)?,
+            gk: f32s(cm * kdh)?,
+            gv: f32s(cm * vdh)?,
+            g: f32s(cm * vh)?,
+            beta: f32s(cm * vh)?,
+            gb: f32s(2 * vh)?,
+            gdn_o: f32s(cm * vdh)?,
+            gdn_tmp: f32s(cm * vdh)?,
+            aqf: f32s(cm * (s.n_head * s.head_dim) as usize)?,
+            aq: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
+            agate: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
+            ak: f32s(cm * (s.n_head_kv / 2 * s.head_dim) as usize)?,
+            av: f32s(cm * (s.n_head_kv / 2 * s.head_dim) as usize)?,
+            aheads: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
+            pos_b: DeviceBuf::alloc(4)?,
+            hlog: f32s(16 * (s.n_vocab / 2) as usize)?,
+            bmax: DeviceBuf::alloc(16 * 8)?,
+            pos_a: {
+                kernels::set_device(primary)?;
+                let b = DeviceBuf::alloc(4)?;
+                kernels::set_device(tp.dev)?;
+                b
+            },
+            lx,
+            lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
+        };
+        kernels::set_device(primary)?;
+        Ok(b)
+    }
+}
+
+struct TpBank {
+    dev: i32,
+    states: Vec<Option<GdnState>>,
+    sc: TbScratch,
+}
+
 /// qwen35 runtime: GDN states + scratch sized for chunk_max()-token chunks.
 pub(super) struct Qwen35Rt {
     states: Vec<Option<GdnState>>,
@@ -409,29 +732,19 @@ pub(super) struct Qwen35Rt {
     tpb: Option<TpBank>,
     /// third card's FFN-only shard (PULSAR_TP with 3+ devices)
     tpc: Option<FfnBank>,
-    qkv: DeviceBuf,      // [T][conv_dim] raw projection
-    conv_out: DeviceBuf, // [T][conv_dim] conv+silu, layout [q|k|v] per row
-    z: DeviceBuf,        // [T][value_dim]
-    gq: DeviceBuf,       // [T][key_dim] delta-rule inputs
-    gk: DeviceBuf,       // [T][key_dim]
-    gv: DeviceBuf,       // [T][value_dim]
-    small: DeviceBuf,    // [T][ssm_v_heads] alpha/beta matvec scratch
-    /// packed [g | beta] row for the concatenated coefficient matmul
-    /// (decode fast path)
-    gb: DeviceBuf,
-    g: DeviceBuf,        // [T][ssm_v_heads] log-decay upload
-    beta: DeviceBuf,     // [T][ssm_v_heads]
-    gdn_o: DeviceBuf,    // [T][value_dim]
-    gdn_tmp: DeviceBuf,  // [T][value_dim]
-    qfull: DeviceBuf,    // [T][2*n_head*head_dim] fused q+gate
-    gate: DeviceBuf,     // [T][n_head*head_dim]
-    shg: DeviceBuf,      // [T] shared-expert gate logits
+    /// per-chunk primary-card scratch (one lane; PULSAR_PIPE adds one)
+    sc: RtScratch,
+    /// two-lane prefill pipeline: per-layer event hook consulted by
+    /// eval_qwen35_span, and lane 1's scratch (lazily allocated)
+    pipe: Option<PipeHook>,
+    pipe_lane: Option<Box<PipeLane>>,
+    /// lane allocation failed once (VRAM): run plain from then on
+    pipe_dead: bool,
     dflash: Option<DflashRt>,
 }
 
 impl Qwen35Rt {
     pub fn new(m: &Model) -> Result<Qwen35Rt> {
-        let cm = chunk_max();
         let s = m.shape;
         let primary = kernels::get_device();
         let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
@@ -463,32 +776,21 @@ impl Qwen35Rt {
         }
         kernels::set_device(primary)?;
         let banks = DenseBank::all(m)?;
-        let f32s = |n: usize| DeviceBuf::alloc(n * 4);
         let graphs_on = std::env::var("PULSAR_GRAPHS").ok().as_deref() != Some("0")
             && m.layers.iter().any(|l| {
                 matches!(l.ffn, super::Ffn::DenseKq { .. } | super::Ffn::Dense { .. })
             });
         let tpb = match &m.tp {
             Some(tp) => {
-                let q8k = |n: usize| {
-                    n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
-                };
-                // tp.half is A's share; B holds the rest
-                let half = (s.n_ff_exp - tp.half) as usize;
-                let (kdh, vdh) = (key_dim / 2, value_dim / 2);
-                let cdh = 2 * kdh + vdh;
                 let vh = s.ssm_v_heads as usize / 2;
-                let recv = f32s(cm * s.n_embd as usize)?; // on the primary
-                // an event records only on its OWN device's streams: lx
-                // records on A (the activation sends: q8_K rows for the
-                // FFN, f32 normed for the GDN half), lo on B (the
-                // partial returns), so each is created with that device
-                // current
-                let lx = kernels::TpLink::new(cm * s.n_embd as usize * 4, tp.dev)?;
                 kernels::set_device(tp.dev)?;
                 let mut bstates = Vec::with_capacity(s.n_exec_layer as usize);
                 for il in 0..s.n_exec_layer as usize {
                     if m.tp_gdn(il).is_some() {
+                        let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
+                        let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
+                        let (kdh, vdh) = (key_dim / 2, value_dim / 2);
+                        let cdh = 2 * kdh + vdh;
                         let sbytes = vh * s.ssm_state as usize * s.ssm_state as usize * 4;
                         let cbytes = (s.ssm_conv_k as usize - 1) * cdh * 4;
                         let mut st2 = GdnState {
@@ -505,78 +807,21 @@ impl Qwen35Rt {
                         bstates.push(None);
                     }
                 }
-                let b = TpBank {
-                    dev: tp.dev,
-                    xq: DeviceBuf::alloc(cm * q8k(s.n_embd as usize))?,
-                    gate: f32s(cm * half)?,
-                    up: f32s(cm * half)?,
-                    mid: f32s(cm * half)?,
-                    midq: DeviceBuf::alloc(cm * q8k(half))?,
-                    out: f32s(cm * s.n_embd as usize)?,
-                    recv,
-                    normed: f32s(cm * s.n_embd as usize)?,
-                    qkv: f32s(cm * cdh)?,
-                    conv_out: f32s(cm * cdh)?,
-                    z: f32s(cm * vdh)?,
-                    gq: f32s(cm * kdh)?,
-                    gk: f32s(cm * kdh)?,
-                    gv: f32s(cm * vdh)?,
-                    g: f32s(cm * vh)?,
-                    beta: f32s(cm * vh)?,
-                    gb: f32s(2 * vh)?,
-                    gdn_o: f32s(cm * vdh)?,
-                    gdn_tmp: f32s(cm * vdh)?,
-                    states: bstates,
-                    aqf: f32s(cm * (s.n_head * s.head_dim) as usize)?,
-                    aq: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
-                    agate: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
-                    ak: f32s(cm * (s.n_head_kv / 2 * s.head_dim) as usize)?,
-                    av: f32s(cm * (s.n_head_kv / 2 * s.head_dim) as usize)?,
-                    aheads: f32s(cm * (s.n_head / 2 * s.head_dim) as usize)?,
-                    pos_b: DeviceBuf::alloc(4)?,
-                    hlog: f32s(16 * (s.n_vocab / 2) as usize)?,
-                    bmax: DeviceBuf::alloc(16 * 8)?,
-                    pos_a: {
-                        kernels::set_device(primary)?;
-                        let b = DeviceBuf::alloc(4)?;
-                        kernels::set_device(tp.dev)?;
-                        b
-                    },
-                    lx,
-                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
-                };
                 kernels::set_device(primary)?;
-                Some(b)
+                Some(TpBank {
+                    dev: tp.dev,
+                    states: bstates,
+                    sc: TbScratch::new(m)?,
+                })
             }
             None => None,
         };
         let tpc = match &m.tp_c {
-            Some(c) => {
-                let q8k = |n: usize| {
-                    n.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
-                };
-                let w = c.width as usize;
-                // lx records on the primary (it sends), lo on the third
-                // card, so each link is created with its device current
-                let lx = kernels::TpLink::new(cm * q8k(s.n_embd as usize), c.dev)?;
-                let recv = f32s(cm * s.n_embd as usize)?;
-                kernels::set_device(c.dev)?;
-                let b = FfnBank {
-                    dev: c.dev,
-                    width: c.width,
-                    xq: DeviceBuf::alloc(cm * q8k(s.n_embd as usize))?,
-                    gate: f32s(cm * w)?,
-                    up: f32s(cm * w)?,
-                    mid: f32s(cm * w)?,
-                    midq: DeviceBuf::alloc(cm * q8k(w))?,
-                    out: f32s(cm * s.n_embd as usize)?,
-                    recv,
-                    lx,
-                    lo: kernels::TpLink::new(cm * s.n_embd as usize * 4, primary)?,
-                };
-                kernels::set_device(primary)?;
-                Some(b)
-            }
+            Some(c) => Some(FfnBank {
+                dev: c.dev,
+                width: c.width,
+                sc: FcScratch::new(m)?,
+            }),
             None => None,
         };
         Ok(Qwen35Rt {
@@ -586,23 +831,92 @@ impl Qwen35Rt {
             graphs_on,
             tpb,
             states,
-            qkv: f32s(cm * conv_dim)?,
-            conv_out: f32s(cm * conv_dim)?,
-            z: f32s(cm * value_dim)?,
-            gq: f32s(cm * key_dim)?,
-            gk: f32s(cm * key_dim)?,
-            gv: f32s(cm * value_dim)?,
-            small: f32s(cm * s.ssm_v_heads as usize)?,
-            gb: f32s(2 * s.ssm_v_heads as usize)?,
-            g: f32s(cm * s.ssm_v_heads as usize)?,
-            beta: f32s(cm * s.ssm_v_heads as usize)?,
-            gdn_o: f32s(cm * value_dim)?,
-            gdn_tmp: f32s(cm * value_dim)?,
-            qfull: f32s(cm * 2 * (s.n_head * s.head_dim) as usize)?,
-            gate: f32s(cm * (s.n_head * s.head_dim) as usize)?,
-            shg: f32s(cm)?,
+            sc: RtScratch::new(&s)?,
+            pipe: None,
+            pipe_lane: None,
+            pipe_dead: false,
             dflash: None,
         })
+    }
+
+    /// Device of each state slot in ckpt() order (primary chain then
+    /// card-B); -1 for absent slots. Prefix persist uses this to place
+    /// checkpoint buffers on reload.
+    pub(super) fn ckpt_devs(&self) -> Vec<i32> {
+        self.states
+            .iter()
+            .chain(self.tpb.iter().flat_map(|b| b.states.iter()))
+            .map(|gs| gs.as_ref().map_or(-1, |g| g.dev))
+            .collect()
+    }
+
+    /// Serialize the LIVE GDN/conv states (the recurrent state at the
+    /// current position) in ckpt() order, for prefix persist.
+    pub(super) fn save_live_states(&self) -> Result<Vec<u8>> {
+        let primary = kernels::get_device();
+        let mut out = Vec::new();
+        let chain = self.states.iter().chain(self.tpb.iter().flat_map(|b| b.states.iter()));
+        let all: Vec<_> = chain.collect();
+        out.extend_from_slice(&(all.len() as u32).to_le_bytes());
+        for gs in all {
+            match gs {
+                Some(g) => {
+                    out.push(1);
+                    kernels::set_device(g.dev)?;
+                    for b in [&g.s, &g.conv] {
+                        let mut host = vec![0u8; b.bytes()];
+                        b.read(0, &mut host)?;
+                        out.extend_from_slice(&(host.len() as u64).to_le_bytes());
+                        out.extend_from_slice(&host);
+                    }
+                }
+                None => out.push(0),
+            }
+        }
+        kernels::set_device(primary)?;
+        Ok(out)
+    }
+
+    /// Restore what save_live_states wrote into the existing buffers.
+    pub(super) fn load_live_states(&mut self, inp: &mut &[u8]) -> Result {
+        let primary = kernels::get_device();
+        let n = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+        *inp = &inp[4..];
+        let chain = self.states.iter_mut().chain(self.tpb.iter_mut().flat_map(|b| b.states.iter_mut()));
+        let mut seen = 0usize;
+        for gs in chain {
+            if seen == n {
+                break;
+            }
+            seen += 1;
+            let flag = inp[0];
+            *inp = &inp[1..];
+            match (flag, gs) {
+                (1, Some(g)) => {
+                    kernels::set_device(g.dev)?;
+                    for b in [&mut g.s, &mut g.conv] {
+                        let m = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+                        *inp = &inp[8..];
+                        if m != b.bytes() {
+                            kernels::set_device(primary)?;
+                            return Err("prefix file: gdn state size mismatch".into());
+                        }
+                        b.write(0, &inp[..m])?;
+                        *inp = &inp[m..];
+                    }
+                }
+                (0, None) => {}
+                _ => {
+                    kernels::set_device(primary)?;
+                    return Err("prefix file: gdn state layout mismatch".into());
+                }
+            }
+        }
+        kernels::set_device(primary)?;
+        if seen != n {
+            return Err("prefix file: gdn state count mismatch".into());
+        }
+        Ok(())
     }
 
     /// Snapshot every GDN state (nextn-MTP verify rounds; buffers live
@@ -850,7 +1164,7 @@ impl Qwen35Rt {
                     let rb = bank_rb.as_mut().unwrap();
                     (&mut rb.conv_out, &mut rb.gq, &mut rb.gk, &mut rb.gv, &mut rb.gdn_o)
                 } else {
-                    (&mut self.conv_out, &mut self.gq, &mut self.gk, &mut self.gv, &mut self.gdn_o)
+                    (&mut self.sc.conv_out, &mut self.sc.gq, &mut self.sc.gk, &mut self.sc.gv, &mut self.sc.gdn_o)
                 };
                 kernels::qwen35_conv_batch(conv_out, sq, &gdn.conv, &mut g.conv, conv_dim, s.ssm_conv_k, accept_n)?;
                 kernels::qwen35_split_qkv(gq, gk, gv, conv_out, accept_n, key_dim, value_dim)?;
@@ -1269,15 +1583,16 @@ impl Model {
             st.tok = kernels::DeviceBuf::alloc(ids.len() * 4)?;
         }
         st.tok.write(0, kernels::as_bytes(&ids))?;
+        let banks_empty = banks.is_empty();
         let mut run = |st: &mut State, rt: &mut Qwen35Rt, t: u32, tok_off: u32, pos: u32, last: bool| -> Result {
             // per-token position cells (TP graph capture): the captured
             // attention kernels dereference these, so a replayed graph
             // sees the fresh position. Written OUTSIDE any capture, one
             // async 1-thread launch per card.
             if let Some(tb) = rt.tpb.as_mut() {
-                kernels::set_u32(&mut tb.pos_a, pos)?;
+                kernels::set_u32(&mut tb.sc.pos_a, pos)?;
                 kernels::set_device(tb.dev)?;
-                kernels::set_u32(&mut tb.pos_b, pos)?;
+                kernels::set_u32(&mut tb.sc.pos_b, pos)?;
                 kernels::set_device(primary)?;
             }
             kernels::embed_q8_0_at(&mut st.cur, &self.token_embd, &st.tok, tok_off, s.n_embd, s.n_vocab, t)?;
@@ -1365,14 +1680,52 @@ impl Model {
         };
         let cm = chunk_max();
         let n_chunks = tokens.chunks(cm).count();
-        for (ci, chunk) in tokens.chunks(cm).enumerate() {
-            let t = chunk.len() as u32;
-            run(st, rt, t, (ci * cm) as u32, pos, ci + 1 == n_chunks)?;
-            pos += t;
-            last_t = t;
+        let pipe = pipe_on()
+            && !rt.pipe_dead
+            && self.tp.is_some()
+            && banks_empty
+            && rt.dflash.is_none()
+            && n_chunks >= 3
+            && self.layers.iter().all(|l| {
+                matches!(l.ffn, super::Ffn::DenseKq { .. } | super::Ffn::Dense { .. })
+            })
+            && std::env::var_os("PULSAR_PROFILE").is_none()
+            && std::env::var_os("PULSAR_DEBUG_L2").is_none()
+            && std::env::var_os("PULSAR_DENSE_PROF").is_none();
+        let owe_fill = pipe && st.fill_in_forward && self.mtp.is_some();
+        let mut ran_pipe = false;
+        if pipe {
+            match self.qwen35_pipe_chunks(st, rt, tokens, pos0, n0) {
+                Ok(t) => {
+                    last_t = t;
+                    pos = pos0 + tokens.len() as u32;
+                    ran_pipe = true;
+                }
+                // lane alloc failure marks pipe_dead: fall back to the
+                // plain loop below instead of failing the prefill
+                Err(_) if rt.pipe_dead => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !ran_pipe {
+            for (ci, chunk) in tokens.chunks(cm).enumerate() {
+                let t = chunk.len() as u32;
+                run(st, rt, t, (ci * cm) as u32, pos, ci + 1 == n_chunks)?;
+                // short tail window of a pipelined MTP prefill: the pipe
+                // declined (< 3 chunks) but the caller still expects the
+                // fills to happen in here
+                if st.fill_in_forward && self.mtp.is_some() {
+                    self.mtp_prefill_fill_rt(st, rt, t, (ci * cm) as u32, pos)?;
+                }
+                pos += t;
+                last_t = t;
+            }
         }
         rt.banks = banks;
         if rows == 0 {
+            if owe_fill {
+                self.pipe_final_fill(st, rt, tokens, pos0)?;
+            }
             return Ok(None);
         }
         if rows > last_t {
@@ -1381,6 +1734,11 @@ impl Model {
         let k = rows;
         let row = s.n_embd as usize * 4;
         kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (last_t - k) as usize * row, k as usize * row)?;
+        if owe_fill {
+            // the pipe deferred its final chunk's fill: cur is copied out,
+            // the fill may clobber it now
+            self.pipe_final_fill(st, rt, tokens, pos0)?;
+        }
         kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, s.rms_eps)?;
         if st.skip_logit_read {
             if self.head_argmax_split(st, rt, k)? {
@@ -1416,19 +1774,19 @@ impl Model {
             return Ok(false);
         };
         let v2 = s.n_vocab / 2;
-        tb.lx.send_f32(&st.normed, (k * s.n_embd) as usize)?;
+        tb.sc.lx.send_f32(&st.normed, (k * s.n_embd) as usize)?;
         kernels::set_device(tb.dev)?;
-        tb.lx.recv_f32(&mut tb.normed, (k * s.n_embd) as usize)?;
-        kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, k)?;
-        kernels::matmul_kq(&mut tb.hlog, &hb.w, &tb.xq, s.n_embd, v2, k, hb.row_bytes, hb.quant)?;
-        kernels::argmax_rows_launch(&mut tb.bmax, &tb.hlog, v2, k)?;
+        tb.sc.lx.recv_f32(&mut tb.sc.normed, (k * s.n_embd) as usize)?;
+        kernels::quantize_q8_k(&mut tb.sc.xq, &tb.sc.normed, s.n_embd, k)?;
+        kernels::matmul_kq(&mut tb.sc.hlog, &hb.w, &tb.sc.xq, s.n_embd, v2, k, hb.row_bytes, hb.quant)?;
+        kernels::argmax_rows_launch(&mut tb.sc.bmax, &tb.sc.hlog, v2, k)?;
         kernels::set_device(kernels::primary_device())?;
         kernels::quantize_q8_k(&mut st.head_xq, &st.normed, s.n_embd, k)?;
         kernels::matmul_kq(&mut st.logits, &self.output, &st.head_xq, s.n_embd, v2, k, row_bytes, quant)?;
         kernels::argmax_rows_launch(&mut st.amax_out, &st.logits, v2, k)?;
         let ap = kernels::argmax_pairs_read(&st.amax_out, k)?;
         kernels::set_device(tb.dev)?;
-        let bp = kernels::argmax_pairs_read(&tb.bmax, k)?;
+        let bp = kernels::argmax_pairs_read(&tb.sc.bmax, k)?;
         kernels::set_device(kernels::primary_device())?;
         st.last_argmax = ap
             .iter()
@@ -1436,6 +1794,212 @@ impl Model {
             .map(|(a, b)| if b.0 > a.0 { b.1 + v2 } else { a.1 })
             .collect();
         Ok(true)
+    }
+
+    /// Generate-side twin of the forward's pipe gate: true when a
+    /// qwen35 prefill through forward_batch will take the two-lane pipe
+    /// for a multi-chunk prompt, so the caller may hand the WHOLE prompt
+    /// (with MTP fills done inside). Keep in lockstep with the gate in
+    /// forward_qwen35_inner.
+    pub(super) fn pipe_ready(&self, st: &State) -> bool {
+        pipe_on()
+            && self.shape.family == super::Family::Qwen35
+            && self.tp.is_some()
+            && st.qwen35.as_ref().is_some_and(|rt| rt.dflash.is_none() && rt.banks.is_empty())
+            && self
+                .layers
+                .iter()
+                .all(|l| matches!(l.ffn, super::Ffn::DenseKq { .. } | super::Ffn::Dense { .. }))
+            && std::env::var_os("PULSAR_PROFILE").is_none()
+            && std::env::var_os("PULSAR_DEBUG_L2").is_none()
+            && std::env::var_os("PULSAR_DENSE_PROF").is_none()
+    }
+
+    /// PULSAR_PIPE driver: runs every cm-chunk of `tokens` through two
+    /// lanes on two host threads, chunk c+1 one layer behind chunk c via
+    /// the PipeHook events. Returns the final chunk's row count; the
+    /// final residual always ends in State's own `cur` (copied back when
+    /// the last chunk ran on the shell lane). Caller guarantees: TP on,
+    /// banks empty, no dflash, dense layers only, >= 3 chunks.
+    fn qwen35_pipe_chunks(
+        &self,
+        st: &mut State,
+        rt: &mut Qwen35Rt,
+        tokens: &[u32],
+        pos0: u32,
+        n0: usize,
+    ) -> Result<u32> {
+        let cm = chunk_max();
+        let s = self.shape;
+        if rt.pipe_lane.is_none() {
+            match PipeLane::new(self, st) {
+                Ok(l) => rt.pipe_lane = Some(Box::new(l)),
+                Err(e) => {
+                    // lane scratch did not fit (262k-ctx KV budgets):
+                    // permanently fall back to the plain chunk loop
+                    // rather than failing the prefill
+                    eprintln!("pulsar: pipe lane alloc failed ({e}); PULSAR_PIPE disabled for this run");
+                    rt.pipe_dead = true;
+                    return Err("pipe lane alloc failed".into());
+                }
+            }
+            // arena prewarm: move the first-use cudaMalloc stalls (a
+            // measured one-off ~2s) out of the steady-state chunks
+            let primary = kernels::get_device();
+            for d in [Some(primary), self.tp.as_ref().map(|t| t.dev), self.tp_c.as_ref().map(|c| c.dev)]
+                .into_iter()
+                .flatten()
+            {
+                kernels::set_device(d)?;
+                kernels::lane_prewarm();
+            }
+            kernels::set_device(primary)?;
+            eprintln!("pulsar: pipe lane allocated (PULSAR_PIPE two-chunk prefill)");
+        }
+        let n_layers = self.layers.len();
+        // +1: the MTP prefill fill runs as a virtual layer n_layers in the
+        // same handoff chain, so the draft layer's state and the hidden
+        // carry update in exact chunk order across the two lanes
+        let mut evs: Vec<(kernels::XEvent, kernels::XEvent)> = Vec::with_capacity(n_layers + 1);
+        for _ in 0..=n_layers {
+            evs.push((kernels::XEvent::new()?, kernels::XEvent::new()?));
+        }
+        let graphs_prev = rt.graphs_on;
+        rt.graphs_on = false;
+        rt.pipe = Some(PipeHook { evs: evs.as_ptr(), slot: 0 });
+        let mut guard = unsafe { ShellGuard::new(st, rt) };
+        guard.sh_rt.pipe = Some(PipeHook { evs: evs.as_ptr(), slot: 1 });
+        let ctx = PipeCtx {
+            m: self as *const Model,
+            st: (&mut **guard.sh_st) as *mut State,
+            rt: (&mut **guard.sh_rt) as *mut Qwen35Rt,
+        };
+        let n_chunks = tokens.chunks(cm).count();
+        let pipe_res: std::result::Result<(), String> = std::thread::scope(|scope| {
+            let h = scope.spawn(move || -> std::result::Result<(), String> {
+                let ctx = ctx;
+                kernels::set_device(kernels::primary_device()).map_err(|e| e.to_string())?;
+                // lane-1 scratch arenas (preq/octet/nvfp4-act/gqa-split):
+                // this thread must never share a staging buffer with T0
+                kernels::set_lane(1);
+                let (m, sst, srt) = unsafe { (&*ctx.m, &mut *ctx.st, &mut *ctx.rt) };
+                for d in [Some(kernels::primary_device()), m.tp.as_ref().map(|t| t.dev), m.tp_c.as_ref().map(|c| c.dev)]
+                    .into_iter()
+                    .flatten()
+                {
+                    kernels::set_device(d).map_err(|e| e.to_string())?;
+                    kernels::lane_prewarm();
+                }
+                kernels::set_device(kernels::primary_device()).map_err(|e| e.to_string())?;
+                for (ci, chunk) in tokens.chunks(cm).enumerate() {
+                    if ci % 2 != 1 {
+                        continue;
+                    }
+                    m.pipe_chunk(sst, srt, chunk.len() as u32, (ci * cm) as u32,
+                                 pos0 + (ci * cm) as u32, n0, ci + 1 < n_chunks)
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            });
+            let mut main_res: std::result::Result<(), String> = Ok(());
+            for (ci, chunk) in tokens.chunks(cm).enumerate() {
+                if ci % 2 != 0 {
+                    continue;
+                }
+                if let Err(e) = self.pipe_chunk(st, rt, chunk.len() as u32, (ci * cm) as u32,
+                                                pos0 + (ci * cm) as u32, n0, ci + 1 < n_chunks) {
+                    main_res = Err(e.to_string());
+                    break;
+                }
+            }
+            let tres = h
+                .join()
+                .map_err(|_| "pipe thread panicked".to_string())
+                .and_then(|r| r);
+            main_res.and(tres)
+        });
+        // the hook points at this frame's evs: clear it (and the shell)
+        // BEFORE any fallible tail work, so no error path can leave a
+        // dangling event pointer armed on the runtime
+        guard.teardown();
+        rt.pipe = None;
+        rt.graphs_on = graphs_prev;
+        let last = n_chunks - 1;
+        let last_t = tokens.chunks(cm).last().map_or(0, |c| c.len()) as u32;
+        if pipe_res.is_ok() && last % 2 == 1 {
+            // final chunk lives on the shell lane: order the copy after
+            // its last-layer record, then hand the residual to State's
+            // cur for the head
+            unsafe {
+                let e = &*evs.as_ptr().add(n_layers - 1);
+                e.1.wait()?;
+            }
+            let bytes = last_t as usize * s.n_embd as usize * 4;
+            // teardown already swapped the lane back: the final chunk's
+            // residual now lives in the LANE's cur buffer
+            let lane_cur = &rt.pipe_lane.as_ref().unwrap().st.cur;
+            kernels::copy_d2d(&mut st.cur, 0, lane_cur, 0, bytes)?;
+        }
+        drop(guard);
+        pipe_res?;
+        Ok(last_t)
+    }
+
+    /// Runs the fill the pipe deferred for its FINAL chunk (the fill
+    /// overwrites `cur`, so it must wait until the head has read the
+    /// residual). Serial by now - rt.pipe is None, no events involved.
+    fn pipe_final_fill(&self, st: &mut State, rt: &mut Qwen35Rt, tokens: &[u32], pos0: u32) -> Result {
+        let cm = chunk_max();
+        let n_chunks = tokens.chunks(cm).count();
+        let last_t = tokens.chunks(cm).last().map_or(0, |c| c.len()) as u32;
+        if last_t == 0 {
+            return Ok(());
+        }
+        let off = ((n_chunks - 1) * cm) as u32;
+        self.mtp_prefill_fill_rt(st, rt, last_t, off, pos0 + off)
+    }
+
+    /// One pipe chunk: position cells + embed + the full layer span.
+    /// Mirrors the non-bank body of forward_qwen35_inner's `run`.
+    fn pipe_chunk(
+        &self,
+        st: &mut State,
+        rt: &mut Qwen35Rt,
+        t: u32,
+        tok_off: u32,
+        pos: u32,
+        n0: usize,
+        fill: bool,
+    ) -> Result {
+        let s = self.shape;
+        let primary = kernels::primary_device();
+        if let Some(tb) = rt.tpb.as_mut() {
+            kernels::set_u32(&mut tb.sc.pos_a, pos)?;
+            kernels::set_device(tb.dev)?;
+            kernels::set_u32(&mut tb.sc.pos_b, pos)?;
+            kernels::set_device(primary)?;
+        }
+        kernels::embed_q8_0_at(&mut st.cur, &self.token_embd, &st.tok, tok_off, s.n_embd, s.n_vocab, t)?;
+        self.eval_qwen35_span(st, rt, 0, n0, pos, t)?;
+        if fill && st.fill_in_forward && self.mtp.is_some() {
+            // MTP fill = virtual layer n0 in the handoff chain: the draft
+            // layer's KV/GDN state and the mtp_hidden carry (aliased State
+            // fields on the shell) then update in exact chunk order
+            if let Some(p) = rt.pipe {
+                unsafe {
+                    let e = &*p.evs.add(n0);
+                    (if p.slot == 0 { &e.1 } else { &e.0 }).wait()?;
+                }
+            }
+            self.mtp_prefill_fill_rt(st, rt, t, tok_off, pos)?;
+            if let Some(p) = rt.pipe {
+                unsafe {
+                    let e = &*p.evs.add(n0);
+                    (if p.slot == 0 { &e.0 } else { &e.1 }).record()?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Eval layers [lo, hi) on the current device. Runs of GDN+DenseKq
@@ -1535,7 +2099,24 @@ impl Model {
                     graphs[&key].launch()?;
                     il = end;
                 } else {
+                    if let Some(p) = rt.pipe {
+                        // pipe lane handoff: layer il may start only after
+                        // the OTHER lane finished ITS layer il (KV rows +
+                        // GDN/conv state; card-B streams follow through
+                        // the lx/lo link edges). Never-recorded events
+                        // wait as no-ops, covering the first chunk.
+                        unsafe {
+                            let e = &*p.evs.add(il);
+                            (if p.slot == 0 { &e.1 } else { &e.0 }).wait()?;
+                        }
+                    }
                     self.eval_qwen35_layer(st, rt, il, &self.layers[il], pos, t)?;
+                    if let Some(p) = rt.pipe {
+                        unsafe {
+                            let e = &*p.evs.add(il);
+                            (if p.slot == 0 { &e.0 } else { &e.1 }).record()?;
+                        }
+                    }
                     if std::env::var_os("PULSAR_DEBUG_L2").is_some() {
                         let a = st.after_attn.read_f32(4)?;
                         let v = st.cur.read_f32(4)?;
@@ -1629,9 +2210,9 @@ impl Model {
                     eprintln!("  PRESEND il={il} t={t} bytes={} A[0] {:?} A[mid] {:?}",
                         (t * s.n_embd) as usize * 4, st.normed.read_f32(2)?, st.normed.read_f32_at(d, 2)?);
                 }
-                tb.lx.send_f32(&st.normed, (t * s.n_embd) as usize)?;
+                tb.sc.lx.send_f32(&st.normed, (t * s.n_embd) as usize)?;
                 kernels::set_device(tb.dev)?;
-                tb.lx.recv_f32(&mut tb.normed, (t * s.n_embd) as usize)?;
+                tb.sc.lx.recv_f32(&mut tb.sc.normed, (t * s.n_embd) as usize)?;
                 if dbg {
                     // does the TpLink hand card B the SAME activations A
                     // computed? A's normed printed by the L2 probe above.
@@ -1650,38 +2231,38 @@ impl Model {
                     let deep = (s.n_embd as usize / 2) * 4;
                     let tail = ((t as usize - 1) * s.n_embd as usize) * 4;
                     eprintln!("  TPlink il={il} B[0] {:?} B[mid] {:?} B[lastrow] {:?}",
-                        tb.normed.read_f32(2)?, tb.normed.read_f32_at(deep, 2)?,
-                        tb.normed.read_f32_at(tail, 2)?);
+                        tb.sc.normed.read_f32(2)?, tb.sc.normed.read_f32_at(deep, 2)?,
+                        tb.sc.normed.read_f32_at(tail, 2)?);
                 }
                 if matches!(bw.wqkv, MatW::Kq(_)) {
-                    kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, t)?;
+                    kernels::quantize_q8_k(&mut tb.sc.xq, &tb.sc.normed, s.n_embd, t)?;
                 }
-                matw(&mut tb.qkv, &bw.wqkv, &tb.normed, &tb.xq, s.n_embd, cdh, t)?;
-                matw(&mut tb.z, &bw.wz, &tb.normed, &tb.xq, s.n_embd, vdh, t)?;
+                matw(&mut tb.sc.qkv, &bw.wqkv, &tb.sc.normed, &tb.sc.xq, s.n_embd, cdh, t)?;
+                matw(&mut tb.sc.z, &bw.wz, &tb.sc.normed, &tb.sc.xq, s.n_embd, vdh, t)?;
                 let packed = t == 1;
                 if packed {
                     // ONE [n_embd -> 2vh] matmul feeds both coefficient
                     // sets; the packed row is g[0..vh] ++ beta[vh..2vh]
-                    kernels::matmul_f32(&mut tb.gb, &bw.ab_w, &tb.normed, s.n_embd, 2 * vh, 1)?;
-                    kernels::qwen35_gdn_coeffs_packed(&mut tb.gb, vh as usize * 4, &bw.a, &bw.dt_bias, vh)?;
+                    kernels::matmul_f32(&mut tb.sc.gb, &bw.ab_w, &tb.sc.normed, s.n_embd, 2 * vh, 1)?;
+                    kernels::qwen35_gdn_coeffs_packed(&mut tb.sc.gb, vh as usize * 4, &bw.a, &bw.dt_bias, vh)?;
                 } else {
-                    kernels::matmul_f32(&mut tb.g, &bw.ab_w, &tb.normed, s.n_embd, vh, t)?;
-                    kernels::matmul_f32_off(&mut tb.beta, &bw.ab_w, vh as usize * s.n_embd as usize * 4, &tb.normed, s.n_embd, vh, t)?;
-                    kernels::qwen35_gdn_coeffs(&mut tb.g, &mut tb.beta, &bw.a, &bw.dt_bias, t, vh)?;
+                    kernels::matmul_f32(&mut tb.sc.g, &bw.ab_w, &tb.sc.normed, s.n_embd, vh, t)?;
+                    kernels::matmul_f32_off(&mut tb.sc.beta, &bw.ab_w, vh as usize * s.n_embd as usize * 4, &tb.sc.normed, s.n_embd, vh, t)?;
+                    kernels::qwen35_gdn_coeffs(&mut tb.sc.g, &mut tb.sc.beta, &bw.a, &bw.dt_bias, t, vh)?;
                 }
                 let bs = tb.states[il].as_mut().ok_or("tp gdn state missing")?;
-                kernels::qwen35_conv_batch(&mut tb.conv_out, &tb.qkv, &bw.conv, &mut bs.conv, cdh, s.ssm_conv_k, t)?;
-                kernels::qwen35_split_qkv(&mut tb.gq, &mut tb.gk, &mut tb.gv, &tb.conv_out, t, kdh, vdh)?;
-                kernels::qwen35_l2_norm(&mut tb.gq, t * kh, s.ssm_state, eps)?;
-                kernels::qwen35_l2_norm(&mut tb.gk, t * kh, s.ssm_state, eps)?;
+                kernels::qwen35_conv_batch(&mut tb.sc.conv_out, &tb.sc.qkv, &bw.conv, &mut bs.conv, cdh, s.ssm_conv_k, t)?;
+                kernels::qwen35_split_qkv(&mut tb.sc.gq, &mut tb.sc.gk, &mut tb.sc.gv, &tb.sc.conv_out, t, kdh, vdh)?;
+                kernels::qwen35_l2_norm(&mut tb.sc.gq, t * kh, s.ssm_state, eps)?;
+                kernels::qwen35_l2_norm(&mut tb.sc.gk, t * kh, s.ssm_state, eps)?;
                 if packed {
                     kernels::qwen35_gdn_batch_packed(
-                        &mut tb.gdn_o, &mut bs.s, &tb.gq, &tb.gk, &tb.gv, &tb.gb, vh as usize * 4,
+                        &mut tb.sc.gdn_o, &mut bs.s, &tb.sc.gq, &tb.sc.gk, &tb.sc.gv, &tb.sc.gb, vh as usize * 4,
                         vh, kh, s.ssm_state,
                     )?;
                 } else {
                     kernels::qwen35_gdn_batch(
-                        &mut tb.gdn_o, &mut bs.s, &tb.gq, &tb.gk, &tb.gv, &tb.g, &tb.beta,
+                        &mut tb.sc.gdn_o, &mut bs.s, &tb.sc.gq, &tb.sc.gk, &tb.sc.gv, &tb.sc.g, &tb.sc.beta,
                         vh, kh, s.ssm_state, t,
                     )?;
                 }
@@ -1691,75 +2272,75 @@ impl Model {
                     // B's v-block starts at 2*kdh = key_dim floats in.
                     let bv = key_dim as usize * 4;
                     // sanity: B's q-block row 0 IS global row kh, so this
-                    // must equal the plain path's rt.qkv at kh. If it does
+                    // must equal the plain path's rt.sc.qkv at kh. If it does
                     // not, the probe offsets are wrong, not card B.
-                    eprintln!("  GDNbq il={il} Bq0 {:?}", tb.qkv.read_f32(4)?);
-                    eprintln!("  GDNb il={il} Bqkv_v {:?}", tb.qkv.read_f32_at(bv, 8)?);
+                    eprintln!("  GDNbq il={il} Bq0 {:?}", tb.sc.qkv.read_f32(4)?);
+                    eprintln!("  GDNb il={il} Bqkv_v {:?}", tb.sc.qkv.read_f32_at(bv, 8)?);
                 }
-                kernels::gqa_head_rms_norm(&mut tb.gdn_o, Some(&bw.ssm_norm), t * vh, s.ssm_state, eps)?;
-                kernels::swiglu(&mut tb.gdn_tmp, &tb.z, &tb.gdn_o, t * vdh, 0.0, 1.0, 0)?;
+                kernels::gqa_head_rms_norm(&mut tb.sc.gdn_o, Some(&bw.ssm_norm), t * vh, s.ssm_state, eps)?;
+                kernels::swiglu(&mut tb.sc.gdn_tmp, &tb.sc.z, &tb.sc.gdn_o, t * vdh, 0.0, 1.0, 0)?;
                 if matches!(bw.ssm_out, MatW::Kq(_)) {
-                    kernels::quantize_q8_k(&mut tb.midq, &tb.gdn_tmp, vdh, t)?;
+                    kernels::quantize_q8_k(&mut tb.sc.midq, &tb.sc.gdn_tmp, vdh, t)?;
                 }
-                matw(&mut tb.out, &bw.ssm_out, &tb.gdn_tmp, &tb.midq, vdh, s.n_embd, t)?;
+                matw(&mut tb.sc.out, &bw.ssm_out, &tb.sc.gdn_tmp, &tb.sc.midq, vdh, s.n_embd, t)?;
                 if il == 0 && pos == 0 && t > 1 {
                     if let Ok(dir) = std::env::var("PULSAR_DUMP_GDN") {
                         eprintln!("DUMP_GDN firing il=0 pos=0 t={t}");
                         kernels::sync()?;
-                        dump_f32(&format!("{dir}/tp_b_gdn.bin"), &tb.gdn_tmp.read_f32((t * vdh) as usize)?);
+                        dump_f32(&format!("{dir}/tp_b_gdn.bin"), &tb.sc.gdn_tmp.read_f32((t * vdh) as usize)?);
                         let mut mb = vec![0u8; (t * vdh / 256) as usize * 292];
-                        tb.midq.read(0, &mut mb)?;
+                        tb.sc.midq.read(0, &mut mb)?;
                         let _ = std::fs::write(format!("{dir}/tp_b_midq.bin"), &mb);
-                        dump_f32(&format!("{dir}/tp_b_part.bin"), &tb.out.read_f32((t * s.n_embd) as usize)?);
+                        dump_f32(&format!("{dir}/tp_b_part.bin"), &tb.sc.out.read_f32((t * s.n_embd) as usize)?);
                     }
                 }
-                tb.lo.send_f32(&tb.out, (t * s.n_embd) as usize)?;
+                tb.sc.lo.send_f32(&tb.sc.out, (t * s.n_embd) as usize)?;
                 kernels::set_device(kernels::primary_device())?;
                 // A's half, overlapping with B's chain
-                matw(&mut rt.qkv, &gdn.wqkv, &st.normed, &st.xq, s.n_embd, cdh, t)?;
-                matw(&mut rt.z, &gdn.wz, &st.normed, &st.xq, s.n_embd, vdh, t)?;
+                matw(&mut rt.sc.qkv, &gdn.wqkv, &st.normed, &st.xq, s.n_embd, cdh, t)?;
+                matw(&mut rt.sc.z, &gdn.wz, &st.normed, &st.xq, s.n_embd, vdh, t)?;
                 if packed {
-                    kernels::matmul_f32(&mut rt.gb, &gdn.ab_w, &st.normed, s.n_embd, 2 * vh, 1)?;
-                    kernels::qwen35_gdn_coeffs_packed(&mut rt.gb, vh as usize * 4, &gdn.a, &gdn.dt_bias, vh)?;
+                    kernels::matmul_f32(&mut rt.sc.gb, &gdn.ab_w, &st.normed, s.n_embd, 2 * vh, 1)?;
+                    kernels::qwen35_gdn_coeffs_packed(&mut rt.sc.gb, vh as usize * 4, &gdn.a, &gdn.dt_bias, vh)?;
                 } else {
-                    kernels::matmul_f32(&mut rt.g, &gdn.ab_w, &st.normed, s.n_embd, vh, t)?;
-                    kernels::matmul_f32_off(&mut rt.beta, &gdn.ab_w, vh as usize * s.n_embd as usize * 4, &st.normed, s.n_embd, vh, t)?;
-                    kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, vh)?;
+                    kernels::matmul_f32(&mut rt.sc.g, &gdn.ab_w, &st.normed, s.n_embd, vh, t)?;
+                    kernels::matmul_f32_off(&mut rt.sc.beta, &gdn.ab_w, vh as usize * s.n_embd as usize * 4, &st.normed, s.n_embd, vh, t)?;
+                    kernels::qwen35_gdn_coeffs(&mut rt.sc.g, &mut rt.sc.beta, &gdn.a, &gdn.dt_bias, t, vh)?;
                 }
                 if dbg && !packed {
-                    eprintln!("  GDNin il={il} g {:?} beta {:?}", rt.g.read_f32(2)?, rt.beta.read_f32(2)?);
+                    eprintln!("  GDNin il={il} g {:?} beta {:?}", rt.sc.g.read_f32(2)?, rt.sc.beta.read_f32(2)?);
                 }
                 let gs = rt.states[il].as_mut().ok_or("gdn state missing")?;
-                kernels::qwen35_conv_batch(&mut rt.conv_out, &rt.qkv, &gdn.conv, &mut gs.conv, cdh, s.ssm_conv_k, t)?;
-                kernels::qwen35_split_qkv(&mut rt.gq, &mut rt.gk, &mut rt.gv, &rt.conv_out, t, kdh, vdh)?;
-                kernels::qwen35_l2_norm(&mut rt.gq, t * kh, s.ssm_state, eps)?;
-                kernels::qwen35_l2_norm(&mut rt.gk, t * kh, s.ssm_state, eps)?;
+                kernels::qwen35_conv_batch(&mut rt.sc.conv_out, &rt.sc.qkv, &gdn.conv, &mut gs.conv, cdh, s.ssm_conv_k, t)?;
+                kernels::qwen35_split_qkv(&mut rt.sc.gq, &mut rt.sc.gk, &mut rt.sc.gv, &rt.sc.conv_out, t, kdh, vdh)?;
+                kernels::qwen35_l2_norm(&mut rt.sc.gq, t * kh, s.ssm_state, eps)?;
+                kernels::qwen35_l2_norm(&mut rt.sc.gk, t * kh, s.ssm_state, eps)?;
                 if packed {
                     kernels::qwen35_gdn_batch_packed(
-                        &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.gb, vh as usize * 4,
+                        &mut rt.sc.gdn_o, &mut gs.s, &rt.sc.gq, &rt.sc.gk, &rt.sc.gv, &rt.sc.gb, vh as usize * 4,
                         vh, kh, s.ssm_state,
                     )?;
                 } else {
                     kernels::qwen35_gdn_batch(
-                        &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.g, &rt.beta,
+                        &mut rt.sc.gdn_o, &mut gs.s, &rt.sc.gq, &rt.sc.gk, &rt.sc.gv, &rt.sc.g, &rt.sc.beta,
                         vh, kh, s.ssm_state, t,
                     )?;
                 }
             if dbg {
                 eprintln!("  GDNmid il={il} conv {:?} gq {:?} gv {:?} gdn_o {:?}",
-                    rt.conv_out.read_f32(2)?, rt.gq.read_f32(2)?, rt.gv.read_f32(2)?, rt.gdn_o.read_f32(2)?);
+                    rt.sc.conv_out.read_f32(2)?, rt.sc.gq.read_f32(2)?, rt.sc.gv.read_f32(2)?, rt.sc.gdn_o.read_f32(2)?);
             }
-                kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * vh, s.ssm_state, eps)?;
-                kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * vdh, 0.0, 1.0, 0)?;
+                kernels::gqa_head_rms_norm(&mut rt.sc.gdn_o, Some(&gdn.ssm_norm), t * vh, s.ssm_state, eps)?;
+                kernels::swiglu(&mut rt.sc.gdn_tmp, &rt.sc.z, &rt.sc.gdn_o, t * vdh, 0.0, 1.0, 0)?;
                 if matches!(gdn.ssm_out, MatW::Kq(_)) {
-                    kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, vdh, t)?;
+                    kernels::quantize_q8_k(&mut st.midq, &rt.sc.gdn_tmp, vdh, t)?;
                 }
-                matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, vdh, s.n_embd, t)?;
+                matw(&mut st.attn_out, &gdn.ssm_out, &rt.sc.gdn_tmp, &st.midq, vdh, s.n_embd, t)?;
                 if il == 0 && pos == 0 && t > 1 {
                     if let Ok(dir) = std::env::var("PULSAR_DUMP_GDN") {
                         eprintln!("DUMP_GDN firing il=0 pos=0 t={t}");
                         kernels::sync()?;
-                        dump_f32(&format!("{dir}/tp_a_gdn.bin"), &rt.gdn_tmp.read_f32((t * vdh) as usize)?);
+                        dump_f32(&format!("{dir}/tp_a_gdn.bin"), &rt.sc.gdn_tmp.read_f32((t * vdh) as usize)?);
                         let mut mb = vec![0u8; (t * vdh / 256) as usize * 292];
                         st.midq.read(0, &mut mb)?;
                         let _ = std::fs::write(format!("{dir}/tp_a_midq.bin"), &mb);
@@ -1768,29 +2349,29 @@ impl Model {
                 }
                 if dbg {
                     eprintln!("  TPpartA il={il} Apart {:?} z {:?} gdn_tmp {:?}",
-                        st.attn_out.read_f32(2)?, rt.z.read_f32(2)?, rt.gdn_tmp.read_f32(2)?);
+                        st.attn_out.read_f32(2)?, rt.sc.z.read_f32(2)?, rt.sc.gdn_tmp.read_f32(2)?);
                 }
-                tb.lo.recv_f32(&mut tb.recv, (t * s.n_embd) as usize)?;
+                tb.sc.lo.recv_f32(&mut tb.sc.recv, (t * s.n_embd) as usize)?;
                 if dbg {
-                    eprintln!("  TPpartB il={il} Bpart {:?}", tb.recv.read_f32(2)?);
+                    eprintln!("  TPpartB il={il} Bpart {:?}", tb.sc.recv.read_f32(2)?);
                 }
-                kernels::add_assign(&mut st.attn_out, &tb.recv, t * s.n_embd)?;
+                kernels::add_assign(&mut st.attn_out, &tb.sc.recv, t * s.n_embd)?;
             } else {
             // ---- Gated DeltaNet (recurrences loop inside the launches)
             if matches!(gdn.wqkv, MatW::Kq(_)) {
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
             }
-            matw(&mut rt.qkv, &gdn.wqkv, &st.normed, &st.xq, s.n_embd, conv_dim, t)?;
-            matw(&mut rt.z, &gdn.wz, &st.normed, &st.xq, s.n_embd, value_dim, t)?;
+            matw(&mut rt.sc.qkv, &gdn.wqkv, &st.normed, &st.xq, s.n_embd, conv_dim, t)?;
+            matw(&mut rt.sc.z, &gdn.wz, &st.normed, &st.xq, s.n_embd, value_dim, t)?;
             if dbg {
-                eprintln!("  qkv {:?} z {:?}", rt.qkv.read_f32(2)?, rt.z.read_f32(2)?);
+                eprintln!("  qkv {:?} z {:?}", rt.sc.qkv.read_f32(2)?, rt.sc.z.read_f32(2)?);
             }
             // g/beta coefficients fully on-device (no host readbacks)
-            kernels::matmul_f32(&mut rt.g, &gdn.ab_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
-            kernels::matmul_f32_off(&mut rt.beta, &gdn.ab_w, s.ssm_v_heads as usize * s.n_embd as usize * 4, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
-            kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, s.ssm_v_heads)?;
+            kernels::matmul_f32(&mut rt.sc.g, &gdn.ab_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
+            kernels::matmul_f32_off(&mut rt.sc.beta, &gdn.ab_w, s.ssm_v_heads as usize * s.n_embd as usize * 4, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
+            kernels::qwen35_gdn_coeffs(&mut rt.sc.g, &mut rt.sc.beta, &gdn.a, &gdn.dt_bias, t, s.ssm_v_heads)?;
             if dbg {
-                eprintln!("  GDNin il={il} g {:?} beta {:?}", rt.g.read_f32(2)?, rt.beta.read_f32(2)?);
+                eprintln!("  GDNin il={il} g {:?} beta {:?}", rt.sc.g.read_f32(2)?, rt.sc.beta.read_f32(2)?);
             }
 
             // fast-rollback stash: the raw qkv rows + final coeffs are
@@ -1798,35 +2379,35 @@ impl Model {
             if let Some(df) = &mut rt.dflash {
                 if df.capture_gdn {
                     let sq = df.stash_qkv[il].as_mut().ok_or("stash missing")?;
-                    kernels::copy_d2d(sq, 0, &rt.qkv, 0, (t * conv_dim) as usize * 4)?;
+                    kernels::copy_d2d(sq, 0, &rt.sc.qkv, 0, (t * conv_dim) as usize * 4)?;
                     let sg = df.stash_g[il].as_mut().unwrap();
-                    kernels::copy_d2d(sg, 0, &rt.g, 0, (t * s.ssm_v_heads) as usize * 4)?;
+                    kernels::copy_d2d(sg, 0, &rt.sc.g, 0, (t * s.ssm_v_heads) as usize * 4)?;
                     let sb = df.stash_beta[il].as_mut().unwrap();
-                    kernels::copy_d2d(sb, 0, &rt.beta, 0, (t * s.ssm_v_heads) as usize * 4)?;
+                    kernels::copy_d2d(sb, 0, &rt.sc.beta, 0, (t * s.ssm_v_heads) as usize * 4)?;
                 }
             }
             let gs = rt.states[il].as_mut().ok_or("gdn state missing")?;
-            kernels::qwen35_conv_batch(&mut rt.conv_out, &rt.qkv, &gdn.conv, &mut gs.conv, conv_dim, s.ssm_conv_k, t)?;
+            kernels::qwen35_conv_batch(&mut rt.sc.conv_out, &rt.sc.qkv, &gdn.conv, &mut gs.conv, conv_dim, s.ssm_conv_k, t)?;
             // split [q|k|v] rows into contiguous batch buffers, one launch
-            kernels::qwen35_split_qkv(&mut rt.gq, &mut rt.gk, &mut rt.gv, &rt.conv_out, t, key_dim, value_dim)?;
-            kernels::qwen35_l2_norm(&mut rt.gq, t * s.ssm_k_heads, s.ssm_state, eps)?;
-            kernels::qwen35_l2_norm(&mut rt.gk, t * s.ssm_k_heads, s.ssm_state, eps)?;
+            kernels::qwen35_split_qkv(&mut rt.sc.gq, &mut rt.sc.gk, &mut rt.sc.gv, &rt.sc.conv_out, t, key_dim, value_dim)?;
+            kernels::qwen35_l2_norm(&mut rt.sc.gq, t * s.ssm_k_heads, s.ssm_state, eps)?;
+            kernels::qwen35_l2_norm(&mut rt.sc.gk, t * s.ssm_k_heads, s.ssm_state, eps)?;
             kernels::qwen35_gdn_batch(
-                &mut rt.gdn_o, &mut gs.s, &rt.gq, &rt.gk, &rt.gv, &rt.g, &rt.beta,
+                &mut rt.sc.gdn_o, &mut gs.s, &rt.sc.gq, &rt.sc.gk, &rt.sc.gv, &rt.sc.g, &rt.sc.beta,
                 s.ssm_v_heads, s.ssm_k_heads, s.ssm_state, t,
             )?;
             if dbg {
                 eprintln!(
                     "  conv {:?} gq {:?} g {:?} beta {:?} gdn_o {:?}",
-                    rt.conv_out.read_f32(2)?, rt.gq.read_f32(2)?,
-                    rt.g.read_f32(2)?, rt.beta.read_f32(2)?, rt.gdn_o.read_f32(2)?
+                    rt.sc.conv_out.read_f32(2)?, rt.sc.gq.read_f32(2)?,
+                    rt.sc.g.read_f32(2)?, rt.sc.beta.read_f32(2)?, rt.sc.gdn_o.read_f32(2)?
                 );
             }
             if dbg {
                 let pv = (2 * key_dim + value_dim / 2) as usize * 4;
                 eprintln!("  GDNpq il={il} Pq_kh {:?}",
-                    rt.qkv.read_f32_at((key_dim / 2) as usize * 4, 4)?);
-                eprintln!("  GDNp il={il} Pqkv_v {:?}", rt.qkv.read_f32_at(pv, 8)?);
+                    rt.sc.qkv.read_f32_at((key_dim / 2) as usize * 4, 4)?);
+                eprintln!("  GDNp il={il} Pqkv_v {:?}", rt.sc.qkv.read_f32_at(pv, 8)?);
             }
             if dbg {
                 // head 0 AND the first UPPER head: head 0 lives on card A
@@ -1835,18 +2416,18 @@ impl Model {
                 // is why attn_out differs while head 0 matches)
                 let up = (s.ssm_v_heads / 2 * s.ssm_state) as usize * 4;
                 eprintln!("  GDNmid il={il} h0 gdn_o {:?} gv {:?} | hUP gdn_o {:?} gv {:?}",
-                    rt.gdn_o.read_f32(2)?, rt.gv.read_f32(2)?,
-                    rt.gdn_o.read_f32_at(up, 2)?, rt.gv.read_f32_at(up, 2)?);
+                    rt.sc.gdn_o.read_f32(2)?, rt.sc.gv.read_f32(2)?,
+                    rt.sc.gdn_o.read_f32_at(up, 2)?, rt.sc.gv.read_f32_at(up, 2)?);
             }
-            kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * s.ssm_v_heads, s.ssm_state, eps)?;
-            kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * value_dim, 0.0, 1.0, 0)?;
+            kernels::gqa_head_rms_norm(&mut rt.sc.gdn_o, Some(&gdn.ssm_norm), t * s.ssm_v_heads, s.ssm_state, eps)?;
+            kernels::swiglu(&mut rt.sc.gdn_tmp, &rt.sc.z, &rt.sc.gdn_o, t * value_dim, 0.0, 1.0, 0)?;
             if matches!(gdn.ssm_out, MatW::Kq(_)) {
-                kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, value_dim, t)?;
+                kernels::quantize_q8_k(&mut st.midq, &rt.sc.gdn_tmp, value_dim, t)?;
             }
             if il == 0 && pos == 0 && t > 1 {
                 if let Ok(dir) = std::env::var("PULSAR_DUMP_GDN") {
                     kernels::sync()?;
-                    dump_f32(&format!("{dir}/plain_gdn.bin"), &rt.gdn_tmp.read_f32((t * value_dim) as usize)?);
+                    dump_f32(&format!("{dir}/plain_gdn.bin"), &rt.sc.gdn_tmp.read_f32((t * value_dim) as usize)?);
                     let mut mb = vec![0u8; (t * value_dim / 256) as usize * 292];
                     st.midq.read(0, &mut mb)?;
                     let _ = std::fs::write(format!("{dir}/plain_midq.bin"), &mb);
@@ -1854,25 +2435,25 @@ impl Model {
             }
             if std::env::var("PULSAR_DEBUG_L2").ok().as_deref() == Some("1") && il == 0 {
                 eprintln!("  PLAINmid il={il} z {:?} gdn_tmp {:?}",
-                    rt.z.read_f32(2)?, rt.gdn_tmp.read_f32(2)?);
+                    rt.sc.z.read_f32(2)?, rt.sc.gdn_tmp.read_f32(2)?);
             }
             // debug: zero the upper head half so the plain path computes
             // exactly what card A is supposed to contribute under TP
             if std::env::var("PULSAR_DEBUG_ZERO_UPPER").is_ok() {
                 let vd = value_dim as usize;
                 let n = t as usize * vd;
-                let mut v = rt.gdn_tmp.read_f32(n)?;
+                let mut v = rt.sc.gdn_tmp.read_f32(n)?;
                 for tok in 0..t as usize {
                     for i in (vd / 2)..vd {
                         v[tok * vd + i] = 0.0;
                     }
                 }
-                rt.gdn_tmp.write(0, kernels::as_bytes(&v))?;
+                rt.sc.gdn_tmp.write(0, kernels::as_bytes(&v))?;
                 if matches!(gdn.ssm_out, MatW::Kq(_)) {
-                    kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, value_dim, t)?;
+                    kernels::quantize_q8_k(&mut st.midq, &rt.sc.gdn_tmp, value_dim, t)?;
                 }
             }
-            matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, value_dim, s.n_embd, t)?;
+            matw(&mut st.attn_out, &gdn.ssm_out, &rt.sc.gdn_tmp, &st.midq, value_dim, s.n_embd, t)?;
             }
         } else if let Some(attn) = &w.attn {
             let hd = s.head_dim;
@@ -1886,64 +2467,64 @@ impl Model {
                 let nh2 = s.n_head / 2;
                 let nkv2 = s.n_head_kv / 2;
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
-                tb.lx.send_f32(&st.normed, (t * s.n_embd) as usize)?;
+                tb.sc.lx.send_f32(&st.normed, (t * s.n_embd) as usize)?;
                 kernels::set_device(tb.dev)?;
-                tb.lx.recv_f32(&mut tb.normed, (t * s.n_embd) as usize)?;
+                tb.sc.lx.recv_f32(&mut tb.sc.normed, (t * s.n_embd) as usize)?;
                 if matches!(bw.wq, MatW::Kq(_)) {
-                    kernels::quantize_q8_k(&mut tb.xq, &tb.normed, s.n_embd, t)?;
+                    kernels::quantize_q8_k(&mut tb.sc.xq, &tb.sc.normed, s.n_embd, t)?;
                 }
-                matw(&mut tb.aqf, &bw.wq, &tb.normed, &tb.xq, s.n_embd, 2 * nh2 * hd, t)?;
-                kernels::qwen35_split_gate(&mut tb.aq, &mut tb.agate, &tb.aqf, t * nh2, hd)?;
-                matw(&mut tb.ak, &bw.wk, &tb.normed, &tb.xq, s.n_embd, nkv2 * hd, t)?;
-                matw(&mut tb.av, &bw.wv, &tb.normed, &tb.xq, s.n_embd, nkv2 * hd, t)?;
-                kernels::gqa_head_rms_norm(&mut tb.aq, Some(&bw.q_norm), t * nh2, hd, eps)?;
-                kernels::gqa_head_rms_norm(&mut tb.ak, Some(&bw.k_norm), t * nkv2, hd, eps)?;
+                matw(&mut tb.sc.aqf, &bw.wq, &tb.sc.normed, &tb.sc.xq, s.n_embd, 2 * nh2 * hd, t)?;
+                kernels::qwen35_split_gate(&mut tb.sc.aq, &mut tb.sc.agate, &tb.sc.aqf, t * nh2, hd)?;
+                matw(&mut tb.sc.ak, &bw.wk, &tb.sc.normed, &tb.sc.xq, s.n_embd, nkv2 * hd, t)?;
+                matw(&mut tb.sc.av, &bw.wv, &tb.sc.normed, &tb.sc.xq, s.n_embd, nkv2 * hd, t)?;
+                kernels::gqa_head_rms_norm(&mut tb.sc.aq, Some(&bw.q_norm), t * nh2, hd, eps)?;
+                kernels::gqa_head_rms_norm(&mut tb.sc.ak, Some(&bw.k_norm), t * nkv2, hd, eps)?;
                 let dev_pos = st.ctx <= 4096 && st.kvq == 0;
                 let (bk, bv) = st.tp_kcache[il].as_mut().ok_or("tp attn cache missing")?;
                 if dev_pos {
-                    kernels::gqa_rope_dev(&mut tb.aq, t, nh2, hd, s.rot_dim, &tb.pos_b, s.rope_freq_base)?;
-                    kernels::gqa_rope_dev(&mut tb.ak, t, nkv2, hd, s.rot_dim, &tb.pos_b, s.rope_freq_base)?;
-                    kernels::gqa_kv_append_dev(bk, &tb.ak, t, nkv2, hd, st.ctx, &tb.pos_b)?;
-                    kernels::gqa_kv_append_dev(bv, &tb.av, t, nkv2, hd, st.ctx, &tb.pos_b)?;
+                    kernels::gqa_rope_dev(&mut tb.sc.aq, t, nh2, hd, s.rot_dim, &tb.sc.pos_b, s.rope_freq_base)?;
+                    kernels::gqa_rope_dev(&mut tb.sc.ak, t, nkv2, hd, s.rot_dim, &tb.sc.pos_b, s.rope_freq_base)?;
+                    kernels::gqa_kv_append_dev(bk, &tb.sc.ak, t, nkv2, hd, st.ctx, &tb.sc.pos_b)?;
+                    kernels::gqa_kv_append_dev(bv, &tb.sc.av, t, nkv2, hd, st.ctx, &tb.sc.pos_b)?;
                     kernels::gqa_attention_dev(
-                        &mut tb.aheads, &tb.aq, bk, bv,
-                        t, nh2, nkv2, hd, st.ctx, &tb.pos_b,
+                        &mut tb.sc.aheads, &tb.sc.aq, bk, bv,
+                        t, nh2, nkv2, hd, st.ctx, &tb.sc.pos_b,
                         1.0 / (hd as f32).sqrt(),
                     )?;
                 } else {
-                    kernels::gqa_rope(&mut tb.aq, t, nh2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
-                    kernels::gqa_rope(&mut tb.ak, t, nkv2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
-                    kernels::gqa_kv_append(bk, &tb.ak, t, nkv2, hd, st.ctx, pos, st.kvq)?;
-                    kernels::gqa_kv_append(bv, &tb.av, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                    kernels::gqa_rope(&mut tb.sc.aq, t, nh2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                    kernels::gqa_rope(&mut tb.sc.ak, t, nkv2, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
+                    kernels::gqa_kv_append(bk, &tb.sc.ak, t, nkv2, hd, st.ctx, pos, st.kvq)?;
+                    kernels::gqa_kv_append(bv, &tb.sc.av, t, nkv2, hd, st.ctx, pos, st.kvq)?;
                     kernels::gqa_attention_rel(
-                        &mut tb.aheads, &tb.aq, bk, bv,
+                        &mut tb.sc.aheads, &tb.sc.aq, bk, bv,
                         t, nh2, nkv2, hd, st.ctx, pos,
                         1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
                         None,
                     )?;
                 }
-                kernels::qwen35_sigmoid_gate(&mut tb.aheads, &tb.agate, t * nh2 * hd)?;
+                kernels::qwen35_sigmoid_gate(&mut tb.sc.aheads, &tb.sc.agate, t * nh2 * hd)?;
                 if matches!(bw.out, MatW::Kq(_)) {
-                    kernels::quantize_q8_k(&mut tb.midq, &tb.aheads, nh2 * hd, t)?;
+                    kernels::quantize_q8_k(&mut tb.sc.midq, &tb.sc.aheads, nh2 * hd, t)?;
                 }
-                matw(&mut tb.out, &bw.out, &tb.aheads, &tb.midq, nh2 * hd, s.n_embd, t)?;
-                tb.lo.send_f32(&tb.out, (t * s.n_embd) as usize)?;
+                matw(&mut tb.sc.out, &bw.out, &tb.sc.aheads, &tb.sc.midq, nh2 * hd, s.n_embd, t)?;
+                tb.sc.lo.send_f32(&tb.sc.out, (t * s.n_embd) as usize)?;
                 kernels::set_device(kernels::primary_device())?;
                 // A's heads, overlapping with B's chain
-                matw(&mut rt.qfull, &attn.wq, &st.normed, &st.xq, s.n_embd, 2 * nh2 * hd, t)?;
-                kernels::qwen35_split_gate(&mut st.q, &mut rt.gate, &rt.qfull, t * nh2, hd)?;
+                matw(&mut rt.sc.qfull, &attn.wq, &st.normed, &st.xq, s.n_embd, 2 * nh2 * hd, t)?;
+                kernels::qwen35_split_gate(&mut st.q, &mut rt.sc.gate, &rt.sc.qfull, t * nh2, hd)?;
                 matw(&mut st.k, &attn.wk, &st.normed, &st.xq, s.n_embd, nkv2 * hd, t)?;
                 matw(&mut st.v, &attn.wv, &st.normed, &st.xq, s.n_embd, nkv2 * hd, t)?;
                 kernels::gqa_head_rms_norm(&mut st.q, Some(&attn.q_norm), t * nh2, hd, eps)?;
                 kernels::gqa_head_rms_norm(&mut st.k, Some(&attn.k_norm), t * nkv2, hd, eps)?;
                 if dev_pos {
-                    kernels::gqa_rope_dev(&mut st.q, t, nh2, hd, s.rot_dim, &tb.pos_a, s.rope_freq_base)?;
-                    kernels::gqa_rope_dev(&mut st.k, t, nkv2, hd, s.rot_dim, &tb.pos_a, s.rope_freq_base)?;
-                    kernels::gqa_kv_append_dev(&mut st.kcache[il], &st.k, t, nkv2, hd, st.ctx, &tb.pos_a)?;
-                    kernels::gqa_kv_append_dev(&mut st.vcache[il], &st.v, t, nkv2, hd, st.ctx, &tb.pos_a)?;
+                    kernels::gqa_rope_dev(&mut st.q, t, nh2, hd, s.rot_dim, &tb.sc.pos_a, s.rope_freq_base)?;
+                    kernels::gqa_rope_dev(&mut st.k, t, nkv2, hd, s.rot_dim, &tb.sc.pos_a, s.rope_freq_base)?;
+                    kernels::gqa_kv_append_dev(&mut st.kcache[il], &st.k, t, nkv2, hd, st.ctx, &tb.sc.pos_a)?;
+                    kernels::gqa_kv_append_dev(&mut st.vcache[il], &st.v, t, nkv2, hd, st.ctx, &tb.sc.pos_a)?;
                     kernels::gqa_attention_dev(
                         &mut st.heads, &st.q, &st.kcache[il], &st.vcache[il],
-                        t, nh2, nkv2, hd, st.ctx, &tb.pos_a,
+                        t, nh2, nkv2, hd, st.ctx, &tb.sc.pos_a,
                         1.0 / (hd as f32).sqrt(),
                     )?;
                 } else {
@@ -1958,22 +2539,22 @@ impl Model {
                         None,
                     )?;
                 }
-                kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.gate, t * nh2 * hd)?;
+                kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.sc.gate, t * nh2 * hd)?;
                 if matches!(attn.out, MatW::Kq(_)) {
                     kernels::quantize_q8_k(&mut st.midq, &st.heads, nh2 * hd, t)?;
                 }
                 matw(&mut st.attn_out, &attn.out, &st.heads, &st.midq, nh2 * hd, s.n_embd, t)?;
-                tb.lo.recv_f32(&mut tb.recv, (t * s.n_embd) as usize)?;
-                kernels::add_assign(&mut st.attn_out, &tb.recv, t * s.n_embd)?;
+                tb.sc.lo.recv_f32(&mut tb.sc.recv, (t * s.n_embd) as usize)?;
+                kernels::add_assign(&mut st.attn_out, &tb.sc.recv, t * s.n_embd)?;
             } else {
             // ---- sigmoid-gated full attention (partial neox rope)
             if matches!(attn.wq, MatW::Kq(_)) {
                 kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
             }
-            matw(&mut rt.qfull, &attn.wq, &st.normed, &st.xq, s.n_embd, 2 * s.n_head * hd, t)?;
+            matw(&mut rt.sc.qfull, &attn.wq, &st.normed, &st.xq, s.n_embd, 2 * s.n_head * hd, t)?;
             // per-token rows are contiguous: treat (token, head) as one
             // flat head axis for the strided split
-            kernels::qwen35_split_gate(&mut st.q, &mut rt.gate, &rt.qfull, t * s.n_head, hd)?;
+            kernels::qwen35_split_gate(&mut st.q, &mut rt.sc.gate, &rt.sc.qfull, t * s.n_head, hd)?;
             matw(&mut st.k, &attn.wk, &st.normed, &st.xq, s.n_embd, s.n_head_kv * hd, t)?;
             matw(&mut st.v, &attn.wv, &st.normed, &st.xq, s.n_embd, s.n_head_kv * hd, t)?;
             kernels::gqa_head_rms_norm(&mut st.q, Some(&attn.q_norm), t * s.n_head, hd, eps)?;
@@ -2008,7 +2589,7 @@ impl Model {
                 1.0 / (hd as f32).sqrt(), 0, None, 0, st.kvq,
                 None, // qwen35 has no attention sinks
             )?;
-            kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.gate, t * s.n_head * hd)?;
+            kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.sc.gate, t * s.n_head * hd)?;
             if matches!(attn.out, MatW::Kq(_)) {
                 kernels::quantize_q8_k(&mut st.midq, &st.heads, s.n_head * hd, t)?;
             }
@@ -2063,9 +2644,9 @@ impl Model {
                     * (s.n_embd as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
                     * kernels::Q8_K_BLOCK_BYTES;
                 let primary = kernels::primary_device();
-                tb.lx.send(&st.xq, xb)?;
+                tb.sc.lx.send(&st.xq, xb)?;
                 kernels::set_device(tb.dev)?;
-                tb.lx.recv(&mut tb.xq, xb)?;
+                tb.sc.lx.recv(&mut tb.sc.xq, xb)?;
                 // half is A's share of the FFN rows, hb is B's, and the
                 // third card (when present) takes what is left. C is
                 // issued FIRST so its hop overlaps B's chain instead of
@@ -2080,24 +2661,24 @@ impl Model {
                     // created there: an event only records on its own
                     // device's streams, and card B is current here
                     kernels::set_device(primary)?;
-                    c.lx.send(&st.xq, xb)?;
+                    c.sc.lx.send(&st.xq, xb)?;
                     kernels::set_device(c.dev)?;
-                    c.lx.recv(&mut c.xq, xb)?;
+                    c.sc.lx.recv(&mut c.sc.xq, xb)?;
                     let w = c.width;
-                    kernels::matmul_kq(&mut c.gate, &cw.gate.w, &c.xq, s.n_embd, w, t, cw.gate.row_bytes, cw.gate.quant | kernels::QUANT_A4_OK)?;
-                    kernels::matmul_kq(&mut c.up, &cw.up.w, &c.xq, s.n_embd, w, t, cw.up.row_bytes, cw.up.quant | kernels::QUANT_A4_OK)?;
-                    kernels::swiglu(&mut c.mid, &c.gate, &c.up, t * w, 0.0, 1.0, 0)?;
-                    kernels::quantize_q8_k(&mut c.midq, &c.mid, w, t)?;
-                    kernels::matmul_kq(&mut c.out, &cw.down.w, &c.midq, w, s.n_embd, t, cw.down.row_bytes, cw.down.quant | kernels::QUANT_A4_OK)?;
-                    c.lo.send(&c.out, t as usize * s.n_embd as usize * 4)?;
+                    kernels::matmul_kq(&mut c.sc.gate, &cw.gate.w, &c.sc.xq, s.n_embd, w, t, cw.gate.row_bytes, cw.gate.quant | kernels::QUANT_A4_OK)?;
+                    kernels::matmul_kq(&mut c.sc.up, &cw.up.w, &c.sc.xq, s.n_embd, w, t, cw.up.row_bytes, cw.up.quant | kernels::QUANT_A4_OK)?;
+                    kernels::swiglu(&mut c.sc.mid, &c.sc.gate, &c.sc.up, t * w, 0.0, 1.0, 0)?;
+                    kernels::quantize_q8_k(&mut c.sc.midq, &c.sc.mid, w, t)?;
+                    kernels::matmul_kq(&mut c.sc.out, &cw.down.w, &c.sc.midq, w, s.n_embd, t, cw.down.row_bytes, cw.down.quant | kernels::QUANT_A4_OK)?;
+                    c.sc.lo.send(&c.sc.out, t as usize * s.n_embd as usize * 4)?;
                     kernels::set_device(tb.dev)?;
                 }
-                kernels::matmul_kq(&mut tb.gate, &bw.gate.w, &tb.xq, s.n_embd, hb, t, bw.gate.row_bytes, bw.gate.quant | kernels::QUANT_A4_OK)?;
-                kernels::matmul_kq(&mut tb.up, &bw.up.w, &tb.xq, s.n_embd, hb, t, bw.up.row_bytes, bw.up.quant | kernels::QUANT_A4_OK)?;
-                kernels::swiglu(&mut tb.mid, &tb.gate, &tb.up, t * hb, 0.0, 1.0, 0)?;
-                kernels::quantize_q8_k(&mut tb.midq, &tb.mid, hb, t)?;
-                kernels::matmul_kq(&mut tb.out, &bw.down.w, &tb.midq, hb, s.n_embd, t, bw.down.row_bytes, bw.down.quant | kernels::QUANT_A4_OK)?;
-                tb.lo.send(&tb.out, t as usize * s.n_embd as usize * 4)?;
+                kernels::matmul_kq(&mut tb.sc.gate, &bw.gate.w, &tb.sc.xq, s.n_embd, hb, t, bw.gate.row_bytes, bw.gate.quant | kernels::QUANT_A4_OK)?;
+                kernels::matmul_kq(&mut tb.sc.up, &bw.up.w, &tb.sc.xq, s.n_embd, hb, t, bw.up.row_bytes, bw.up.quant | kernels::QUANT_A4_OK)?;
+                kernels::swiglu(&mut tb.sc.mid, &tb.sc.gate, &tb.sc.up, t * hb, 0.0, 1.0, 0)?;
+                kernels::quantize_q8_k(&mut tb.sc.midq, &tb.sc.mid, hb, t)?;
+                kernels::matmul_kq(&mut tb.sc.out, &bw.down.w, &tb.sc.midq, hb, s.n_embd, t, bw.down.row_bytes, bw.down.quant | kernels::QUANT_A4_OK)?;
+                tb.sc.lo.send(&tb.sc.out, t as usize * s.n_embd as usize * 4)?;
                 kernels::set_device(primary)?;
                 // A's half runs while B's chain + copies are in flight
                 kernels::matmul_kq(&mut st.gate_act, &gate.w, &st.xq, s.n_embd, half, t, gate.row_bytes, gate.quant | kernels::QUANT_A4_OK)?;
@@ -2105,11 +2686,11 @@ impl Model {
                 kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * half, 0.0, 1.0, 0)?;
                 kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, half, t)?;
                 kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, half, s.n_embd, t, down.row_bytes, down.quant | kernels::QUANT_A4_OK)?;
-                tb.lo.recv(&mut tb.recv, t as usize * s.n_embd as usize * 4)?;
-                kernels::add_assign(&mut st.ffn_out, &tb.recv, t * s.n_embd)?;
+                tb.sc.lo.recv(&mut tb.sc.recv, t as usize * s.n_embd as usize * 4)?;
+                kernels::add_assign(&mut st.ffn_out, &tb.sc.recv, t * s.n_embd)?;
                 if let Some(c) = rt.tpc.as_mut() {
-                    c.lo.recv(&mut c.recv, t as usize * s.n_embd as usize * 4)?;
-                    kernels::add_assign(&mut st.ffn_out, &c.recv, t * s.n_embd)?;
+                    c.sc.lo.recv(&mut c.sc.recv, t as usize * s.n_embd as usize * 4)?;
+                    kernels::add_assign(&mut st.ffn_out, &c.sc.recv, t * s.n_embd)?;
                 }
                 kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
                 if prof {
@@ -2165,8 +2746,8 @@ impl Model {
             kernels::matmul_q8_0(&mut st.up_act, su, &st.normed, s.n_embd, s.n_ff_exp, t)?;
             kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * s.n_ff_exp, 0.0, 1.0, 0)?;
             kernels::matmul_q8_0(&mut st.shared_out, sd, &st.ffn_mid, s.n_ff_exp, s.n_embd, t)?;
-            kernels::matmul_f32(&mut rt.shg, &w.shexp_gate, &st.normed, s.n_embd, 1, t)?;
-            kernels::qwen35_row_sigmoid_scale(&mut st.shared_out, &rt.shg, t, s.n_embd)?;
+            kernels::matmul_f32(&mut rt.sc.shg, &w.shexp_gate, &st.normed, s.n_embd, 1, t)?;
+            kernels::qwen35_row_sigmoid_scale(&mut st.shared_out, &rt.sc.shg, t, s.n_embd)?;
         } else {
             kernels::zero(&mut st.shared_out, (t * s.n_embd) as usize * 4)?;
         }

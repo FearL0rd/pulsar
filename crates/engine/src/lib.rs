@@ -3147,7 +3147,17 @@ mod real {
         pub(crate) fn tp_ffn3(&self, il: usize) -> Option<&TpFfnW> {
             self.tp_c.as_ref()?.ffn.get(il)?.as_ref()
         }
+        /// No ctx hint: the multi-GPU planner falls back to a flat KV
+        /// reserve. Prefer `load_with_ctx` whenever the caller knows --ctx.
         pub fn load(path: &Path) -> Result<Model> {
+            Self::load_with_ctx(path, 0)
+        }
+
+        /// `ctx_hint` > 0 lets the TP/PP planner size its KV reserve for the
+        /// ctx `State::new` will actually request. The planner runs at load
+        /// time, before ctx exists, so without the hint it guesses flat and
+        /// keeps every layer on the TP pair - then prefill OOMs at long ctx.
+        pub fn load_with_ctx(path: &Path, ctx_hint: u32) -> Result<Model> {
             let (shards, gguf) = parse_header(path)?;
             let file = VFile::open(&shards)?;
             let shape = Shape::from_gguf(&gguf)?;
@@ -3543,10 +3553,35 @@ mod real {
                                 .iter()
                                 .filter_map(|t| t.byte_size())
                                 .sum();
-                            // TP halves the per-layer matrices, so each of
-                            // the pair holds ~half; leave room for KV and
-                            // the prefill hop/scratch buffers
-                            let need = total / 2 + (4u64 << 30);
+                            // KV reserve sized for the ctx the caller asked
+                            // for, not a flat guess. Only layers that own an
+                            // attn_k tensor hold KV - on a hybrid stack the
+                            // linear-attention layers do not - so count those
+                            // rather than trusting block_count (this family
+                            // ships head_count_kv as a scalar, so a per-layer
+                            // array is not available to count zeros in).
+                            // 1 byte/elem is the fp8 floor the KV auto-sizer
+                            // compresses to: if it does not fit even there,
+                            // the pair genuinely cannot host this ctx and the
+                            // tail spill below is the only way to serve it.
+                            let kv_reserve = if ctx_hint > 0 {
+                                let kv_layers = (0..shape.n_exec_layer)
+                                    .filter(|il| {
+                                        gguf.tensor(&format!("blk.{il}.attn_k.weight")).is_some()
+                                    })
+                                    .count() as u64;
+                                let per_pos = 2
+                                    * shape.n_head_kv as u64
+                                    * shape.head_dim as u64
+                                    * kv_layers;
+                                // TP shards KV heads across the pair
+                                let kv = per_pos.saturating_mul(ctx_hint as u64) / 2;
+                                // prefill hop/scratch on top of the cache
+                                kv + (2u64 << 30)
+                            } else {
+                                4u64 << 30
+                            };
+                            let need = total / 2 + kv_reserve;
                             [primary, dev_b].iter().all(|&d| {
                                 kernels::mem_info(d).map_or(false, |(free, _)| free as u64 >= need)
                             })
@@ -3565,7 +3600,55 @@ mod real {
                                 .filter(|t| t.name.starts_with("blk.0."))
                                 .filter_map(|t| t.byte_size())
                                 .sum();
-                            if let (Ok((free, _)), true) = (kernels::mem_info(third), per > 0) {
+                            if ctx_hint > 0 && per > 0 {
+                                // Spill the FEWEST layers that make the pair
+                                // fit. A tail costs decode - its layers read
+                                // weights from one card while TP layers read
+                                // from two, and layers are sequential within
+                                // a token - so filling the third card to
+                                // capacity trades far more speed than the KV
+                                // math demands (measured: 24.8 tok/s at a
+                                // 32-layer tail vs 42.2 at 12 on the 27B).
+                                let free_pair = [primary, dev_b]
+                                    .iter()
+                                    .map(|&d| {
+                                        kernels::mem_info(d).map(|(f, _)| f as u64).unwrap_or(0)
+                                    })
+                                    .min()
+                                    .unwrap_or(0);
+                                let total: u64 = gguf
+                                    .tensors
+                                    .iter()
+                                    .filter_map(|t| t.byte_size())
+                                    .sum();
+                                // layer indices that actually own a KV cache
+                                let kv_idx: Vec<usize> = (0..n_layers)
+                                    .filter(|il| {
+                                        gguf.tensor(&format!("blk.{il}.attn_k.weight")).is_some()
+                                    })
+                                    .collect();
+                                let per_pos_layer =
+                                    2 * shape.n_head_kv as u64 * shape.head_dim as u64;
+                                let scratch = 2u64 << 30;
+                                let mut t = 0usize;
+                                while t < n_layers / 2 {
+                                    let kept = n_layers - t;
+                                    let w = total.saturating_sub(per * t as u64) / 2;
+                                    let kv_kept =
+                                        kv_idx.iter().filter(|&&i| i < kept).count() as u64;
+                                    let kv = per_pos_layer
+                                        .saturating_mul(kv_kept)
+                                        .saturating_mul(ctx_hint as u64)
+                                        / 2;
+                                    if w + kv + scratch <= free_pair {
+                                        break;
+                                    }
+                                    t += 1;
+                                }
+                                n_tail = t;
+                            } else if let (Ok((free, _)), true) =
+                                (kernels::mem_info(third), per > 0)
+                            {
                                 let reserve = 3u64 << 30;
                                 let usable = (free as u64).saturating_sub(reserve);
                                 n_tail = (usable / per) as usize;
@@ -5240,6 +5323,11 @@ mod real {
         /// greedy decode); pub: the CLI's one-shot loop drives them
         pub last_argmax: Vec<u32>,
         pub skip_logit_read: bool,
+        /// generate() sets this across its prefill loop: the qwen35
+        /// forward runs the MTP prefill fill itself per inner chunk
+        /// (inside the pipe as a virtual layer; in the plain loop after
+        /// each chunk), so the caller must not fill again.
+        fill_in_forward: bool,
         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
         /// 5=q4_0, 6=turbo3, 7=turbo2, 8=turbo3_tcq, 9=turbo2_tcq,
@@ -5496,8 +5584,11 @@ mod real {
         /// output). dsv4-only; other families return Err.
         pub fn save_prefix(&self, m: &Model, hist: &[u32], path: &Path) -> Result {
             let s = m.shape;
+            if s.family == Family::Qwen35 {
+                return self.save_prefix_qwen35(m, hist, path);
+            }
             if s.family != Family::Dsv4 {
-                return Err("prefix persist: dsv4 only".into());
+                return Err("prefix persist: dsv4 and qwen35 only".into());
             }
             let rt = self.dsv4.as_ref().ok_or("dsv4 state missing")?;
             let mut out = Vec::with_capacity(64 << 20);
@@ -5538,12 +5629,224 @@ mod real {
             Ok(())
         }
 
+        /// qwen35 prefix persist: header + hist + every KV slot verbatim
+        /// (incl. the MTP draft slot and the card-B TP halves) + the GDN
+        /// checkpoints + the MTP hidden carry. Full-buffer dumps like the
+        /// dsv4 arm: a save costs seconds, a lost prefix costs the whole
+        /// re-prefill. kvq is in the header - a lossy-KV format change
+        /// invalidates the file.
+        fn save_prefix_qwen35(&self, m: &Model, hist: &[u32], path: &Path) -> Result {
+            let out = self.prefix_bytes_qwen35(m, hist)?;
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &out)?;
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        }
+
+        /// save_prefix with the file write on a detached thread: the D2H
+        /// reads (state consistency) stay synchronous, the disk write
+        /// (the slow half on this box's NVMe) overlaps the next request.
+        /// qwen35 only; other families fall back to the sync path.
+        pub fn save_prefix_async(&self, m: &Model, hist: &[u32], path: &Path) -> Result {
+            if m.shape.family != Family::Qwen35 {
+                return self.save_prefix(m, hist, path);
+            }
+            let out = self.prefix_bytes_qwen35(m, hist)?;
+            let path = path.to_path_buf();
+            std::thread::spawn(move || {
+                let tmp = path.with_extension("tmp");
+                let r = std::fs::write(&tmp, &out).and_then(|_| std::fs::rename(&tmp, &path));
+                if let Err(e) = r {
+                    eprintln!("pulsar: prefix save (background) failed: {e}");
+                }
+            });
+            Ok(())
+        }
+
+        fn prefix_bytes_qwen35(&self, m: &Model, hist: &[u32]) -> Result<Vec<u8>> {
+            let s = m.shape;
+            let rt = self.qwen35.as_ref().ok_or("qwen35 state missing")?;
+            let primary = kernels::get_device();
+            let mut out = Vec::with_capacity(64 << 20);
+            out.extend_from_slice(b"PLSRPFQ1");
+            for v in [s.n_exec_layer, s.n_embd, s.n_vocab, self.ctx, self.kvq,
+                      s.n_head_kv, s.head_dim, u32::from(m.mtp.is_some())] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&(hist.len() as u64).to_le_bytes());
+            out.extend_from_slice(kernels::as_bytes(hist));
+            let put = |out: &mut Vec<u8>, b: &DeviceBuf| -> Result {
+                let bytes = b.bytes();
+                let mut host = vec![0u8; bytes];
+                b.read(0, &mut host)?;
+                out.extend_from_slice(&(bytes as u64).to_le_bytes());
+                out.extend_from_slice(&host);
+                Ok(())
+            };
+            out.extend_from_slice(&(self.kcache.len() as u32).to_le_bytes());
+            for il in 0..self.kcache.len() {
+                put(&mut out, &self.kcache[il])?;
+                put(&mut out, &self.vcache[il])?;
+            }
+            out.extend_from_slice(&(self.tp_kcache.len() as u32).to_le_bytes());
+            for pair in &self.tp_kcache {
+                match pair {
+                    Some((k, v)) => {
+                        out.push(1);
+                        if let Some(tp) = &m.tp {
+                            kernels::set_device(tp.dev)?;
+                        }
+                        let r = put(&mut out, k).and_then(|_| put(&mut out, v));
+                        kernels::set_device(primary)?;
+                        r?;
+                    }
+                    None => out.push(0),
+                }
+            }
+            // GDN checkpoints: states in ckpt() order (primary chain, then
+            // card-B); each snapshot lives on its state's device
+            out.extend_from_slice(&(self.ckpts.len() as u32).to_le_bytes());
+            for (pos, ck) in &self.ckpts {
+                out.extend_from_slice(&pos.to_le_bytes());
+                let RecurrentCkpt::Qwen35(layers) = ck else {
+                    return Err("prefix persist: non-qwen35 checkpoint".into());
+                };
+                out.extend_from_slice(&(layers.len() as u32).to_le_bytes());
+                let devs: Vec<i32> = rt.ckpt_devs();
+                for (i, entry) in layers.iter().enumerate() {
+                    match entry {
+                        Some((a, b)) => {
+                            out.push(1);
+                            kernels::set_device(*devs.get(i).unwrap_or(&primary))?;
+                            let r = put(&mut out, a).and_then(|_| put(&mut out, b));
+                            kernels::set_device(primary)?;
+                            r?;
+                        }
+                        None => out.push(0),
+                    }
+                }
+            }
+            out.extend_from_slice(&rt.save_live_states()?);
+            put(&mut out, &self.mtp_hidden)?;
+            Ok(out)
+        }
+
+        fn load_prefix_qwen35(&mut self, m: &Model, data: &[u8]) -> Result<Vec<u32>> {
+            let s = m.shape;
+            let primary = kernels::get_device();
+            let mut inp: &[u8] = &data[8..];
+            let mut u32s = [0u32; 8];
+            for v in &mut u32s {
+                *v = u32::from_le_bytes(inp[..4].try_into().unwrap());
+                inp = &inp[4..];
+            }
+            if u32s != [s.n_exec_layer, s.n_embd, s.n_vocab, self.ctx, self.kvq,
+                        s.n_head_kv, s.head_dim, u32::from(m.mtp.is_some())] {
+                return Err("prefix file: shape/ctx/kvq/mtp mismatch".into());
+            }
+            let nh = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+            inp = &inp[8..];
+            let hist: Vec<u32> = inp[..nh * 4]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            inp = &inp[nh * 4..];
+            let take = |inp: &mut &[u8], b: &mut DeviceBuf| -> Result {
+                let n = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+                *inp = &inp[8..];
+                if n != b.bytes() {
+                    return Err("prefix file: cache size mismatch".into());
+                }
+                if n > 0 {
+                    b.write(0, &inp[..n])?;
+                }
+                *inp = &inp[n..];
+                Ok(())
+            };
+            let nk = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+            inp = &inp[4..];
+            if nk != self.kcache.len() {
+                return Err("prefix file: kv slot count mismatch".into());
+            }
+            for il in 0..nk {
+                take(&mut inp, &mut self.kcache[il])?;
+                take(&mut inp, &mut self.vcache[il])?;
+            }
+            let ntp = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+            inp = &inp[4..];
+            if ntp != self.tp_kcache.len() {
+                return Err("prefix file: tp kv count mismatch".into());
+            }
+            for pair in self.tp_kcache.iter_mut() {
+                let flag = inp[0];
+                inp = &inp[1..];
+                match (flag, pair) {
+                    (1, Some((k, v))) => {
+                        if let Some(tp) = &m.tp {
+                            kernels::set_device(tp.dev)?;
+                        }
+                        let r = take(&mut inp, k).and_then(|_| take(&mut inp, v));
+                        kernels::set_device(primary)?;
+                        r?;
+                    }
+                    (0, None) => {}
+                    _ => return Err("prefix file: tp kv layout mismatch".into()),
+                }
+            }
+            let nck = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+            inp = &inp[4..];
+            let mut rt = self.qwen35.take().ok_or("qwen35 state missing")?;
+            let devs: Vec<i32> = rt.ckpt_devs();
+            self.ckpts.clear();
+            for _ in 0..nck {
+                let pos = u32::from_le_bytes(inp[..4].try_into().unwrap());
+                inp = &inp[4..];
+                let nl = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+                inp = &inp[4..];
+                let mut layers: Vec<Option<(DeviceBuf, DeviceBuf)>> = Vec::with_capacity(nl);
+                for i in 0..nl {
+                    let flag = inp[0];
+                    inp = &inp[1..];
+                    if flag == 0 {
+                        layers.push(None);
+                        continue;
+                    }
+                    kernels::set_device(*devs.get(i).unwrap_or(&primary))?;
+                    let mut grab = |inp: &mut &[u8]| -> Result<DeviceBuf> {
+                        let n = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+                        *inp = &inp[8..];
+                        let mut b = DeviceBuf::alloc(n.max(4))?;
+                        if n > 0 {
+                            b.write(0, &inp[..n])?;
+                        }
+                        *inp = &inp[n..];
+                        Ok(b)
+                    };
+                    let a = grab(&mut inp);
+                    let b = grab(&mut inp);
+                    kernels::set_device(primary)?;
+                    layers.push(Some((a?, b?)));
+                }
+                self.ckpts.push((pos, RecurrentCkpt::Qwen35(layers)));
+            }
+            // LIVE GDN/conv states: the recurrent state at hist's end, so
+            // an append-only continuation needs no rewind at all
+            let live = rt.load_live_states(&mut inp);
+            self.qwen35 = Some(rt);
+            live?;
+            take(&mut inp, &mut self.mtp_hidden)?;
+            Ok(hist)
+        }
+
         /// Load a prefix written by save_prefix into this (fresh) State.
         /// Returns the persisted history tokens; the caller installs them
         /// as its prompt-cache hist. Shape/ctx mismatches reject the file.
         pub fn load_prefix(&mut self, m: &Model, path: &Path) -> Result<Vec<u32>> {
             let s = m.shape;
             let data = std::fs::read(path)?;
+            if data.len() >= 8 && &data[..8] == b"PLSRPFQ1" {
+                return self.load_prefix_qwen35(m, &data);
+            }
             let mut inp: &[u8] = &data;
             if inp.len() < 8 || &inp[..8] != b"PLSRPFX2" {
                 return Err("prefix file: bad magic".into());
@@ -6782,6 +7085,7 @@ mod real {
                 amax_out: DeviceBuf::alloc(spec_rows.max(1) as usize * 8)?,
                 last_argmax: Vec::new(),
                 skip_logit_read: false,
+                fill_in_forward: false,
                 kvq,
                 kv_devs,
                 kvq_lat,
@@ -7061,6 +7365,23 @@ mod real {
         /// Forward `tokens` at absolute positions pos0..pos0+n. Union
         /// expert fetch per layer across the whole batch. Logits (when
         /// requested) are for the LAST token only.
+        /// How many prompt tokens one forward_batch call may take. The
+        /// generic State scratch is max_batch-sized, so that is the cap -
+        /// EXCEPT qwen35 under PULSAR_PIPE, whose inner loop re-chunks to
+        /// chunk_max() anyway and needs the whole prompt in one call to
+        /// overlap chunks across two lanes.
+        pub fn prefill_cap(&self, st: &State) -> usize {
+            if self.shape.family == Family::Qwen35 && qwen35::pipe_on() {
+                // window, not the whole prompt: the pipe overlaps chunks
+                // inside each window, and the caller's maybe_checkpoint
+                // between windows keeps divergence-rewind granularity
+                // (one drain bubble per window, well under 1%)
+                4096usize.max(3 * qwen35::chunk_max())
+            } else {
+                st.max_batch() as usize
+            }
+        }
+
         pub fn forward_batch(
             &self,
             st: &mut State,
@@ -7220,6 +7541,16 @@ mod real {
         /// cache (dsv4 compressor/HC lanes, qwen35 GDN, inkling
         /// shortconv). A prefix-cache may only APPEND to the forwarded
         /// stream for these; pure-KV families can rewind and overwrite.
+        /// Whether the prefix cache may stay on with speculative decode.
+        /// qwen35's spec loop rewinds GDN state on partial acceptance and
+        /// its KV (main and draft slots) is position-masked, so the
+        /// request ends with state consistent at the final position;
+        /// draft-feature drift after a reuse costs accept rate only,
+        /// never output correctness (the target model verifies).
+        pub fn spec_safe_prefix_cache(&self) -> bool {
+            self.shape.family == Family::Qwen35
+        }
+
         pub fn recurrent_state(&self) -> bool {
             // Exhaustive: answering `false` for a family that does carry
             // recurrent state lets the prefix cache rewind something that
@@ -8924,9 +9255,34 @@ mod real {
         /// Must run right after the chunk's forward while st.cur still
         /// holds its hidden states. Clobbers st.cur.
         fn mtp_prefill_fill(&self, st: &mut State, n_tok: u32, pos0: u32) -> Result {
+            if self.mtp.is_none() {
+                return Ok(());
+            }
+            match self.shape.family {
+                Family::Qwen35 => {
+                    let mut rt = st.qwen35.take().ok_or("qwen35 state missing")?;
+                    let r = self.mtp_prefill_fill_rt(st, &mut rt, n_tok, 0, pos0);
+                    st.qwen35 = Some(rt);
+                    r
+                }
+                _ => self.mtp_prefill_fill_plain(st, n_tok, pos0),
+            }
+        }
+
+        /// The qwen35 fill body with the runtime handed in (the pipe
+        /// calls this from inside the forward, where st.qwen35 is
+        /// already taken) and a token offset into st.tok (the pipe
+        /// uploads the WHOLE prompt's ids once).
+        fn mtp_prefill_fill_rt(
+            &self,
+            st: &mut State,
+            rt: &mut qwen35::Qwen35Rt,
+            n_tok: u32,
+            tok_off: u32,
+            pos0: u32,
+        ) -> Result {
             let Some(mtp) = &self.mtp else { return Ok(()) };
             let s = self.shape;
-            let primary = kernels::get_device();
             let row = s.n_embd as usize * 4;
             // hidden inputs: [old mtp_hidden, cur rows 0..n-1]
             kernels::copy_d2d(&mut st.mtp_e_raw, 0, &st.mtp_hidden, 0, row)?;
@@ -8935,7 +9291,34 @@ mod real {
             }
             kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.cur, (n_tok as usize - 1) * row, row)?;
             kernels::rms_norm(&mut st.mtp_h, &st.mtp_e_raw, &mtp.hnorm, s.n_embd, n_tok, s.rms_eps)?;
-            // token embeddings (st.tok still holds the chunk)
+            kernels::embed_q8_0_at(&mut st.mtp_e_raw, &self.token_embd, &st.tok, tok_off, s.n_embd, s.n_vocab, n_tok)?;
+            kernels::rms_norm(&mut st.mtp_e, &st.mtp_e_raw, &mtp.enorm, s.n_embd, n_tok, s.rms_eps)?;
+            for i in 0..n_tok as usize {
+                kernels::copy_d2d(&mut st.mtp_x, i * 2 * row, &st.mtp_e, i * row, row)?;
+                kernels::copy_d2d(&mut st.mtp_x, i * 2 * row + row, &st.mtp_h, i * row, row)?;
+            }
+            match &mtp.eh_proj {
+                MatW::Q8(b) => kernels::matmul_q8_0(&mut st.cur, b, &st.mtp_x, 2 * s.n_embd, s.n_embd, n_tok)?,
+                MatW::Kq(k) => {
+                    kernels::quantize_q8_k(&mut st.mtp_xq, &st.mtp_x, 2 * s.n_embd, n_tok)?;
+                    kernels::matmul_kq(&mut st.cur, &k.w, &st.mtp_xq, 2 * s.n_embd, s.n_embd, n_tok, k.row_bytes, k.quant)?
+                }
+            }
+            self.eval_qwen35_layer(st, rt, self.layers.len(), &mtp.layer, pos0, n_tok)
+        }
+
+        /// non-qwen35 families keep the old single-path fill
+        fn mtp_prefill_fill_plain(&self, st: &mut State, n_tok: u32, pos0: u32) -> Result {
+            let Some(mtp) = &self.mtp else { return Ok(()) };
+            let s = self.shape;
+            let primary = kernels::get_device();
+            let row = s.n_embd as usize * 4;
+            kernels::copy_d2d(&mut st.mtp_e_raw, 0, &st.mtp_hidden, 0, row)?;
+            if n_tok > 1 {
+                kernels::copy_d2d(&mut st.mtp_e_raw, row, &st.cur, 0, (n_tok as usize - 1) * row)?;
+            }
+            kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.cur, (n_tok as usize - 1) * row, row)?;
+            kernels::rms_norm(&mut st.mtp_h, &st.mtp_e_raw, &mtp.hnorm, s.n_embd, n_tok, s.rms_eps)?;
             kernels::embed_q8_0(&mut st.mtp_e_raw, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, n_tok)?;
             kernels::rms_norm(&mut st.mtp_e, &st.mtp_e_raw, &mtp.enorm, s.n_embd, n_tok, s.rms_eps)?;
             for i in 0..n_tok as usize {
@@ -9103,22 +9486,35 @@ mod real {
         // often than needed, and the MTP prefill path was 5.4x slower
         // than the same prompt with MTP off (61s vs 11s on 7120 tokens).
         // The MTP scratch is max_batch-sized, so it was never the limit.
-        let chunk_cap = if mtp_prefill && model.shape.family == Family::Qwen35 {
+        // MTP prefill through the pipe: the forward runs the fills
+        // itself (a virtual layer inside the pipe; per inner chunk in
+        // the plain loop for a short tail window), so the prompt goes
+        // down in 4096-token windows and the per-chunk fill below is
+        // skipped.
+        let pipe_fill = mtp_prefill && model.pipe_ready(st);
+        let chunk_cap = if pipe_fill {
+            model.prefill_cap(st)
+        } else if mtp_prefill && model.shape.family == Family::Qwen35 {
             (st.max_batch() as usize).min(qwen35::chunk_max())
         } else {
-            st.max_batch() as usize
+            // PULSAR_PIPE makes this usize::MAX for qwen35: the pipe
+            // overlaps chunks INSIDE one forward call (prefix checkpoints
+            // get coarser in exchange)
+            model.prefill_cap(st)
         };
         let prof_chunks = std::env::var_os("PULSAR_PROFILE").is_some();
         if pos0 == 0 {
             st.clear_ckpts();
         }
+        st.fill_in_forward = pipe_fill;
         for chunk in prompt.chunks(chunk_cap) {
             if cancel() {
+                st.fill_in_forward = false;
                 return Ok(pos);
             }
             let t0 = std::time::Instant::now();
             logits = model.forward_batch(st, chunk, pos, true)?;
-            if mtp_prefill {
+            if mtp_prefill && !pipe_fill {
                 model.mtp_prefill_fill(st, chunk.len() as u32, pos)?;
             }
             if prof_chunks {
@@ -9131,6 +9527,7 @@ mod real {
             pos += chunk.len() as u32;
             st.maybe_checkpoint(model, pos)?;
         }
+        st.fill_in_forward = false;
 
         // Draft-free n-gram speculation (PULSAR_NGRAM=depth, greedy only):
         // propose the tokens that followed the longest recent-suffix match

@@ -99,6 +99,8 @@ mod real {
         fn pulsar_rms_norm(out: *mut c_void, x: *const c_void, w: *const c_void, n: u32, rows: u32, eps: f32) -> i32;
         fn pulsar_q8_0_matmul(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_preq_scratch_reserve(bytes: u64) -> i32;
+        fn pulsar_set_lane(lane: i32);
+        fn pulsar_lane_prewarm();
         fn pulsar_q8_0_matmul_banked(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_bank: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_f32(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_kq(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
@@ -304,6 +306,31 @@ mod real {
         f64::from_bits(PRIMARY_H2D_BITS.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Default-ON env flag: unset or any value but "0" means on. Both TP
+    /// hop levers (PULSAR_P2P, PULSAR_TP_BF16) measured strictly faster
+    /// (11.15 -> 10.12s on the 7.4k TP prefill) and p2p self-detects
+    /// driver support, so opt-OUT is the safe polarity.
+    fn env_on(name: &str) -> bool {
+        std::env::var(name).map_or(true, |v| v != "0")
+    }
+
+    /// P2P's effective default: ON, EXCEPT when the two-lane prefill
+    /// pipe is armed. The patched consumer-P2P kernel module faults
+    /// (libcuda SIGSEGV in cuStreamWaitEvent) when replayed decode
+    /// graphs carrying peer copies mix with the pipe's event/alloc
+    /// churn - the repro needs p2p+bf16+graphs+MTP+growing prompts
+    /// together (2026-08-23). Under the pipe p2p measured ZERO prefill
+    /// win (hops hide behind the other lane), so off is free. An
+    /// explicit PULSAR_P2P=1 still forces it on.
+    fn p2p_on() -> bool {
+        match std::env::var("PULSAR_P2P") {
+            Ok(v) => v != "0",
+            Err(_) => std::env::var("PULSAR_PIPE").ok().as_deref() != Some("1"),
+        }
+    }
+
+    }
+
     fn ensure_device() {
         use std::sync::Once;
         static ONCE: Once = Once::new();
@@ -336,18 +363,16 @@ mod real {
                 best.0
             });
             PRIMARY_DEV.store(dev, std::sync::atomic::Ordering::Relaxed);
-            if probed <= 0.0 {
-                probed = raw_h2d_probe(dev);
-            }
-            PRIMARY_H2D_BITS.store(probed.to_bits(), std::sync::atomic::Ordering::Relaxed);
-            // PULSAR_P2P=1: establish peer access HERE, inside the same
+            // P2P defaults ON (PULSAR_P2P=0 disables), and the peer access must
+            // be established HERE, inside the same
+
             // once-block that picks the device, i.e. before a single
             // DeviceBuf exists. Enabling it later (from TpLink::new, after
             // the weight pool is allocated) surfaced as a failing kernel
             // launch two calls downstream, which is what a deferred CUDA
             // error looks like. Consumer cards report can-access only with
             // a patched driver; where they do not, this is a no-op.
-            if std::env::var_os("PULSAR_P2P").is_some() {
+            if p2p_on() {
                 let mut n = 0;
                 unsafe { cudaGetDeviceCount(&mut n) };
                 let mut pairs = 0;
@@ -861,7 +886,8 @@ mod real {
         s16: DeviceBuf,
         /// bf16 stage on the RECEIVER's device (unpack source)
         r16: DeviceBuf,
-        /// PULSAR_TP_BF16=1: halve the bytes that cross the bus
+        /// bf16 hop staging, on by default (PULSAR_TP_BF16=0 for exact
+        /// f32 hops): halves the bytes that cross the bus
         bf16: bool,
     }
 
@@ -883,11 +909,11 @@ mod real {
             set_device(peer)?;
             let r16 = DeviceBuf::alloc(bytes / 2 + 4)?;
             set_device(here)?;
-            let bf16 = std::env::var_os("PULSAR_TP_BF16").is_some();
+            let bf16 = env_on("PULSAR_TP_BF16");
             // Peer access itself is established once in ensure_device, before
             // any allocation; here we only ASK whether it took, both ways.
             let mut p2p = false;
-            if std::env::var_os("PULSAR_P2P").is_some() && here != peer {
+            if p2p_on() && here != peer {
                 let (mut ab, mut ba) = (0i32, 0i32);
                 unsafe {
                     cudaDeviceCanAccessPeer(&mut ab, here, peer);
@@ -1241,6 +1267,21 @@ mod real {
     /// Pre-allocate the q8_0 prequant scratch on the CURRENT device so a
     /// later matmul_q8_0 inside a CUDA-graph capture hits the cached
     /// pointer: cudaMalloc is illegal mid-capture.
+    /// Selects this HOST THREAD's scratch-arena lane (0 or 1) for the
+    /// process-global preq/octet/nvfp4-act/gqa-split arenas. The
+    /// PULSAR_PIPE prefill sets 1 on its second worker thread so the two
+    /// lanes never share a staging buffer mid-flight.
+    pub fn set_lane(lane: u32) {
+        unsafe { pulsar_set_lane(lane as i32) }
+    }
+
+    /// Allocates the current thread-lane's scratch arenas on the CURRENT
+    /// device at their floors (first-use cudaMalloc stalls move out of
+    /// the timed prefill). Call once per (device, lane).
+    pub fn lane_prewarm() {
+        unsafe { pulsar_lane_prewarm() }
+    }
+
     pub fn preq_scratch_reserve(bytes: u64) -> Result {
         check(unsafe { pulsar_preq_scratch_reserve(bytes) }, "preq_scratch_reserve")
     }

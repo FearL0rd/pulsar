@@ -318,6 +318,456 @@ __global__ static void qwen35_gdn_batch_kernel(
     for (uint32_t i = 0; i < dim; i++) Sg[(uint64_t)i * dim + j] = S[i];
 }
 
+/* ---- chunked GDN prefill (PULSAR_GDN_CHUNK) ----------------------------
+ * The sequential delta rule S_i = a_i (I - b_i k_i k_i^T) S_{i-1} +
+ * b_i k_i v_i^T runs one token at a time with two block barriers per
+ * token - h_v blocks x dim threads leaves the GPU >90% idle. The
+ * chunked form (Yang et al., gated delta rule) hides the recurrence:
+ * substituting the WRITTEN residual vt_i = b_i(v_i - a_i k_i^T S_{i-1})
+ * turns the recurrence into plain gated linear attention over vt, and
+ * vt itself solves a C x C unit-lower-triangular system:
+ *
+ *   (I + A) VT = R,  A[i][j] = b_i (k_i . k_j) exp(c_i - c_j)  (j < i)
+ *   R[i]        = b_i (v_i - exp(c_i) (k_i^T S0))
+ *   o_i         = exp(c_i) q^_i^T S0
+ *                 + sum_{j<=i} (q^_i . k_j) exp(c_i - c_j) vt_j
+ *   S_C         = exp(c_C) S0 + sum_i exp(c_C - c_i) k_i vt_i^T
+ *
+ * with c_i = cumsum(g) inside the chunk (log space) and q^ = q*rsqrt(d).
+ * Every decay ratio that appears is exp of a sum of negatives, so
+ * nothing overflows. Everything but the C-step substitution is a
+ * barrier-free per-thread GEMM slice; the FLOP count is ~2.5x the
+ * sequential kernel (the C^2 terms) but the loops are long and
+ * ILP-friendly instead of 2-barriers-per-token latency chains.
+ * Thread j keeps state COLUMN S[:,j] in registers, exactly like the
+ * sequential kernel, so the two share the global state layout and a
+ * tail < C tokens just runs the sequential kernel after. Selftest
+ * compares the two kernels directly. */
+/* 32 not 64: the C^2 terms (Gram, solve, output mix) are the chunked
+ * form's FLOP tax; at C=64 they made it a net loss on CUDA cores.
+ * Tensor-core GEMMs (v2) are what make big chunks pay. */
+#define GDN_CHUNK 32u
+
+static size_t gdn_chunk_smem_bytes(uint32_t dim) {
+    return (size_t)(GDN_CHUNK * (dim + 1u)      /* k tile */
+                    + GDN_CHUNK * (GDN_CHUNK + 1u)  /* A */
+                    + GDN_CHUNK * (dim + 1u)    /* vt */
+                    + 2u * GDN_CHUNK)           /* c (cum log g), beta */
+                   * 4u;
+}
+
+__global__ static void qwen35_gdn_chunk_kernel(
+        float *out, float *state,
+        const float *q, const float *k, const float *v,
+        const float *g, const float *beta,
+        uint32_t h_v, uint32_t h_k, uint32_t dim, uint32_t n_tok) {
+    const uint32_t C = GDN_CHUNK;
+    const uint32_t h = blockIdx.x;
+    const uint32_t j = threadIdx.x;
+    if (h >= h_v || j >= dim) return;
+    const uint32_t kh = h % h_k;
+    float *Sg = state + (uint64_t)h * dim * dim;
+    const float qscale = rsqrtf((float)dim);
+    const uint32_t ldk = dim + 1u, lda = C + 1u;
+
+    extern __shared__ float gdn_sm[];
+    float *ksm = gdn_sm;                 /* [C][ldk] */
+    float *A = ksm + C * ldk;            /* [C][lda] strictly lower */
+    float *vt = A + C * lda;             /* [C][ldk] col j = thread j */
+    float *cg = vt + C * ldk;            /* [C] cumulative log decay */
+    float *bsm = cg + C;                 /* [C] beta */
+
+    float S[128];
+    for (uint32_t i = 0; i < dim; i++) S[i] = Sg[(uint64_t)i * dim + j];
+
+    for (uint32_t base = 0; base + C <= n_tok; base += C) {
+        /* stage K tile, beta, and the in-chunk cumulative log decay */
+        for (uint32_t i = j; i < C * dim; i += blockDim.x) {
+            const uint32_t r = i / dim, d = i % dim;
+            ksm[r * ldk + d] = k[((uint64_t)(base + r) * h_k + kh) * dim + d];
+        }
+        if (j == 0) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < C; r++) {
+                acc += g[(uint64_t)(base + r) * h_v + h];
+                cg[r] = acc;
+                bsm[r] = beta[(uint64_t)(base + r) * h_v + h];
+            }
+        }
+        __syncthreads();
+
+        /* A[i][j'] = b_i (k_i . k_j') exp(c_i - c_j'), j' < i: 128
+         * threads split the C*(C-1)/2 dots */
+        for (uint32_t t = j; t < C * C; t += blockDim.x) {
+            const uint32_t r = t / C, cix = t % C;
+            if (cix < r) {
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < dim; d++)
+                    dot += ksm[r * ldk + d] * ksm[cix * ldk + d];
+                A[r * lda + cix] = bsm[r] * dot * expf(cg[r] - cg[cix]);
+            }
+        }
+        /* R straight into vt: thread j owns dim column j */
+        for (uint32_t r = 0; r < C; r++) {
+            float ks0 = 0.0f;
+            for (uint32_t d = 0; d < dim; d++)
+                ks0 += ksm[r * ldk + d] * S[d];
+            vt[r * ldk + j] = bsm[r]
+                    * (v[((uint64_t)(base + r) * h_v + h) * dim + j]
+                       - expf(cg[r]) * ks0);
+        }
+        __syncthreads();
+
+        /* forward substitution: vt_i -= sum_{j'<i} A[i][j'] vt_j' */
+        for (uint32_t r = 1; r < C; r++) {
+            float acc = 0.0f;
+            for (uint32_t p = 0; p < r; p++)
+                acc += A[r * lda + p] * vt[p * ldk + j];
+            vt[r * ldk + j] -= acc;
+            __syncthreads();
+        }
+
+        /* A is free after the solve: reuse it for the causal decayed
+         * output Gram QG[r][p] = (q^_r . k_p) exp(c_r - c_p), p <= r,
+         * computed ONCE across the block (the first cut recomputed every
+         * q.k dot in all 128 threads - 3x slower than sequential) */
+        __syncthreads();
+        for (uint32_t t = j; t < C * C; t += blockDim.x) {
+            const uint32_t r = t / C, p = t % C;
+            if (p <= r) {
+                const float *qr = q + ((uint64_t)(base + r) * h_k + kh) * dim;
+                float qk = 0.0f;
+                for (uint32_t d = 0; d < dim; d++)
+                    qk += qr[d] * ksm[p * ldk + d];
+                A[r * lda + p] = qk * qscale * expf(cg[r] - cg[p]);
+            }
+        }
+        __syncthreads();
+        for (uint32_t r = 0; r < C; r++) {
+            const float *qr = q + ((uint64_t)(base + r) * h_k + kh) * dim;
+            float qs0 = 0.0f;
+            for (uint32_t d = 0; d < dim; d++)
+                qs0 += qr[d] * qscale * S[d];
+            float o = expf(cg[r]) * qs0;
+            for (uint32_t p = 0; p <= r; p++)
+                o += A[r * lda + p] * vt[p * ldk + j];
+            out[((uint64_t)(base + r) * h_v + h) * dim + j] = o;
+        }
+        const float bC = expf(cg[C - 1u]);
+        for (uint32_t d = 0; d < dim; d++) {
+            float acc = bC * S[d];
+            for (uint32_t r = 0; r < C; r++)
+                acc += expf(cg[C - 1u] - cg[r]) * ksm[r * ldk + d] * vt[r * ldk + j];
+            S[d] = acc;
+        }
+        __syncthreads();
+    }
+    for (uint32_t i = 0; i < dim; i++) Sg[(uint64_t)i * dim + j] = S[i];
+}
+
+/* ---- chunked GDN v2: chunk stages on tensor cores (PULSAR_GDN_CHUNK=2)
+ * Same math as the scalar chunked kernel above; the five GEMM-shaped
+ * stages run on fp16 mma with f32 accumulate, sharing the gqa ldmatrix
+ * helpers: KS0 = K.S and QS0 = Q^.S (C x D through an fp16 S^T tile),
+ * the two C x C Grams (K.K^T for the solve, Q^.K^T for the output),
+ * and the output mix QG.VT. The fp32 state column stays in registers
+ * as the cross-chunk carrier (fp16 only at the GEMM inputs, the FLA
+ * production recipe); the forward substitution keeps its column in
+ * registers too - ZERO barriers where the scalar kernel spent 31 - and
+ * the state update stays scalar fp32 (its mma form would need a D x D
+ * f32 staging tile that busts the 99KB smem budget). The output Gram
+ * is computed twice (each warp pair) to keep its fragments in
+ * registers for the mix - C^2 x D FLOPs, cheaper than an smem
+ * round-trip + barrier. 4 barriers per chunk vs the scalar kernel's
+ * ~36. dim == 128 and C == 32 fixed (dispatch guards). */
+#define GDN_CMMA_PAD 8u
+
+static size_t gdn_chunk_mma_smem_bytes(void) {
+    const uint32_t LDK = 128u + GDN_CMMA_PAD;
+    const uint32_t LDF = 128u + 4u;
+    const uint32_t LDV = GDN_CHUNK + GDN_CMMA_PAD;
+    return (size_t)128u * LDK * 2u              /* Sh: S^T fp16 */
+           + (size_t)GDN_CHUNK * LDK * 2u * 2u  /* k, q^ fp16 tiles */
+           + (size_t)GDN_CHUNK * LDF * 4u       /* vt staging f32 */
+           + (size_t)128u * LDV * 2u            /* vt^T fp16 */
+           + (size_t)GDN_CHUNK * (GDN_CHUNK + 1u) * 4u  /* A f32 */
+           + 2u * GDN_CHUNK * 4u;               /* cg, beta */
+}
+
+__global__ static void qwen35_gdn_chunk_mma_kernel(
+        float *out, float *state,
+        const float *q, const float *k, const float *v,
+        const float *g, const float *beta,
+        uint32_t h_v, uint32_t h_k, uint32_t n_tok) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr uint32_t C = GDN_CHUNK;
+    constexpr uint32_t D = 128u;
+    constexpr uint32_t LDK = D + GDN_CMMA_PAD;
+    constexpr uint32_t LDF = D + 4u;
+    constexpr uint32_t LDV = C + GDN_CMMA_PAD;
+    const uint32_t h = blockIdx.x;
+    const uint32_t j = threadIdx.x;             /* dim column, 128 threads */
+    if (h >= h_v) return;
+    const uint32_t kvh = h % h_k;
+    float *Sg = state + (uint64_t)h * D * D;
+    const float qscale = rsqrtf((float)D);
+    const uint32_t lane = j & 31u, warp = j >> 5u;
+    const uint32_t fg = lane >> 2u, ft = lane & 3u;
+    const uint32_t rw = warp >> 1u;             /* token row tile (16) */
+    const uint32_t nh = warp & 1u;              /* dim half for C x D tiles */
+
+    extern __shared__ __align__(16) char gdn_mma_smem[];
+    __half *Sh = (__half *)gdn_mma_smem;               /* [D][LDK] = S^T */
+    __half *ksm = Sh + D * LDK;                        /* [C][LDK] */
+    __half *qsm = ksm + C * LDK;                       /* [C][LDK], qscale in */
+    float *vtf = (float *)(qsm + C * LDK);             /* [C][LDF] */
+    __half *vth = (__half *)(vtf + C * LDF);           /* [D][LDV] = vt^T */
+    float *Ah = (float *)(vth + D * LDV);              /* [C][C+1] lower */
+    float *cg = Ah + C * (C + 1u);                     /* [C] cum log decay */
+    float *bsm = cg + C;                               /* [C] beta */
+
+    float S[D];   /* fp32 state column j, the cross-chunk carrier */
+    for (uint32_t i = 0; i < D; i++) S[i] = Sg[(uint64_t)i * D + j];
+    float vtr[C];
+
+    /* fragment rows (tokens) this thread touches in C-row stages */
+    const uint32_t rl = rw * 16u + fg, rh = rl + 8u;
+
+    for (uint32_t base = 0; base + C <= n_tok; base += C) {
+        /* stage: S^T as fp16 (thread j owns row j = its state column),
+         * k / q^ tiles, beta, in-chunk cumulative log decay */
+        for (uint32_t d = 0; d < D; d++) Sh[j * LDK + d] = __float2half(S[d]);
+        for (uint32_t i = j; i < C * D; i += blockDim.x) {
+            const uint32_t r = i / D, d = i % D;
+            ksm[r * LDK + d] = __float2half(
+                    k[((uint64_t)(base + r) * h_k + kvh) * D + d]);
+            qsm[r * LDK + d] = __float2half(
+                    q[((uint64_t)(base + r) * h_k + kvh) * D + d] * qscale);
+        }
+        if (j == 0) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < C; r++) {
+                acc += g[(uint64_t)(base + r) * h_v + h];
+                cg[r] = acc;
+                bsm[r] = beta[(uint64_t)(base + r) * h_v + h];
+            }
+        }
+        __syncthreads();
+
+        /* KS0 = K.S (C x D): A = k tile (ldmatrix x4), B = S^T rows =
+         * already col-major k x n (ldmatrix x2). The fragment transform
+         * writes the substitution RHS straight into vtf. */
+        {
+            float f[8][4];
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 8u; nt++)
+                #pragma unroll
+                for (uint32_t c = 0; c < 4u; c++) f[nt][c] = 0.0f;
+            #pragma unroll
+            for (uint32_t kk = 0; kk < D / 16u; kk++) {
+                const uint32_t kb = kk * 16u;
+                unsigned a[4];
+                gqa_ldm_x4(a, gqa_smem_u32(
+                        &ksm[(rw * 16u + (lane & 15u)) * LDK + kb
+                             + ((lane >> 4u) & 1u) * 8u]));
+                #pragma unroll
+                for (uint32_t nt = 0; nt < 8u; nt++) {
+                    unsigned b[2];
+                    gqa_ldm_x2(b, gqa_smem_u32(
+                            &Sh[(nh * 64u + nt * 8u + (lane & 7u)) * LDK + kb
+                                + ((lane >> 3u) & 1u) * 8u]));
+                    gqa_mma_f16(f[nt], a, b);
+                }
+            }
+            const float el = expf(cg[rl]), eh = expf(cg[rh]);
+            const float bl = bsm[rl], bh = bsm[rh];
+            const float *vl = v + ((uint64_t)(base + rl) * h_v + h) * D;
+            const float *vhi = v + ((uint64_t)(base + rh) * h_v + h) * D;
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 8u; nt++) {
+                const uint32_t c0 = nh * 64u + nt * 8u + ft * 2u;
+                vtf[rl * LDF + c0] = bl * (vl[c0] - el * f[nt][0]);
+                vtf[rl * LDF + c0 + 1u] = bl * (vl[c0 + 1u] - el * f[nt][1]);
+                vtf[rh * LDF + c0] = bh * (vhi[c0] - eh * f[nt][2]);
+                vtf[rh * LDF + c0 + 1u] = bh * (vhi[c0 + 1u] - eh * f[nt][3]);
+            }
+        }
+
+        /* K Gram for the solve (warps 0/2 cover rows 0..15/16..31):
+         * A[r][p] = b_r (k_r . k_p) exp(c_r - c_p), p < r, into f32 smem */
+        if (nh == 0u) {
+            float gA[4][4];
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 4u; nt++)
+                #pragma unroll
+                for (uint32_t c = 0; c < 4u; c++) gA[nt][c] = 0.0f;
+            #pragma unroll
+            for (uint32_t kk = 0; kk < D / 16u; kk++) {
+                const uint32_t kb = kk * 16u;
+                unsigned a[4];
+                gqa_ldm_x4(a, gqa_smem_u32(
+                        &ksm[(rw * 16u + (lane & 15u)) * LDK + kb
+                             + ((lane >> 4u) & 1u) * 8u]));
+                #pragma unroll
+                for (uint32_t nt = 0; nt < 4u; nt++) {
+                    unsigned b[2];
+                    gqa_ldm_x2(b, gqa_smem_u32(
+                            &ksm[(nt * 8u + (lane & 7u)) * LDK + kb
+                                 + ((lane >> 3u) & 1u) * 8u]));
+                    gqa_mma_f16(gA[nt], a, b);
+                }
+            }
+            const float bl = bsm[rl], bh = bsm[rh];
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 4u; nt++) {
+                const uint32_t p0 = nt * 8u + ft * 2u;
+                if (p0 < rl)
+                    Ah[rl * (C + 1u) + p0] = bl * gA[nt][0] * expf(cg[rl] - cg[p0]);
+                if (p0 + 1u < rl)
+                    Ah[rl * (C + 1u) + p0 + 1u] = bl * gA[nt][1] * expf(cg[rl] - cg[p0 + 1u]);
+                if (p0 < rh)
+                    Ah[rh * (C + 1u) + p0] = bh * gA[nt][2] * expf(cg[rh] - cg[p0]);
+                if (p0 + 1u < rh)
+                    Ah[rh * (C + 1u) + p0 + 1u] = bh * gA[nt][3] * expf(cg[rh] - cg[p0 + 1u]);
+            }
+        }
+
+        /* QS0 = Q^.S into the output fragments, scaled by exp(c_r) */
+        float oacc[8][4];
+        #pragma unroll
+        for (uint32_t nt = 0; nt < 8u; nt++)
+            #pragma unroll
+            for (uint32_t c = 0; c < 4u; c++) oacc[nt][c] = 0.0f;
+        #pragma unroll
+        for (uint32_t kk = 0; kk < D / 16u; kk++) {
+            const uint32_t kb = kk * 16u;
+            unsigned a[4];
+            gqa_ldm_x4(a, gqa_smem_u32(
+                    &qsm[(rw * 16u + (lane & 15u)) * LDK + kb
+                         + ((lane >> 4u) & 1u) * 8u]));
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 8u; nt++) {
+                unsigned b[2];
+                gqa_ldm_x2(b, gqa_smem_u32(
+                        &Sh[(nh * 64u + nt * 8u + (lane & 7u)) * LDK + kb
+                            + ((lane >> 3u) & 1u) * 8u]));
+                gqa_mma_f16(oacc[nt], a, b);
+            }
+        }
+        {
+            const float el = expf(cg[rl]), eh = expf(cg[rh]);
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 8u; nt++) {
+                oacc[nt][0] *= el; oacc[nt][1] *= el;
+                oacc[nt][2] *= eh; oacc[nt][3] *= eh;
+            }
+        }
+
+        /* output Gram QG[r][p] = (q^_r . k_p) exp(c_r - c_p), p <= r:
+         * every warp computes its row tile (duplicated across the warp
+         * pair) so the masked fp16 fragments feed the mix mma from
+         * registers */
+        unsigned qgp[4][2];
+        {
+            float qg[4][4];
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 4u; nt++)
+                #pragma unroll
+                for (uint32_t c = 0; c < 4u; c++) qg[nt][c] = 0.0f;
+            #pragma unroll
+            for (uint32_t kk = 0; kk < D / 16u; kk++) {
+                const uint32_t kb = kk * 16u;
+                unsigned a[4];
+                gqa_ldm_x4(a, gqa_smem_u32(
+                        &qsm[(rw * 16u + (lane & 15u)) * LDK + kb
+                             + ((lane >> 4u) & 1u) * 8u]));
+                #pragma unroll
+                for (uint32_t nt = 0; nt < 4u; nt++) {
+                    unsigned b[2];
+                    gqa_ldm_x2(b, gqa_smem_u32(
+                            &ksm[(nt * 8u + (lane & 7u)) * LDK + kb
+                                 + ((lane >> 3u) & 1u) * 8u]));
+                    gqa_mma_f16(qg[nt], a, b);
+                }
+            }
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 4u; nt++) {
+                const uint32_t p0 = nt * 8u + ft * 2u;
+                const float w0 = p0 <= rl ? qg[nt][0] * expf(cg[rl] - cg[p0]) : 0.0f;
+                const float w1 = p0 + 1u <= rl ? qg[nt][1] * expf(cg[rl] - cg[p0 + 1u]) : 0.0f;
+                const float w2 = p0 <= rh ? qg[nt][2] * expf(cg[rh] - cg[p0]) : 0.0f;
+                const float w3 = p0 + 1u <= rh ? qg[nt][3] * expf(cg[rh] - cg[p0 + 1u]) : 0.0f;
+                qgp[nt][0] = ((unsigned)__half_as_ushort(__float2half(w1)) << 16)
+                             | __half_as_ushort(__float2half(w0));
+                qgp[nt][1] = ((unsigned)__half_as_ushort(__float2half(w3)) << 16)
+                             | __half_as_ushort(__float2half(w2));
+            }
+        }
+        __syncthreads();  /* vtf + Ah published */
+
+        /* forward substitution, thread-local: column j in registers,
+         * zero barriers (the scalar kernel spent 31 here) */
+        #pragma unroll
+        for (uint32_t p = 0; p < C; p++) vtr[p] = vtf[p * LDF + j];
+        for (uint32_t r = 1; r < C; r++) {
+            float acc = 0.0f;
+            for (uint32_t p = 0; p < r; p++)
+                acc += Ah[r * (C + 1u) + p] * vtr[p];
+            vtr[r] -= acc;
+        }
+        #pragma unroll
+        for (uint32_t p = 0; p < C; p++) vth[j * LDV + p] = __float2half(vtr[p]);
+        __syncthreads();  /* vt^T published */
+
+        /* output mix: O += QG.VT (B = vt^T rows = col-major k x n),
+         * then the fragments store straight to out */
+        #pragma unroll
+        for (uint32_t kk = 0; kk < C / 16u; kk++) {
+            const unsigned a[4] = { qgp[kk * 2u][0], qgp[kk * 2u][1],
+                                    qgp[kk * 2u + 1u][0], qgp[kk * 2u + 1u][1] };
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 8u; nt++) {
+                unsigned b[2];
+                gqa_ldm_x2(b, gqa_smem_u32(
+                        &vth[(nh * 64u + nt * 8u + (lane & 7u)) * LDV + kk * 16u
+                             + ((lane >> 3u) & 1u) * 8u]));
+                gqa_mma_f16(oacc[nt], a, b);
+            }
+        }
+        {
+            float *ol = out + ((uint64_t)(base + rl) * h_v + h) * D;
+            float *oh = out + ((uint64_t)(base + rh) * h_v + h) * D;
+            #pragma unroll
+            for (uint32_t nt = 0; nt < 8u; nt++) {
+                const uint32_t c0 = nh * 64u + nt * 8u + ft * 2u;
+                ol[c0] = oacc[nt][0]; ol[c0 + 1u] = oacc[nt][1];
+                oh[c0] = oacc[nt][2]; oh[c0 + 1u] = oacc[nt][3];
+            }
+        }
+
+        /* state update, scalar fp32 per thread column:
+         * S = exp(c_C) S + sum_r exp(c_C - c_r) k_r vt_r */
+        const float bC = expf(cg[C - 1u]);
+        #pragma unroll
+        for (uint32_t r = 0; r < C; r++) vtr[r] *= expf(cg[C - 1u] - cg[r]);
+        for (uint32_t d = 0; d < D; d++) {
+            float acc = bC * S[d];
+            #pragma unroll
+            for (uint32_t r = 0; r < C; r++)
+                acc += __half2float(ksm[r * LDK + d]) * vtr[r];
+            S[d] = acc;
+        }
+        __syncthreads();  /* ksm/vth reads done before restage */
+    }
+    for (uint32_t i = 0; i < D; i++) Sg[(uint64_t)i * D + j] = S[i];
+#endif
+}
+
+static int gdn_chunk_mode() {
+    const char *e = getenv("PULSAR_GDN_CHUNK");
+    return e ? atoi(e) : 0;
+}
+
 extern "C" int pulsar_qwen35_gdn_batch(
         void *out_dev, void *state_dev,
         const void *q_dev, const void *k_dev, const void *v_dev,
@@ -328,11 +778,73 @@ extern "C" int pulsar_qwen35_gdn_batch(
         dim > 128u || n_tok == 0) {
         return 0;
     }
-    qwen35_gdn_batch_kernel<<<h_v, dim>>>(
-            (float *)out_dev, (float *)state_dev,
-            (const float *)q_dev, (const float *)k_dev, (const float *)v_dev,
-            (const float *)g_dev, (const float *)beta_dev, h_v, h_k, dim, n_tok);
-    return cuda_ok(cudaGetLastError(), "qwen35 gdn batch launch");
+    uint32_t done = 0;
+    const int cmode = gdn_chunk_mode();
+    if (cmode >= 1 && n_tok >= GDN_CHUNK) {
+        const uint32_t full = (n_tok / GDN_CHUNK) * GDN_CHUNK;
+        /* per-device smem attributes (>48KB): same rule as the gqa mma
+         * kernel - cudaFuncSetAttribute is per device */
+        int dev = 0;
+        (void)cudaGetDevice(&dev);
+        if (cmode >= 2 && dim == 128u && dev >= 0 && dev < 16) {
+            static signed char cm_ok[16];
+            const size_t sm2 = gdn_chunk_mma_smem_bytes();
+            if (cm_ok[dev] == 0) {
+                const int ok2 = cuda_ok(cudaFuncSetAttribute(
+                             (const void *)qwen35_gdn_chunk_mma_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)sm2),
+                             "gdn chunk mma smem");
+                cm_ok[dev] = ok2 ? 1 : -1;
+            }
+            if (cm_ok[dev] == 1) {
+                qwen35_gdn_chunk_mma_kernel<<<h_v, 128u, sm2>>>(
+                        (float *)out_dev, (float *)state_dev,
+                        (const float *)q_dev, (const float *)k_dev, (const float *)v_dev,
+                        (const float *)g_dev, (const float *)beta_dev, h_v, h_k, full);
+                if (!cuda_ok(cudaGetLastError(), "qwen35 gdn chunk mma launch")) return 0;
+                done = full;
+            }
+        }
+        if (done == 0 && dev >= 0 && dev < 16) {
+            static signed char ck_ok[16];
+            const size_t sm = gdn_chunk_smem_bytes(dim);
+            if (ck_ok[dev] == 0) {
+                int ok = 1;
+                if (sm > 48u * 1024u)
+                    ok = cuda_ok(cudaFuncSetAttribute(
+                                 (const void *)qwen35_gdn_chunk_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)gdn_chunk_smem_bytes(128u)),
+                                 "gdn chunk smem");
+                ck_ok[dev] = ok ? 1 : -1;
+            }
+            if (ck_ok[dev] == 1) {
+                qwen35_gdn_chunk_kernel<<<h_v, dim, sm>>>(
+                        (float *)out_dev, (float *)state_dev,
+                        (const float *)q_dev, (const float *)k_dev, (const float *)v_dev,
+                        (const float *)g_dev, (const float *)beta_dev, h_v, h_k, dim, full);
+                if (!cuda_ok(cudaGetLastError(), "qwen35 gdn chunk launch")) return 0;
+                done = full;
+            }
+        }
+    }
+    if (done < n_tok) {
+        /* tail (or the whole batch when chunking is off/small) runs the
+         * sequential kernel from the carried state */
+        const uint64_t row = dim;
+        qwen35_gdn_batch_kernel<<<h_v, dim>>>(
+                (float *)out_dev + (uint64_t)done * h_v * row,
+                (float *)state_dev,
+                (const float *)q_dev + (uint64_t)done * h_k * row,
+                (const float *)k_dev + (uint64_t)done * h_k * row,
+                (const float *)v_dev + (uint64_t)done * h_v * row,
+                (const float *)g_dev + (uint64_t)done * h_v,
+                (const float *)beta_dev + (uint64_t)done * h_v,
+                h_v, h_k, dim, n_tok - done);
+        return cuda_ok(cudaGetLastError(), "qwen35 gdn batch launch");
+    }
+    return 1;
 }
 
 /* Per-row scale: x[t][:] *= s[t] (batched shared-expert scalar gates). */
@@ -1116,6 +1628,92 @@ extern "C" int pulsar_qwen35_selftest(void) {
         }
         cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
         free(q); free(k); free(v); free(got);
+    }
+
+    /* chunked GDN vs the sequential kernel on identical inputs: 200
+     * tokens = 3 full chunks + an 8-token sequential tail through the
+     * dispatch, prod shape (HV heads, HK kv heads, dim 128). The
+     * sequential kernel IS the reference; the chunked form reorders
+     * float ops heavily (C^2 terms, exp ratios), so the tolerance is
+     * looser than exact phases. */
+    if (ok) {
+        const uint32_t NT = 200;
+        const uint64_t qk_e = (uint64_t)NT * HK * DIM;
+        const uint64_t v_e = (uint64_t)NT * HV * DIM;
+        const uint64_t gb_e = (uint64_t)NT * HV;
+        const uint64_t st_e = (uint64_t)HV * DIM * DIM;
+        float *q = (float *)malloc(qk_e * 4), *k = (float *)malloc(qk_e * 4);
+        float *v = (float *)malloc(v_e * 4);
+        float *g = (float *)malloc(gb_e * 4), *b = (float *)malloc(gb_e * 4);
+        for (uint64_t i = 0; i < qk_e; i++) { q[i] = gqa_test_randf() - 0.5f; k[i] = gqa_test_randf() - 0.5f; }
+        /* the model L2-normalizes q/k before this kernel; without it
+         * beta*|k|^2 >> 1 and the delta-rule map EXPANDS - 200 raw
+         * random tokens overflow BOTH kernels (how this test first
+         * failed). Normalize per row like production. */
+        for (uint64_t r = 0; r < (uint64_t)NT * HK; r++) {
+            float nq = 0.f, nk = 0.f;
+            for (uint32_t d = 0; d < DIM; d++) {
+                nq += q[r * DIM + d] * q[r * DIM + d];
+                nk += k[r * DIM + d] * k[r * DIM + d];
+            }
+            nq = 1.0f / sqrtf(nq + 1e-6f); nk = 1.0f / sqrtf(nk + 1e-6f);
+            for (uint32_t d = 0; d < DIM; d++) { q[r * DIM + d] *= nq; k[r * DIM + d] *= nk; }
+        }
+        for (uint64_t i = 0; i < v_e; i++) v[i] = gqa_test_randf() - 0.5f;
+        for (uint64_t i = 0; i < gb_e; i++) {
+            g[i] = -0.05f - 0.5f * gqa_test_randf(); /* log decay < 0 */
+            b[i] = 0.9f * gqa_test_randf() + 0.05f;
+        }
+        void *dq, *dk, *dv, *dg, *db, *dst, *dout;
+        cudaMalloc(&dq, qk_e * 4); cudaMalloc(&dk, qk_e * 4);
+        cudaMalloc(&dv, v_e * 4); cudaMalloc(&dg, gb_e * 4);
+        cudaMalloc(&db, gb_e * 4); cudaMalloc(&dst, st_e * 4);
+        cudaMalloc(&dout, v_e * 4);
+        cudaMemcpy(dq, q, qk_e * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dk, k, qk_e * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dv, v, v_e * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dg, g, gb_e * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(db, b, gb_e * 4, cudaMemcpyHostToDevice);
+        float *o_ref = (float *)malloc(v_e * 4), *o_ck = (float *)malloc(v_e * 4);
+        float *s_ref = (float *)malloc(st_e * 4), *s_ck = (float *)malloc(st_e * 4);
+        cudaMemset(dst, 0, st_e * 4);
+        unsetenv("PULSAR_GDN_CHUNK");
+        ok &= pulsar_qwen35_gdn_batch(dout, dst, dq, dk, dv, dg, db, HV, HK, DIM, NT);
+        cudaMemcpy(o_ref, dout, v_e * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(s_ref, dst, st_e * 4, cudaMemcpyDeviceToHost);
+        /* mode 1 = scalar chunked, mode 2 = tensor-core chunked (fp16
+         * GEMM inputs, so a looser bar) */
+        for (int cm = 1; cm <= 2; cm++) {
+            cudaMemset(dst, 0, st_e * 4);
+            setenv("PULSAR_GDN_CHUNK", cm == 1 ? "1" : "2", 1);
+            ok &= pulsar_qwen35_gdn_batch(dout, dst, dq, dk, dv, dg, db, HV, HK, DIM, NT);
+            unsetenv("PULSAR_GDN_CHUNK");
+            cudaMemcpy(o_ck, dout, v_e * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(s_ck, dst, st_e * 4, cudaMemcpyDeviceToHost);
+            if (cudaDeviceSynchronize() != cudaSuccess) ok = 0;
+            float od = 0.0f, sd = 0.0f;
+            uint64_t bad_ref = 0, bad_ck = 0;
+            int64_t first_bad = -1;
+            for (uint64_t i = 0; i < v_e; i++) {
+                if (!isfinite(o_ref[i])) bad_ref++;
+                if (!isfinite(o_ck[i])) { bad_ck++; if (first_bad < 0) first_bad = (int64_t)i; }
+                od = fmaxf(od, fabsf(o_ref[i] - o_ck[i]));
+            }
+            for (uint64_t i = 0; i < st_e; i++) sd = fmaxf(sd, fabsf(s_ref[i] - s_ck[i]));
+            if (bad_ref || bad_ck)
+                fprintf(stderr, "qwen35 selftest: gdn chunked nonfinite ref=%llu ck=%llu first_ck=%lld (tok %lld)\n",
+                        (unsigned long long)bad_ref, (unsigned long long)bad_ck,
+                        (long long)first_bad, (long long)(first_bad / ((int64_t)8 * 128)));
+            const float tol = cm == 1 ? 2e-3f : 5e-3f;
+            int pass = ok && od < tol && sd < tol;
+            fprintf(stderr, "qwen35 selftest: gdn chunked mode %d (n_tok=%u): %s (out diff %.2e, state diff %.2e)\n",
+                    cm, NT, pass ? "PASS" : "FAIL", od, sd);
+            if (!pass) ok = 0;
+        }
+        cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dg);
+        cudaFree(db); cudaFree(dst); cudaFree(dout);
+        free(q); free(k); free(v); free(g); free(b);
+        free(o_ref); free(o_ck); free(s_ref); free(s_ck);
     }
 
     if (cudaDeviceSynchronize() != cudaSuccess) ok = 0;
