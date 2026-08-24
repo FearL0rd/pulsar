@@ -1712,10 +1712,6 @@ impl Model {
         for _ in 0..n_layers {
             evs.push((kernels::XEvent::new()?, kernels::XEvent::new()?));
         }
-        // the octet-tile GEMM scratch is process-global; two lanes would
-        // clobber it mid-flight, so the pipe runs with it disabled
-        let oct_prev = std::env::var_os("PULSAR_NO_OCT");
-        std::env::set_var("PULSAR_NO_OCT", "1");
         let graphs_prev = rt.graphs_on;
         rt.graphs_on = false;
         rt.pipe = Some(PipeHook { evs: evs.as_ptr(), slot: 0 });
@@ -1731,6 +1727,9 @@ impl Model {
             let h = scope.spawn(move || -> std::result::Result<(), String> {
                 let ctx = ctx;
                 kernels::set_device(kernels::primary_device()).map_err(|e| e.to_string())?;
+                // lane-1 scratch arenas (preq/octet/nvfp4-act/gqa-split):
+                // this thread must never share a staging buffer with T0
+                kernels::set_lane(1);
                 let (m, sst, srt) = unsafe { (&*ctx.m, &mut *ctx.st, &mut *ctx.rt) };
                 for (ci, chunk) in tokens.chunks(cm).enumerate() {
                     if ci % 2 != 1 {
@@ -1776,10 +1775,6 @@ impl Model {
         drop(guard);
         rt.pipe = None;
         rt.graphs_on = graphs_prev;
-        match oct_prev {
-            Some(v) => std::env::set_var("PULSAR_NO_OCT", v),
-            None => std::env::remove_var("PULSAR_NO_OCT"),
-        }
         pipe_res?;
         Ok(last_t)
     }

@@ -1068,20 +1068,20 @@ __global__ static void gqa_attention_combine_kernel(
 /* grow-only per-device scratch for the split partials (same pattern as
  * preq_scratch: single-stream engine, VRAM only dereferenceable on its
  * own device) */
-static void *g_gqa_split_scratch[16];
-static uint64_t g_gqa_split_cap[16];
+static void *g_gqa_split_scratch[16][2];
+static uint64_t g_gqa_split_cap[16][2];
 
 static void *gqa_split_scratch(uint64_t bytes) {
     int dev = 0;
     (void)cudaGetDevice(&dev);
     if (dev < 0 || dev >= 16) return NULL;
-    if (bytes <= g_gqa_split_cap[dev]) return g_gqa_split_scratch[dev];
-    if (g_gqa_split_scratch[dev]) (void)cudaFree(g_gqa_split_scratch[dev]);
-    g_gqa_split_scratch[dev] = NULL;
-    g_gqa_split_cap[dev] = 0;
-    if (!cuda_ok(cudaMalloc(&g_gqa_split_scratch[dev], bytes), "gqa split scratch")) return NULL;
-    g_gqa_split_cap[dev] = bytes;
-    return g_gqa_split_scratch[dev];
+    if (bytes <= g_gqa_split_cap[dev][t_lane]) return g_gqa_split_scratch[dev][t_lane];
+    if (g_gqa_split_scratch[dev][t_lane]) (void)cudaFree(g_gqa_split_scratch[dev][t_lane]);
+    g_gqa_split_scratch[dev][t_lane] = NULL;
+    g_gqa_split_cap[dev][t_lane] = 0;
+    if (!cuda_ok(cudaMalloc(&g_gqa_split_scratch[dev][t_lane], bytes), "gqa split scratch")) return NULL;
+    g_gqa_split_cap[dev][t_lane] = bytes;
+    return g_gqa_split_scratch[dev][t_lane];
 }
 
 

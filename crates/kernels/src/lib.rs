@@ -99,6 +99,7 @@ mod real {
         fn pulsar_rms_norm(out: *mut c_void, x: *const c_void, w: *const c_void, n: u32, rows: u32, eps: f32) -> i32;
         fn pulsar_q8_0_matmul(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_preq_scratch_reserve(bytes: u64) -> i32;
+        fn pulsar_set_lane(lane: i32);
         fn pulsar_q8_0_matmul_banked(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_bank: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_f32(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_kq(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
@@ -1238,6 +1239,14 @@ mod real {
     /// Pre-allocate the q8_0 prequant scratch on the CURRENT device so a
     /// later matmul_q8_0 inside a CUDA-graph capture hits the cached
     /// pointer: cudaMalloc is illegal mid-capture.
+    /// Selects this HOST THREAD's scratch-arena lane (0 or 1) for the
+    /// process-global preq/octet/nvfp4-act/gqa-split arenas. The
+    /// PULSAR_PIPE prefill sets 1 on its second worker thread so the two
+    /// lanes never share a staging buffer mid-flight.
+    pub fn set_lane(lane: u32) {
+        unsafe { pulsar_set_lane(lane as i32) }
+    }
+
     pub fn preq_scratch_reserve(bytes: u64) -> Result {
         check(unsafe { pulsar_preq_scratch_reserve(bytes) }, "preq_scratch_reserve")
     }
