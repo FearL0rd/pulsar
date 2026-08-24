@@ -4,9 +4,11 @@ Status: SHIPPED (945c315, PULSAR_PIPE=1 opt-in). Measured: 7.4k TP
 prefill 10.11s -> 8.08-8.16s across three runs (735 -> 919 tok/s, -20%),
 beats the 2-card TP3=off reference (9.33s) with the third card kept;
 50k tokens 129.45 -> 114.32s (-12%). Output ids bit-identical every
-run; check.sh PASS. v2 headroom: per-lane octet tiles (NO_OCT costs the
-GEMM its fast activation layout inside the pipe), per-parity graphs,
-MTP-prefill interleave. Evidence below is from the
+run; check.sh PASS. v2 (7893e12): per-lane scratch
+arenas restored octet tiles inside the pipe (7.8s) and made PIPE+FP4
+race-free: 7.17-7.76s (best 1,037 tok/s). Remaining headroom:
+per-parity graphs, MTP-prefill interleave, arena prewarm (one-off
+cold-start alloc stall), then tensor-core attention / chunked GDN. Evidence below is from the
 2026-08-23 profiling session (nsys sqlite at ~/prefill-tp.sqlite on
 substrate, 7,436-token prompt, ctx 16384, MTP off, 3-card FFN TP).
 
