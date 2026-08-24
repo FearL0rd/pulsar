@@ -1697,19 +1697,24 @@ __global__ static void gqa_attention_tiled2_kernel(
 }
 
 /* ---- tensor-core prefill attention (PULSAR_ATTN_MMA) -------------------
- * FA1-style: both GEMMs (Q.K^T and P.V) run on fp16 tensor cores with
- * f32 accumulate; the softmax goes through a shared-memory S tile
- * instead of register-fragment bookkeeping (correctness first - the
- * fragment shuffle softmax is where FA bugs live; revisit if ncu says
- * the smem round-trip caps the win). 64-query tiles; the key-tile width
- * TK shrinks with head_dim to fit the 99KB smem budget (HD 128 -> TK 64,
- * HD 256 -> TK 32; qwen38's full-attention heads are HD 256). Per-
- * element KV formats only (block/turbo formats keep the scalar
- * kernels), rel unsupported (dispatch guards). K/V rows dequant into
- * fp16 tiles at staging with the per-row scale folded in; Q stages once
- * with `scale` folded in. fp16 rounds inputs (~1e-3 rel); accumulation
- * is f32. Selftest phase 11 compares both widths against the exact
- * reference. */
+ * FA2-shape v2: both GEMMs (Q.K^T and P.V) run on fp16 tensor cores with
+ * f32 accumulate, and the score tile never leaves registers. Fragments
+ * load via ldmatrix (Q x4, K x2, V x2.trans - the .trans kills v1's
+ * four-single-gather V path); masking, the online softmax (m/den per
+ * query row), and the fp16 P conversion all happen on the S fragments
+ * in registers with quad shuffles (each query row is owned by the 4
+ * threads of one mma quad, redundantly). Shared memory holds only the
+ * Q/K/V fp16 tiles, and the chunk loop has ONE barrier (tile restage)
+ * where v1 had three (S store, softmax, P store). 64-query tiles; TK
+ * shrinks with head_dim (HD 128 -> TK 64, HD 256 -> TK 32; qwen38's
+ * full-attention heads are HD 256). Per-element KV formats only, rel
+ * unsupported (dispatch guards). K/V rows dequant into fp16 tiles at
+ * staging with the per-row scale folded in; Q stages once with `scale`
+ * folded in. fp16 rounds inputs (~1e-3 rel); accumulation is f32.
+ * Softmax sums reduce in a different order than v1 (quad tree vs
+ * serial), so last-bit output drift vs v1 is expected and the selftest
+ * tolerance covers it. Selftest phase 11 compares both widths against
+ * the exact reference. */
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __device__ __forceinline__ static void gqa_mma_f16(
         float d[4], const unsigned a[4], const unsigned b[2]) {
@@ -1719,17 +1724,35 @@ __device__ __forceinline__ static void gqa_mma_f16(
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
+
+/* ldmatrix fragment loaders. Addresses are per-lane shared-memory row
+ * pointers (16B-aligned by the padded tile strides). x4 = a 16x16 A
+ * tile (row-major), x2 = a k16xn8 B tile from [n][k] memory (already
+ * col-major), x2t = a k16xn8 B tile from [k][n] memory (transposed on
+ * load). */
+__device__ __forceinline__ static unsigned gqa_smem_u32(const void *p) {
+    return (unsigned)__cvta_generic_to_shared(p);
+}
+__device__ __forceinline__ static void gqa_ldm_x4(unsigned a[4], unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(addr));
+}
+__device__ __forceinline__ static void gqa_ldm_x2(unsigned b[2], unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(addr));
+}
+__device__ __forceinline__ static void gqa_ldm_x2t(unsigned b[2], unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
+                 : "=r"(b[0]), "=r"(b[1]) : "r"(addr));
+}
 #endif
 
 #define GQA_MMA_TQ 64u
 #define GQA_MMA_PAD 8u
 
 static size_t gqa_mma_smem_bytes(uint32_t hd, uint32_t tk) {
-    const size_t ldq = hd + GQA_MMA_PAD, lds = tk + GQA_MMA_PAD;
-    return (GQA_MMA_TQ * ldq + (size_t)tk * ldq * 2) * 2  /* q,k,v fp16 */
-           + GQA_MMA_TQ * lds * 4                          /* s f32 */
-           + GQA_MMA_TQ * lds * 2                          /* p fp16 */
-           + (size_t)GQA_MMA_TQ * 3 * 4;                   /* m, den, corr */
+    const size_t ldq = hd + GQA_MMA_PAD;
+    return (GQA_MMA_TQ * ldq + (size_t)tk * ldq * 2) * 2;  /* q,k,v fp16 */
 }
 
 template <Kvf KVF, uint32_t HD, uint32_t TK>
@@ -1749,8 +1772,8 @@ __global__ static void gqa_attention_mma_kernel(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr uint32_t TQ = GQA_MMA_TQ;
     constexpr uint32_t LDQ = HD + GQA_MMA_PAD;
-    constexpr uint32_t LDS = TK + GQA_MMA_PAD;
     constexpr uint32_t NFRAG = HD / 8u;      /* PV n-tiles per warp */
+    constexpr uint32_t NSF = TK / 8u;        /* score n-tiles per warp */
     const uint32_t t0 = blockIdx.x * TQ;
     const uint32_t h = blockIdx.y;
     if (t0 >= n_tok) return;
@@ -1766,13 +1789,9 @@ __global__ static void gqa_attention_mma_kernel(
     __half *qh = (__half *)gqa_mma_smem;                    /* [TQ][LDQ] */
     __half *kh = qh + TQ * LDQ;                             /* [TK][LDQ] */
     __half *vh = kh + TK * LDQ;                             /* [TK][LDQ] */
-    float *st = (float *)(vh + TK * LDQ);                   /* [TQ][LDS] */
-    __half *ph = (__half *)(st + TQ * LDS);                 /* [TQ][LDS] */
-    float *m_s = (float *)(ph + TQ * LDS);                  /* [TQ] */
-    float *den_s = m_s + TQ;                                /* [TQ] */
-    float *corr_s = den_s + TQ;                             /* [TQ] */
 
-    /* stage Q once, `scale` folded in; padded rows, zeros past nq */
+    /* stage Q once, `scale` folded in; padded rows, zeros past nq (the
+     * first chunk's staging barrier publishes it - no extra sync) */
     for (uint32_t i = tid; i < TQ * (HD / 4u); i += 128u) {
         const uint32_t r = i / (HD / 4u), d4 = i % (HD / 4u);
         float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -1786,14 +1805,24 @@ __global__ static void gqa_attention_mma_kernel(
         dst[2] = __float2half(v.z * scale);
         dst[3] = __float2half(v.w * scale);
     }
-    if (tid < TQ) {
-        m_s[tid] = -INFINITY;
-        den_s[tid] = 0.0f;
-    }
-    __syncthreads();
 
-    /* O accumulators live in PV mma fragments: warp w owns query rows
-     * w*16..w*16+15; NFRAG n-tiles of m16n8 cover HD */
+    /* fragment coordinates: warp w owns query rows w*16..w*16+15; the
+     * quad (lanes with equal fg) redundantly owns rows r0 = q0+fg and
+     * r8 = r0+8, tracking their online-softmax m/den in registers */
+    const uint32_t fg = lane >> 2u;      /* fragment group row */
+    const uint32_t ft = lane & 3u;       /* fragment thread col pair */
+    const uint32_t q0 = warp * 16u;
+    const uint32_t r0 = q0 + fg, r8 = r0 + 8u;
+    const bool live0 = r0 < nq, live8 = r8 < nq;
+    const uint32_t nrq0 = pos0 + t0 + r0 + 1u;   /* valid keys < nrq */
+    const uint32_t nrq8 = nrq0 + 8u;
+    uint32_t low0 = 0u, low8 = 0u;
+    if (window != 0u) {
+        low0 = nrq0 > window ? nrq0 - window : 0u;
+        low8 = nrq8 > window ? nrq8 - window : 0u;
+    }
+    float m0 = -INFINITY, m8 = -INFINITY, den0 = 0.0f, den8 = 0.0f;
+
     float oacc[NFRAG][4];
     #pragma unroll
     for (uint32_t f = 0; f < NFRAG; f++)
@@ -1806,13 +1835,12 @@ __global__ static void gqa_attention_mma_kernel(
         const uint32_t nr0 = pos0 + t0 + 1u;
         row0_min = nr0 > window ? nr0 - window : 0u;
     }
-    const uint32_t fg = lane >> 2u;      /* fragment group row */
-    const uint32_t ft = lane & 3u;       /* fragment thread col pair */
 
     for (uint32_t base = row0_min; base < n_rows_max; base += TK) {
         const uint32_t chunk = n_rows_max - base < TK ? n_rows_max - base : TK;
 
         /* stage K and V rows as fp16 with the per-row scale folded in */
+        __syncthreads();  /* prior chunk's PV reads done */
         for (uint32_t i = tid; i < TK * (HD / 4u); i += 128u) {
             const uint32_t r = i / (HD / 4u), d4 = i % (HD / 4u);
             float4 kv = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -1836,130 +1864,128 @@ __global__ static void gqa_attention_mma_kernel(
         }
         __syncthreads();
 
-        /* S = Q.K^T: warp w owns rows w*16..+15; TK/8 col tiles of 8
-         * keys; k-dim HD in HD/16 mma steps. Fragments load direct from
-         * smem (padded rows; ldmatrix is the v2 upgrade). */
-        const uint32_t q0 = warp * 16u;
+        /* S = Q.K^T, fragments in registers. k-dim outer so the Q
+         * A-fragment (ldmatrix x4) loads once per k step; K B-fragments
+         * are ldmatrix x2 on the [key][dim] tile, which is already the
+         * col-major k x n layout. */
+        float sf[NSF][4];
         #pragma unroll
-        for (uint32_t nt = 0; nt < TK / 8u; nt++) {
-            float d[4] = {0.f, 0.f, 0.f, 0.f};
+        for (uint32_t nt = 0; nt < NSF; nt++)
             #pragma unroll
-            for (uint32_t kk = 0; kk < HD / 16u; kk++) {
-                const uint32_t kb = kk * 16u;
-                unsigned a[4], b[2];
-                a[0] = *(const unsigned *)&qh[(q0 + fg) * LDQ + kb + ft * 2u];
-                a[1] = *(const unsigned *)&qh[(q0 + fg + 8u) * LDQ + kb + ft * 2u];
-                a[2] = *(const unsigned *)&qh[(q0 + fg) * LDQ + kb + ft * 2u + 8u];
-                a[3] = *(const unsigned *)&qh[(q0 + fg + 8u) * LDQ + kb + ft * 2u + 8u];
-                b[0] = *(const unsigned *)&kh[(nt * 8u + fg) * LDQ + kb + ft * 2u];
-                b[1] = *(const unsigned *)&kh[(nt * 8u + fg) * LDQ + kb + ft * 2u + 8u];
-                gqa_mma_f16(d, a, b);
+            for (uint32_t c = 0; c < 4u; c++) sf[nt][c] = 0.0f;
+        #pragma unroll
+        for (uint32_t kk = 0; kk < HD / 16u; kk++) {
+            const uint32_t kb = kk * 16u;
+            unsigned a[4];
+            gqa_ldm_x4(a, gqa_smem_u32(
+                    &qh[(q0 + (lane & 15u)) * LDQ + kb + ((lane >> 4u) & 1u) * 8u]));
+            #pragma unroll
+            for (uint32_t nt = 0; nt < NSF; nt++) {
+                unsigned b[2];
+                gqa_ldm_x2(b, gqa_smem_u32(
+                        &kh[(nt * 8u + (lane & 7u)) * LDQ + kb
+                            + ((lane >> 3u) & 1u) * 8u]));
+                gqa_mma_f16(sf[nt], a, b);
             }
-            st[(q0 + fg) * LDS + nt * 8u + ft * 2u] = d[0];
-            st[(q0 + fg) * LDS + nt * 8u + ft * 2u + 1u] = d[1];
-            st[(q0 + fg + 8u) * LDS + nt * 8u + ft * 2u] = d[2];
-            st[(q0 + fg + 8u) * LDS + nt * 8u + ft * 2u + 1u] = d[3];
         }
-        __syncthreads();
 
-        /* online softmax on the S tile: thread r < TQ owns query row r */
-        if (tid < TQ) {
-            const uint32_t r = tid;
-            const uint32_t tq_pos = pos0 + t0 + r;
-            const uint32_t nrq = tq_pos + 1u;
-            const uint32_t r0q = (window != 0u && nrq > window) ? nrq - window : 0u;
-            float mx = -INFINITY;
-            for (uint32_t c = 0; c < chunk; c++) {
-                const uint32_t row = base + c;
-                float x = st[r * LDS + c];
-                if (r >= nq || row >= nrq || row < r0q) x = -INFINITY;
-                st[r * LDS + c] = x;
-                mx = fmaxf(mx, x);
-            }
-            const float m_new = fmaxf(m_s[r], mx);
-            const float corr = m_new == -INFINITY ? 1.0f : expf(m_s[r] - m_new);
-            float dsum = 0.0f;
-            for (uint32_t c = 0; c < chunk; c++) {
-                const float x = st[r * LDS + c];
-                const float pv = x == -INFINITY ? 0.0f : expf(x - m_new);
-                ph[r * LDS + c] = __float2half(pv);
-                dsum += pv;
-            }
-            for (uint32_t c = chunk; c < TK; c++) ph[r * LDS + c] = __float2half(0.0f);
-            den_s[r] = den_s[r] * corr + dsum;
-            m_s[r] = m_new;
-            corr_s[r] = corr;
+        /* mask + online softmax on the fragments. Row r0's elements
+         * live in the quad (lanes ft 0..3), two per score n-tile:
+         * intra-thread reduce, then shuffle across the quad. Columns
+         * past `chunk` stage as zero K rows but their global row index
+         * is >= nrq, so the causal test masks them for free. */
+        float mx0 = -INFINITY, mx8 = -INFINITY;
+        #pragma unroll
+        for (uint32_t nt = 0; nt < NSF; nt++) {
+            const uint32_t c0 = base + nt * 8u + ft * 2u, c1 = c0 + 1u;
+            if (!live0 || c0 >= nrq0 || c0 < low0) sf[nt][0] = -INFINITY;
+            if (!live0 || c1 >= nrq0 || c1 < low0) sf[nt][1] = -INFINITY;
+            if (!live8 || c0 >= nrq8 || c0 < low8) sf[nt][2] = -INFINITY;
+            if (!live8 || c1 >= nrq8 || c1 < low8) sf[nt][3] = -INFINITY;
+            mx0 = fmaxf(mx0, fmaxf(sf[nt][0], sf[nt][1]));
+            mx8 = fmaxf(mx8, fmaxf(sf[nt][2], sf[nt][3]));
         }
-        __syncthreads();
+        #pragma unroll
+        for (uint32_t o = 1; o < 4u; o <<= 1) {
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, o));
+            mx8 = fmaxf(mx8, __shfl_xor_sync(0xffffffffu, mx8, o));
+        }
+        const float mn0 = fmaxf(m0, mx0), mn8 = fmaxf(m8, mx8);
+        const float cor0 = mn0 == -INFINITY ? 1.0f : expf(m0 - mn0);
+        const float cor8 = mn8 == -INFINITY ? 1.0f : expf(m8 - mn8);
+        float ds0 = 0.0f, ds8 = 0.0f;
+        unsigned pf[NSF][2];
+        #pragma unroll
+        for (uint32_t nt = 0; nt < NSF; nt++) {
+            const float p0 = sf[nt][0] == -INFINITY ? 0.0f : expf(sf[nt][0] - mn0);
+            const float p1 = sf[nt][1] == -INFINITY ? 0.0f : expf(sf[nt][1] - mn0);
+            const float p2 = sf[nt][2] == -INFINITY ? 0.0f : expf(sf[nt][2] - mn8);
+            const float p3 = sf[nt][3] == -INFINITY ? 0.0f : expf(sf[nt][3] - mn8);
+            ds0 += p0 + p1;
+            ds8 += p2 + p3;
+            pf[nt][0] = ((unsigned)__half_as_ushort(__float2half(p1)) << 16)
+                        | __half_as_ushort(__float2half(p0));
+            pf[nt][1] = ((unsigned)__half_as_ushort(__float2half(p3)) << 16)
+                        | __half_as_ushort(__float2half(p2));
+        }
+        #pragma unroll
+        for (uint32_t o = 1; o < 4u; o <<= 1) {
+            ds0 += __shfl_xor_sync(0xffffffffu, ds0, o);
+            ds8 += __shfl_xor_sync(0xffffffffu, ds8, o);
+        }
+        den0 = den0 * cor0 + ds0;
+        den8 = den8 * cor8 + ds8;
+        m0 = mn0;
+        m8 = mn8;
 
-        /* O = O*corr + P.V: same fragment mapping; k-dim TK in TK/16 steps */
-        const float c0 = corr_s[q0 + fg];
-        const float c8 = corr_s[q0 + fg + 8u];
+        /* O = O*corr + P.V: P A-fragments repack straight from the
+         * score fragments (n-tiles 2kk, 2kk+1 are the k16 A tile of PV
+         * step kk); V B-fragments are ldmatrix x2.trans on the
+         * [key][dim] tile. */
         #pragma unroll
         for (uint32_t f = 0; f < NFRAG; f++) {
-            oacc[f][0] *= c0; oacc[f][1] *= c0;
-            oacc[f][2] *= c8; oacc[f][3] *= c8;
+            oacc[f][0] *= cor0; oacc[f][1] *= cor0;
+            oacc[f][2] *= cor8; oacc[f][3] *= cor8;
         }
         #pragma unroll
-        for (uint32_t nt = 0; nt < NFRAG; nt++) {
+        for (uint32_t kk = 0; kk < TK / 16u; kk++) {
+            const uint32_t kb = kk * 16u;
+            const unsigned a[4] = { pf[kk * 2u][0], pf[kk * 2u][1],
+                                    pf[kk * 2u + 1u][0], pf[kk * 2u + 1u][1] };
             #pragma unroll
-            for (uint32_t kk = 0; kk < TK / 16u; kk++) {
-                const uint32_t kb = kk * 16u;
-                unsigned a[4];
-                a[0] = *(const unsigned *)&ph[(q0 + fg) * LDS + kb + ft * 2u];
-                a[1] = *(const unsigned *)&ph[(q0 + fg + 8u) * LDS + kb + ft * 2u];
-                a[2] = *(const unsigned *)&ph[(q0 + fg) * LDS + kb + ft * 2u + 8u];
-                a[3] = *(const unsigned *)&ph[(q0 + fg + 8u) * LDS + kb + ft * 2u + 8u];
-                /* B is V^T: col-major fragment wants B[k][n] = vh[key=k]
-                 * [dim=n], rows differ per half - gather singles and pack */
-                __half bh0 = vh[(kb + ft * 2u) * LDQ + nt * 8u + fg];
-                __half bh1 = vh[(kb + ft * 2u + 1u) * LDQ + nt * 8u + fg];
-                __half bh2 = vh[(kb + ft * 2u + 8u) * LDQ + nt * 8u + fg];
-                __half bh3 = vh[(kb + ft * 2u + 9u) * LDQ + nt * 8u + fg];
+            for (uint32_t nt = 0; nt < NFRAG; nt++) {
                 unsigned bb[2];
-                bb[0] = ((unsigned)__half_as_ushort(bh1) << 16) | __half_as_ushort(bh0);
-                bb[1] = ((unsigned)__half_as_ushort(bh3) << 16) | __half_as_ushort(bh2);
+                gqa_ldm_x2t(bb, gqa_smem_u32(
+                        &vh[(kb + ((lane >> 3u) & 1u) * 8u + (lane & 7u)) * LDQ
+                            + nt * 8u]));
                 gqa_mma_f16(oacc[nt], a, bb);
             }
         }
-        __syncthreads();
     }
 
-    /* epilogue: sinks fold into the denominator, then O /= den, store */
-    if (tid < TQ) {
-        float mq = m_s[tid], dq = den_s[tid];
-        float cr = 1.0f;
-        if (sinks) {
-            const float svk = sinks[h];
-            if (svk > mq) {
-                cr = expf(mq - svk);
-                dq = dq * cr + 1.0f;
-            } else {
-                dq += expf(svk - mq);
-            }
-        }
-        corr_s[tid] = cr;
-        den_s[tid] = dq;
+    /* epilogue: sinks fold into the denominator per row (all in
+     * registers - every quad thread carries its rows' m/den), then
+     * O /= den, store */
+    float cr0 = 1.0f, dq0 = den0, cr8 = 1.0f, dq8 = den8;
+    if (sinks) {
+        const float svk = sinks[h];
+        if (svk > m0) { cr0 = expf(m0 - svk); dq0 = dq0 * cr0 + 1.0f; }
+        else dq0 += expf(svk - m0);
+        if (svk > m8) { cr8 = expf(m8 - svk); dq8 = dq8 * cr8 + 1.0f; }
+        else dq8 += expf(svk - m8);
     }
-    __syncthreads();
-    {
-        const uint32_t q0 = warp * 16u;
-        const float cr0 = corr_s[q0 + fg], dq0 = den_s[q0 + fg];
-        const float cr8 = corr_s[q0 + fg + 8u], dq8 = den_s[q0 + fg + 8u];
-        #pragma unroll
-        for (uint32_t nt = 0; nt < NFRAG; nt++) {
-            const uint32_t r0 = q0 + fg, r8 = q0 + fg + 8u;
-            const uint32_t d0 = nt * 8u + ft * 2u;
-            if (r0 < nq) {
-                float *o = out + ((uint64_t)(t0 + r0) * n_head + h) * HD;
-                o[d0] = oacc[nt][0] * cr0 / dq0;
-                o[d0 + 1u] = oacc[nt][1] * cr0 / dq0;
-            }
-            if (r8 < nq) {
-                float *o = out + ((uint64_t)(t0 + r8) * n_head + h) * HD;
-                o[d0] = oacc[nt][2] * cr8 / dq8;
-                o[d0 + 1u] = oacc[nt][3] * cr8 / dq8;
-            }
+    #pragma unroll
+    for (uint32_t nt = 0; nt < NFRAG; nt++) {
+        const uint32_t d0 = nt * 8u + ft * 2u;
+        if (live0) {
+            float *o = out + ((uint64_t)(t0 + r0) * n_head + h) * HD;
+            o[d0] = oacc[nt][0] * cr0 / dq0;
+            o[d0 + 1u] = oacc[nt][1] * cr0 / dq0;
+        }
+        if (live8) {
+            float *o = out + ((uint64_t)(t0 + r8) * n_head + h) * HD;
+            o[d0] = oacc[nt][2] * cr8 / dq8;
+            o[d0 + 1u] = oacc[nt][3] * cr8 / dq8;
         }
     }
 #endif
