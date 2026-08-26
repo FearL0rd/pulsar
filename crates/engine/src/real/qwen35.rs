@@ -15,7 +15,7 @@
 //! makes DFlash verify (16 candidate rows for the cost of a few
 //! sequential tokens) and chunked prefill work.
 
-use super::{Attn, Ffn, LayerW, MatW, Model, Result, State};
+use super::{Attn, Ffn, LayerW, MatW, Model, Q4ePleW, Qwen35W, Result, State};
 use kernels::DeviceBuf;
 
 /// Matmul over either weight encoding. `x` is the f32 input; `xq` must
@@ -28,6 +28,165 @@ fn matw(out: &mut DeviceBuf, w: &MatW, x: &DeviceBuf, xq: &DeviceBuf, in_dim: u3
     }
     Ok(())
 }
+
+/// IQ4_NL codebook (ggml kvalues_iq4nl), for the host-side PLE row gather.
+const IQ4NL_VALUES: [f32; 16] = [
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+    1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0,
+];
+
+impl Model {
+    /// qwen4exp hyper-connection read for one lane (0 = attn, 1 = ffn):
+    /// grouped norm -> low-rank silu -> sigmoid gate -> mean collapse
+    /// into st.normed, inject coefficients stashed for the combine.
+    /// Lane 0 first runs the PLE injection when this layer carries one.
+    fn q4e_pre_lane(&self, st: &mut State, rt: &mut Qwen35Rt, w: &Qwen35W, l: &LayerW, t: u32, lane: usize) -> Result {
+        let s = self.shape;
+        if lane == 0 {
+            if let Some(ple) = &w.ple {
+                self.q4e_ple(st, rt, ple, t)?;
+            }
+        }
+        let hc_dim = s.n_hc * s.n_embd;
+        let hcw = w.hc.as_ref().ok_or("qwen4exp layer without hc weights")?;
+        let lw = &hcw[lane];
+        let gamma = if lane == 0 { &l.attn_norm } else { &l.ffn_norm };
+        let q = &mut rt.sc.q4e;
+        kernels::q4e_hc_norm(&mut q.xn, &st.cur, gamma, s.n_embd, s.n_hc, t, s.rms_eps)?;
+        kernels::quantize_q8_k(&mut q.xqw, &q.xn, hc_dim, t)?;
+        matw(&mut q.lo, &lw.down, &q.xn, &q.xqw, hc_dim, s.hc_low_rank, t)?;
+        kernels::q4e_silu_scale(&mut q.lo, 1.0 / s.n_hc as f32, (t * s.hc_low_rank) as u64)?;
+        kernels::quantize_q8_k(&mut q.loq, &q.lo, s.hc_low_rank, t)?;
+        matw(&mut q.gl, &lw.up, &q.lo, &q.loq, s.hc_low_rank, hc_dim, t)?;
+        let inj = if lane == 0 { &mut q.inj0 } else { &mut q.inj1 };
+        kernels::matmul_f32(inj, &lw.inject, &q.xn, hc_dim, s.n_hc, t)?;
+        kernels::q4e_hc_collapse(&mut st.normed, &q.xn, &q.gl, s.n_embd, s.n_hc, t)?;
+        Ok(())
+    }
+
+    /// PLE injection: gated n-gram value + its dilated depthwise conv,
+    /// both added onto the wide stream. rt.sc.q4e.emb was host-gathered
+    /// for this chunk by q4e_chunk_rows.
+    fn q4e_ple(&self, st: &mut State, rt: &mut Qwen35Rt, ple: &Q4ePleW, t: u32) -> Result {
+        let s = self.shape;
+        let hc_dim = s.n_hc * s.n_embd;
+        let dil = self.ple.as_ref().map_or(3, |p| p.ngram);
+        let q = &mut rt.sc.q4e;
+        let kern = (ple.conv.bytes() / 4 / hc_dim as usize) as u32;
+        kernels::quantize_q8_k(&mut q.xqw, &q.emb, s.n_embd, t)?;
+        matw(&mut q.pk, &ple.key, &q.emb, &q.xqw, s.n_embd, hc_dim, t)?;
+        matw(&mut q.pv, &ple.value, &q.emb, &q.xqw, s.n_embd, s.n_embd, t)?;
+        kernels::q4e_hc_norm(&mut q.kn, &q.pk, &ple.norm_key, s.n_embd, s.n_hc, t, s.rms_eps)?;
+        kernels::q4e_hc_norm(&mut q.qn, &st.cur, &ple.norm_query, s.n_embd, s.n_hc, t, s.rms_eps)?;
+        kernels::q4e_ple_gate(&mut q.pcoef, &q.kn, &q.qn, s.n_embd, s.n_hc, t)?;
+        kernels::zero(&mut q.pg, (t * hc_dim) as usize * 4)?;
+        kernels::q4e_stream_scatter(&mut q.pg, &q.pv, &q.pcoef, s.n_embd, s.n_hc, t, 1)?;
+        kernels::q4e_hc_norm(&mut q.pnorm, &q.pg, &ple.norm_conv, s.n_embd, s.n_hc, t, s.rms_eps)?;
+        kernels::q4e_conv_dil(&mut q.pconv, &q.pnorm, &ple.conv, &mut q.ple_state, hc_dim, kern, dil, t)?;
+        kernels::add_assign(&mut st.cur, &q.pg, t * hc_dim)?;
+        kernels::add_assign(&mut st.cur, &q.pconv, t * hc_dim)?;
+        Ok(())
+    }
+
+    /// Final hyper-connection mixer = the output norm: identical read to
+    /// q4e_pre_lane but from st.last_row, no inject, into st.normed.
+    fn q4e_head_mix(&self, st: &mut State, rt: &mut Qwen35Rt, k: u32) -> Result {
+        let s = self.shape;
+        let hc_dim = s.n_hc * s.n_embd;
+        let (down, up) = self.hc_head.as_ref().ok_or("qwen4exp without output_hc weights")?;
+        let q = &mut rt.sc.q4e;
+        kernels::q4e_hc_norm(&mut q.xn, &st.last_row, &self.output_norm, s.n_embd, s.n_hc, k, s.rms_eps)?;
+        kernels::quantize_q8_k(&mut q.xqw, &q.xn, hc_dim, k)?;
+        matw(&mut q.lo, down, &q.xn, &q.xqw, hc_dim, s.hc_low_rank, k)?;
+        kernels::q4e_silu_scale(&mut q.lo, 1.0 / s.n_hc as f32, (k * s.hc_low_rank) as u64)?;
+        kernels::quantize_q8_k(&mut q.loq, &q.lo, s.hc_low_rank, k)?;
+        matw(&mut q.gl, up, &q.lo, &q.loq, s.hc_low_rank, hc_dim, k)?;
+        kernels::q4e_hc_collapse(&mut st.normed, &q.xn, &q.gl, s.n_embd, s.n_hc, k)?;
+        Ok(())
+    }
+
+    /// Host side of the PLE lane for one forward chunk: n-gram hash per
+    /// token (reference set_input semantics: EOS pads a fresh sequence
+    /// and cuts the window), IQ4_NL row gather from the mmapped table,
+    /// upload into rt.sc.q4e.emb. Single-sequence: history is the last
+    /// ngram-1 ids carried across calls, reset at pos 0.
+    fn q4e_chunk_rows(&self, rt: &mut Qwen35Rt, tokens: &[u32], off: usize, t: usize, pos: u32) -> Result {
+        let s = self.shape;
+        let ple = self.ple.as_ref().ok_or("qwen4exp without ple table")?;
+        let q = &mut rt.sc.q4e;
+        if pos == 0 && off == 0 {
+            q.ple_hist.clear();
+            let pb = q.ple_state.bytes();
+            kernels::zero(&mut q.ple_state, pb)?;
+        }
+        let ng = ple.ngram as usize;
+        let eos = ple.eos as u64;
+        let heads = ple.heads as usize;
+        let dim = ple.dim as usize;
+        let mut row_buf = vec![0u8; ple.row_bytes as usize];
+        for j in 0..t {
+            let a = off + j;
+            // context window: token + up to ngram-1 predecessors
+            let mut ctx = [eos; 8];
+            ctx[0] = tokens[a] as u64;
+            let mut cut = false;
+            for sdx in 1..ng {
+                ctx[sdx] = if cut {
+                    eos
+                } else if a >= sdx {
+                    tokens[a - sdx] as u64
+                } else {
+                    let back = sdx - a;
+                    if q.ple_hist.len() >= back && pos as usize + a >= sdx {
+                        q.ple_hist[q.ple_hist.len() - back] as u64
+                    } else {
+                        eos
+                    }
+                };
+                if ctx[sdx] == eos {
+                    cut = true;
+                }
+            }
+            for n in 2..=ng {
+                let mut mixed = ctx[0].wrapping_mul(ple.mults[0]);
+                for x in 1..n {
+                    mixed ^= ctx[x].wrapping_mul(ple.mults[x]);
+                }
+                let base_h = (n - 2) * ple.per_gram as usize;
+                for g in 0..ple.per_gram as usize {
+                    let h = base_h + g;
+                    let row = mixed % ple.sizes[h] + ple.offs[h];
+                    ple.file
+                        .read_exact_at(&mut row_buf, ple.base + row * ple.row_bytes)?;
+                    let out = &mut q.emb_host[j * s.n_embd as usize + h * dim..][..dim];
+                    // IQ4_NL: 32-elem blocks, f16 scale + 16 nibble bytes
+                    for (b, blk) in row_buf.chunks_exact(18).enumerate() {
+                        let d = super::requant::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                        for i in 0..16 {
+                            let byte = blk[2 + i];
+                            out[b * 32 + i] = d * IQ4NL_VALUES[(byte & 0xf) as usize];
+                            out[b * 32 + i + 16] = d * IQ4NL_VALUES[(byte >> 4) as usize];
+                        }
+                    }
+                }
+            }
+        }
+        // carry the last ngram-1 ids into the next chunk/call
+        for j in 0..t {
+            q.ple_hist.push(tokens[off + j]);
+        }
+        let keep = ng - 1;
+        if q.ple_hist.len() > keep {
+            let cut_n = q.ple_hist.len() - keep;
+            q.ple_hist.drain(..cut_n);
+        }
+        let ne = t * s.n_embd as usize;
+        q.emb.write(0, kernels::as_bytes(&q.emb_host[..ne]))?;
+        Ok(())
+    }
+}
+
+
 
 /// Verify/prefill chunk width (DFlash block size; also the register
 /// budget the batched GDN kernel was written for).
@@ -165,6 +324,32 @@ struct RtScratch {
     qfull: DeviceBuf,    // [T][2*n_head*head_dim] fused q+gate
     gate: DeviceBuf,     // [T][n_head*head_dim]
     shg: DeviceBuf,      // [T] shared-expert gate logits
+    /// qwen4exp scratch (1-float dummies elsewhere)
+    q4e: Q4eScratch,
+}
+
+/// qwen4exp hyper-connection + PLE scratch, all on the primary.
+struct Q4eScratch {
+    xn: DeviceBuf,    // [T][hc_dim] grouped-norm output
+    gl: DeviceBuf,    // [T][hc_dim] low-rank gate, pre-sigmoid
+    lo: DeviceBuf,    // [T][hc_lr]
+    loq: DeviceBuf,   // q8_k of lo
+    xqw: DeviceBuf,   // q8_k of xn
+    inj0: DeviceBuf,  // [T][n_hc] attn-lane inject coefficients
+    inj1: DeviceBuf,  // [T][n_hc] ffn-lane inject coefficients
+    emb: DeviceBuf,   // [T][n_embd] host-gathered n-gram embedding
+    pk: DeviceBuf,    // [T][hc_dim] ple key
+    pv: DeviceBuf,    // [T][n_embd] ple value
+    kn: DeviceBuf,    // [T][hc_dim] normed key
+    qn: DeviceBuf,    // [T][hc_dim] normed query (hidden)
+    pg: DeviceBuf,    // [T][hc_dim] gated value, per stream
+    pnorm: DeviceBuf, // [T][hc_dim] norm_conv output
+    pconv: DeviceBuf, // [T][hc_dim] conv+silu output
+    pcoef: DeviceBuf, // [T][n_hc] ple stream gates
+    ple_state: DeviceBuf, // [(kern-1)*dil][hc_dim] conv history ring
+    /// last ngram-1 token ids, for the host-side hash of chunk 0 tokens
+    ple_hist: Vec<u32>,
+    emb_host: Vec<f32>,
 }
 
 impl RtScratch {
@@ -191,6 +376,49 @@ impl RtScratch {
             qfull: f32s(cm * 2 * (s.n_head * s.head_dim) as usize)?,
             gate: f32s(cm * (s.n_head * s.head_dim) as usize)?,
             shg: f32s(cm)?,
+            q4e: Q4eScratch::new(s, cm)?,
+        })
+    }
+}
+
+impl Q4eScratch {
+    fn new(s: &super::Shape, cm: usize) -> Result<Q4eScratch> {
+        let f32s = |n: usize| DeviceBuf::alloc(n.max(1) * 4);
+        if !s.qwen4exp {
+            // 4-byte dummies: every other family never touches these
+            return Ok(Q4eScratch {
+                xn: f32s(0)?, gl: f32s(0)?, lo: f32s(0)?, loq: f32s(0)?,
+                xqw: f32s(0)?, inj0: f32s(0)?, inj1: f32s(0)?, emb: f32s(0)?,
+                pk: f32s(0)?, pv: f32s(0)?, kn: f32s(0)?, qn: f32s(0)?,
+                pg: f32s(0)?, pnorm: f32s(0)?, pconv: f32s(0)?, pcoef: f32s(0)?,
+                ple_state: f32s(0)?, ple_hist: Vec::new(), emb_host: Vec::new(),
+            });
+        }
+        let hc_dim = (s.n_hc * s.n_embd) as usize;
+        let q8k = |w: usize| {
+            cm * w.div_ceil(kernels::Q8_K_BLOCK_ELEMS) * kernels::Q8_K_BLOCK_BYTES
+        };
+        Ok(Q4eScratch {
+            xn: f32s(cm * hc_dim)?,
+            gl: f32s(cm * hc_dim)?,
+            lo: f32s(cm * s.hc_low_rank as usize)?,
+            loq: DeviceBuf::alloc(q8k(s.hc_low_rank as usize))?,
+            xqw: DeviceBuf::alloc(q8k(hc_dim))?,
+            inj0: f32s(cm * s.n_hc as usize)?,
+            inj1: f32s(cm * s.n_hc as usize)?,
+            emb: f32s(cm * s.n_embd as usize)?,
+            pk: f32s(cm * hc_dim)?,
+            pv: f32s(cm * s.n_embd as usize)?,
+            kn: f32s(cm * hc_dim)?,
+            qn: f32s(cm * hc_dim)?,
+            pg: f32s(cm * hc_dim)?,
+            pnorm: f32s(cm * hc_dim)?,
+            pconv: f32s(cm * hc_dim)?,
+            pcoef: f32s(cm * s.n_hc as usize)?,
+            // kernel 4, dilation = ngram 3 -> 9 history columns
+            ple_state: f32s(9 * hc_dim)?,
+            ple_hist: Vec::new(),
+            emb_host: vec![0.0; cm * s.n_embd as usize],
         })
     }
 }
@@ -1546,11 +1774,6 @@ pub(super) fn dspark_conf_threshold() -> f32 {
 
 impl Model {
     pub(super) fn forward_qwen35(&self, st: &mut State, tokens: &[u32], pos0: u32, rows: u32) -> Result<Option<Vec<f32>>> {
-        if self.shape.qwen4exp {
-            // phase 2 of the qwen4exp port (docs/qwen4exp-port-notes.md):
-            // hyper-connection residual + PLE lane not built yet
-            return Err("qwen4exp: graph not implemented yet (load/census only)".into());
-        }
         if tokens.is_empty() {
             return Err("empty batch".into());
         }
@@ -1600,7 +1823,14 @@ impl Model {
                 kernels::set_u32(&mut tb.sc.pos_b, pos)?;
                 kernels::set_device(primary)?;
             }
-            kernels::embed_q8_0_at(&mut st.cur, &self.token_embd, &st.tok, tok_off, s.n_embd, s.n_vocab, t)?;
+            if s.qwen4exp {
+                // embed one stream into scratch, replicate to n_hc copies
+                kernels::embed_q8_0_at(&mut st.attn_out, &self.token_embd, &st.tok, tok_off, s.n_embd, s.n_vocab, t)?;
+                kernels::q4e_replicate(&mut st.cur, &st.attn_out, s.n_embd, s.n_hc, t)?;
+                self.q4e_chunk_rows(rt, tokens, tok_off as usize, t as usize, pos)?;
+            } else {
+                kernels::embed_q8_0_at(&mut st.cur, &self.token_embd, &st.tok, tok_off, s.n_embd, s.n_vocab, t)?;
+            }
             self.eval_qwen35_span(st, rt, 0, n0, pos, t)?;
             let n_banks = banks.len();
             for bi in 0..n_banks {
@@ -1737,14 +1967,18 @@ impl Model {
             return Err("qwen35: rows exceeds the final chunk".into());
         }
         let k = rows;
-        let row = s.n_embd as usize * 4;
+        let row = (s.n_embd * s.stream_mult()) as usize * 4;
         kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (last_t - k) as usize * row, k as usize * row)?;
         if owe_fill {
             // the pipe deferred its final chunk's fill: cur is copied out,
             // the fill may clobber it now
             self.pipe_final_fill(st, rt, tokens, pos0)?;
         }
-        kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, s.rms_eps)?;
+        if s.qwen4exp {
+            self.q4e_head_mix(st, rt, k)?;
+        } else {
+            kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, k, s.rms_eps)?;
+        }
         if st.skip_logit_read {
             if self.head_argmax_split(st, rt, k)? {
                 return Ok(Some(Vec::new()));
@@ -2169,7 +2403,11 @@ impl Model {
             }
         }
 
-        kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, t, eps)?;
+        if s.qwen4exp {
+            self.q4e_pre_lane(st, rt, w, l, t, 0)?;
+        } else {
+            kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, t, eps)?;
+        }
         if std::env::var("PULSAR_DEBUG_L2").ok().as_deref() == Some("1") && il == 0 {
             let deep = (s.n_embd as usize / 2) * 4;
             let tail = ((t as usize - 1) * s.n_embd as usize) * 4;
@@ -2283,7 +2521,7 @@ impl Model {
                     eprintln!("  GDNb il={il} Bqkv_v {:?}", tb.sc.qkv.read_f32_at(bv, 8)?);
                 }
                 kernels::gqa_head_rms_norm(&mut tb.sc.gdn_o, Some(&bw.ssm_norm), t * vh, s.ssm_state, eps)?;
-                kernels::swiglu(&mut tb.sc.gdn_tmp, &tb.sc.z, &tb.sc.gdn_o, t * vdh, 0.0, 1.0, 0)?;
+                kernels::swiglu(&mut tb.sc.gdn_tmp, &tb.sc.z, &tb.sc.gdn_o, t * vdh, 0.0, 1.0, if s.qwen4exp { 5 } else { 0 })?;
                 if matches!(bw.ssm_out, MatW::Kq(_)) {
                     kernels::quantize_q8_k(&mut tb.sc.midq, &tb.sc.gdn_tmp, vdh, t)?;
                 }
@@ -2336,7 +2574,7 @@ impl Model {
                     rt.sc.conv_out.read_f32(2)?, rt.sc.gq.read_f32(2)?, rt.sc.gv.read_f32(2)?, rt.sc.gdn_o.read_f32(2)?);
             }
                 kernels::gqa_head_rms_norm(&mut rt.sc.gdn_o, Some(&gdn.ssm_norm), t * vh, s.ssm_state, eps)?;
-                kernels::swiglu(&mut rt.sc.gdn_tmp, &rt.sc.z, &rt.sc.gdn_o, t * vdh, 0.0, 1.0, 0)?;
+                kernels::swiglu(&mut rt.sc.gdn_tmp, &rt.sc.z, &rt.sc.gdn_o, t * vdh, 0.0, 1.0, if s.qwen4exp { 5 } else { 0 })?;
                 if matches!(gdn.ssm_out, MatW::Kq(_)) {
                     kernels::quantize_q8_k(&mut st.midq, &rt.sc.gdn_tmp, vdh, t)?;
                 }
@@ -2425,7 +2663,7 @@ impl Model {
                     rt.sc.gdn_o.read_f32_at(up, 2)?, rt.sc.gv.read_f32_at(up, 2)?);
             }
             kernels::gqa_head_rms_norm(&mut rt.sc.gdn_o, Some(&gdn.ssm_norm), t * s.ssm_v_heads, s.ssm_state, eps)?;
-            kernels::swiglu(&mut rt.sc.gdn_tmp, &rt.sc.z, &rt.sc.gdn_o, t * value_dim, 0.0, 1.0, 0)?;
+            kernels::swiglu(&mut rt.sc.gdn_tmp, &rt.sc.z, &rt.sc.gdn_o, t * value_dim, 0.0, 1.0, if s.qwen4exp { 5 } else { 0 })?;
             if matches!(gdn.ssm_out, MatW::Kq(_)) {
                 kernels::quantize_q8_k(&mut st.midq, &rt.sc.gdn_tmp, value_dim, t)?;
             }
@@ -2613,7 +2851,12 @@ impl Model {
                 st.attn_out.read_f32(2)?
             );
         }
-        kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, t * s.n_embd)?;
+        if s.qwen4exp {
+            // hyper-connection combine, in place on the wide stream
+            kernels::q4e_stream_scatter(&mut st.cur, &st.attn_out, &rt.sc.q4e.inj0, s.n_embd, s.n_hc, t, 0)?;
+        } else {
+            kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, t * s.n_embd)?;
+        }
 
         // ---- FFN (pre-norm residual)
         // PULSAR_DENSE_PROF=1: sync-bracketed phase totals (attn+GDN into
@@ -2626,7 +2869,11 @@ impl Model {
             st.prof.sync += mark.elapsed();
             mark = std::time::Instant::now();
         }
-        kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, t, eps)?;
+        if s.qwen4exp {
+            self.q4e_pre_lane(st, rt, w, l, t, 1)?;
+        } else {
+            kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, t, eps)?;
+        }
         if let Ffn::DenseKq { gate, up, down } = &l.ffn {
             let tp = self.tp.as_ref().and_then(|tp| {
                 tp.layers
@@ -2697,7 +2944,11 @@ impl Model {
                     c.sc.lo.recv(&mut c.sc.recv, t as usize * s.n_embd as usize * 4)?;
                     kernels::add_assign(&mut st.ffn_out, &c.sc.recv, t * s.n_embd)?;
                 }
-                kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
+                if s.qwen4exp {
+            kernels::q4e_stream_scatter(&mut st.cur, &st.ffn_out, &rt.sc.q4e.inj1, s.n_embd, s.n_hc, t, 0)?;
+        } else {
+            kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
+        }
                 if prof {
                     kernels::sync()?;
                     st.prof.resolve += mark.elapsed();
@@ -2711,7 +2962,11 @@ impl Model {
             kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * s.n_ff_exp, 0.0, 1.0, 0)?;
             kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, s.n_ff_exp, t)?;
             kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, s.n_ff_exp, s.n_embd, t, down.row_bytes, down.quant)?;
+            if s.qwen4exp {
+            kernels::q4e_stream_scatter(&mut st.cur, &st.ffn_out, &rt.sc.q4e.inj1, s.n_embd, s.n_hc, t, 0)?;
+        } else {
             kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
+        }
             if prof {
                 kernels::sync()?;
                 st.prof.resolve += mark.elapsed();
@@ -2727,7 +2982,11 @@ impl Model {
             kernels::matmul_q8_0(&mut st.up_act, up, &st.normed, s.n_embd, s.n_ff_exp, t)?;
             kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * s.n_ff_exp, 0.0, 1.0, 0)?;
             kernels::matmul_q8_0(&mut st.ffn_out, down, &st.ffn_mid, s.n_ff_exp, s.n_embd, t)?;
+            if s.qwen4exp {
+            kernels::q4e_stream_scatter(&mut st.cur, &st.ffn_out, &rt.sc.q4e.inj1, s.n_embd, s.n_hc, t, 0)?;
+        } else {
             kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
+        }
             return Ok(());
         }
         let Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, .. } = &l.ffn else {
@@ -2761,7 +3020,11 @@ impl Model {
         let selected = st.router_selected.read_i32((t * s.n_expert_used) as usize)?;
         self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 0, t, s.n_embd)?;
         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, t * s.n_embd)?;
-        kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
+        if s.qwen4exp {
+            kernels::q4e_stream_scatter(&mut st.cur, &st.ffn_out, &rt.sc.q4e.inj1, s.n_embd, s.n_hc, t, 0)?;
+        } else {
+            kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
+        }
         Ok(())
     }
 }

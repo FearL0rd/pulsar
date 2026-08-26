@@ -147,6 +147,7 @@ mod real {
         pub full_attn_interval: u32,
         // qwen4exp (zero/false elsewhere): hyper-connections + PLE
         pub qwen4exp: bool,
+        // (stream_mult() on the impl: n_hc residual copies when qwen4exp)
         pub hc_low_rank: u32,
         /// per-layer n-gram input width (embedding_length_per_layer_input)
         pub ple_dim: u32,
@@ -231,6 +232,12 @@ mod real {
         /// Resolve a parsed gguf header into a Shape. Public so config
         /// parsing for a new architecture can be checked against the real
         /// file (see examples/k3-shape.rs) before its weights exist.
+        /// Residual-stream width multiplier: qwen4exp carries n_hc
+        /// hyper-connection copies; every other family carries one.
+        pub fn stream_mult(&self) -> u32 {
+            if self.qwen4exp { self.n_hc } else { 1 }
+        }
+
         pub fn from_gguf(g: &Gguf) -> Result<Shape> {
             let u = |k: &str| -> Result<u32> {
                 Ok(g.arch_meta(k).and_then(Value::as_u64).ok_or_else(|| meta_err(k))? as u32)
@@ -1051,6 +1058,9 @@ mod real {
         /// qwen4exp final hyper-connection mixer (down, up): the model
         /// has no output_norm tensor - output_norm holds its gamma.
         hc_head: Option<(MatW, MatW)>,
+        /// qwen4exp n-gram table: host-side row gather from the (26.8
+        /// GiB) per_layer_token_embd tensor, never uploaded.
+        pub(crate) ple: Option<PleTable>,
         /// K3 AttnRes: the score vector for the final mix before the head
         output_res_score: Option<DeviceBuf>,
         output: DeviceBuf,
@@ -2381,7 +2391,7 @@ mod real {
     /// top of values already coarsened to 2-6 bits), so one-time host
     /// conversion beats porting five dense matmul variants. Experts are
     /// untouched (they stream from disk and have native kernels).
-    mod requant {
+    pub(crate) mod requant {
         pub fn f16_to_f32(h: u16) -> f32 {
             let s = ((h >> 15) & 1) as u32;
             let e = ((h >> 10) & 0x1f) as u32;
@@ -2556,6 +2566,27 @@ mod real {
     /// same space the merged Gguf's tensor offsets live in).
     pub struct VFile {
         files: Vec<(u64, File)>,
+    }
+
+    /// qwen4exp PLE: everything the host-side n-gram row gather needs.
+    /// Hash (reference set_input): mixed = ctx0*m0 ^ ctx1*m1 [^ ctx2*m2],
+    /// head h = (n-2)*heads_per_ngram + g reads row mixed % sizes[h] +
+    /// offs[h]. EOS pads/cuts the context window.
+    pub(crate) struct PleTable {
+        pub file: VFile,
+        /// absolute byte offset of row 0 (data_offset + tensor offset)
+        pub base: u64,
+        pub row_bytes: u64,
+        #[allow(dead_code)]
+        pub ty: TensorType,
+        pub dim: u32,      // 160 = embedding_length_per_layer_input
+        pub heads: u32,    // 16 = (ngram-1)*heads_per_ngram
+        pub ngram: u32,    // 3
+        pub per_gram: u32, // 8
+        pub eos: u32,
+        pub mults: Vec<u64>,
+        pub offs: Vec<u64>,
+        pub sizes: Vec<u64>,
     }
 
     impl VFile {
@@ -3116,6 +3147,47 @@ mod real {
                     MatW::load(&file, &gguf, "output_hc_down.weight")?,
                     MatW::load(&file, &gguf, "output_hc_up.weight")?,
                 ))
+            } else {
+                None
+            };
+            let ple = if shape.qwen4exp {
+                let t = gguf
+                    .tensor("per_layer_token_embd.weight")
+                    .ok_or_else(|| meta_err("per_layer_token_embd.weight"))?
+                    .clone();
+                let (blk, bytes) = t
+                    .ty
+                    .block_layout()
+                    .ok_or_else(|| meta_err("per_layer_token_embd: unknown type layout"))?;
+                let mu = |k: &str| -> Result<u64> {
+                    gguf.arch_meta(k)
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| meta_err(k))
+                };
+                let arr = |k: &str| -> Result<Vec<u64>> {
+                    match gguf.arch_meta(k) {
+                        Some(Value::Array(a)) => {
+                            Ok(a.iter().map(|v| v.as_u64().unwrap_or(0)).collect())
+                        }
+                        _ => Err(meta_err(k)),
+                    }
+                };
+                let ngram = mu("ple.ngram_size")? as u32;
+                let per_gram = mu("ple.heads_per_ngram")? as u32;
+                Some(PleTable {
+                    file: VFile::open(&shards)?,
+                    base: gguf.data_offset + t.offset,
+                    row_bytes: (t.dims[0] / blk) * bytes,
+                    ty: t.ty,
+                    dim: t.dims[0] as u32,
+                    heads: (ngram - 1) * per_gram,
+                    ngram,
+                    per_gram,
+                    eos: mu("ple.eos_token_id")? as u32,
+                    mults: arr("ple.layer_multipliers")?,
+                    offs: arr("ple.head_offsets")?,
+                    sizes: arr("ple.head_vocab_sizes")?,
+                })
             } else {
                 None
             };
@@ -4965,6 +5037,7 @@ mod real {
                 token_embd,
                 output_norm,
                 hc_head,
+                ple,
                 output_res_score,
                 output,
                 layers,
@@ -6985,8 +7058,8 @@ mod real {
                 spec_rows,
                 tok: DeviceBuf::alloc(mb as usize * 4)?,
                 // spec verify reads depth+1 trailing rows (MTP or n-gram)
-                last_row: f32s((spec_rows) * s.n_embd)?,
-                cur: f32s(mb * s.n_embd)?,
+                last_row: f32s((spec_rows) * s.n_embd * s.stream_mult())?,
+                cur: f32s(mb * s.n_embd * s.stream_mult())?,
                 normed: f32s(mb * s.n_embd)?,
                 q,
                 k: kbuf,
@@ -7499,7 +7572,7 @@ mod real {
         /// draft-feature drift after a reuse costs accept rate only,
         /// never output correctness (the target model verifies).
         pub fn spec_safe_prefix_cache(&self) -> bool {
-            self.shape.family == Family::Qwen35
+            self.shape.family == Family::Qwen35 && !self.shape.qwen4exp
         }
 
         pub fn recurrent_state(&self) -> bool {
