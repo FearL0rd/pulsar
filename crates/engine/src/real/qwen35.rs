@@ -1546,6 +1546,11 @@ pub(super) fn dspark_conf_threshold() -> f32 {
 
 impl Model {
     pub(super) fn forward_qwen35(&self, st: &mut State, tokens: &[u32], pos0: u32, rows: u32) -> Result<Option<Vec<f32>>> {
+        if self.shape.qwen4exp {
+            // phase 2 of the qwen4exp port (docs/qwen4exp-port-notes.md):
+            // hyper-connection residual + PLE lane not built yet
+            return Err("qwen4exp: graph not implemented yet (load/census only)".into());
+        }
         if tokens.is_empty() {
             return Err("empty batch".into());
         }

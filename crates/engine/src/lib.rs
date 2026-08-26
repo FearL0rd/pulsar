@@ -145,6 +145,11 @@ mod real {
         pub ssm_v_heads: u32,
         pub ssm_inner: u32,
         pub full_attn_interval: u32,
+        // qwen4exp (zero/false elsewhere): hyper-connections + PLE
+        pub qwen4exp: bool,
+        pub hc_low_rank: u32,
+        /// per-layer n-gram input width (embedding_length_per_layer_input)
+        pub ple_dim: u32,
         /// SwiGLU clamp for routed AND shared experts (10.0 on V4;
         /// the per-layer metadata array is constant per model)
         pub clamp_exp: f32,
@@ -274,10 +279,15 @@ mod real {
                 Some("qwen35") => Family::Qwen35,
                 // Kimi-K3 2.8T: hybrid KDA/MLA + AttnRes + latent MoE
                 Some("kimi-k3") => Family::K3,
+                // Qwen3.8-Flash-Next 180B-A6B (task: qwen4exp port notes):
+                // qwen35moe skeleton + hyper-connections + PLE n-gram
+                // embeddings + QSA indexer; GDN output gate is sigmoid
+                Some("qwen4exp") => Family::Qwen35,
                 other => return Err(format!("unsupported architecture {other:?}").into()),
             };
             let inkling = g.architecture() == Some("inkling");
             let qwen35_dense = g.architecture() == Some("qwen35");
+            let qwen4exp = g.architecture() == Some("qwen4exp");
             let n_layer = u("block_count")?;
             // deepseek4 ships its MTP block as a SEPARATE gguf: the main
             // file's nextn_predict_layers=1 does not shrink block_count
@@ -415,6 +425,9 @@ mod real {
                 ssm_v_heads: 0,
                 ssm_inner: 0,
                 full_attn_interval: 0,
+                qwen4exp: false,
+                hc_low_rank: 0,
+                ple_dim: 0,
                 kda_head_dim: 0,
                 kda_gate_lb: 0.0,
                 n_expert_latent: 0,
@@ -479,6 +492,15 @@ mod real {
                 s.ssm_v_heads = u("ssm.time_step_rank").unwrap_or(32);
                 s.ssm_inner = u("ssm.inner_size").unwrap_or(4096);
                 s.full_attn_interval = u("full_attention_interval").unwrap_or(4);
+                if qwen4exp {
+                    s.qwen4exp = true;
+                    s.n_hc = u("hyper_connection.count")?;
+                    s.hc_low_rank = u("hyper_connection.low_rank")?;
+                    s.ple_dim = u("embedding_length_per_layer_input")?;
+                    s.n_idx_head = u("attention.indexer.head_count").unwrap_or(0);
+                    s.n_idx_dim = u("attention.indexer.key_length").unwrap_or(0);
+                    s.n_idx_topk = u("attention.indexer.top_k").unwrap_or(0);
+                }
             }
             if family == Family::K3 {
                 // MLA half: identical shape to the deepseek2/GLM lineage,
@@ -3053,7 +3075,13 @@ mod real {
                     DeviceBuf::from_bytes(&bytes)?
                 }
             };
-            let output_norm = upload(&file, &gguf, "output_norm.weight")?;
+            let output_norm = if shape.qwen4exp {
+                // no output_norm tensor: the final hyper-connection mixer
+                // is the output norm (output_hc_{norm,down,up})
+                upload(&file, &gguf, "output_hc_norm.weight")?
+            } else {
+                upload(&file, &gguf, "output_norm.weight")?
+            };
             // K3 mixes the banked AttnRes checkpoints one last time before
             // the head; absent on every other family.
             let output_res_score = if gguf.tensor("output_res_score.weight").is_some() {
@@ -4625,7 +4653,11 @@ mod real {
                     None
                 };
                 Ok(LayerW {
-                    attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
+                    attn_norm: if shape.qwen4exp {
+                        upload(&file, &gguf, &t("hc_attn_norm.weight"))?
+                    } else {
+                        upload(&file, &gguf, &t("attn_norm.weight"))?
+                    },
                     attn,
                     attn_output,
                     // presence decided by the file, so an arch that grows
@@ -4641,7 +4673,9 @@ mod real {
                         None
                     },
                     // qwen35 calls the pre-FFN norm post_attention_norm
-                    ffn_norm: if gguf.tensor(&t("ffn_norm.weight")).is_some() {
+                    ffn_norm: if shape.qwen4exp {
+                        upload(&file, &gguf, &t("hc_ffn_norm.weight"))?
+                    } else if gguf.tensor(&t("ffn_norm.weight")).is_some() {
                         upload(&file, &gguf, &t("ffn_norm.weight"))?
                     } else {
                         upload(&file, &gguf, &t("post_attention_norm.weight"))?
