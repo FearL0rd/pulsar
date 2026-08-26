@@ -877,6 +877,32 @@ mod real {
         gdn: Option<Qwen35Gdn>,
         /// shared-expert scalar gate weight, f32 [n_embd -> 1]
         shexp_gate: DeviceBuf,
+        /// qwen4exp hyper-connection lanes (attn, ffn); None elsewhere.
+        /// The lane NORM gammas live in LayerW.attn_norm / ffn_norm.
+        hc: Option<Box<[Q4eHcLane; 2]>>,
+        /// qwen4exp PLE mixer, on ple.layers only (blk.1)
+        ple: Option<Box<Q4ePleW>>,
+    }
+
+    /// One qwen4exp hyper-connection lane: read = grouped-rms (gamma in
+    /// LayerW) -> silu(down/hc) -> sigmoid(up) gate -> mean collapse;
+    /// write = 2*sigmoid(inject/hc)-scaled scatter.
+    struct Q4eHcLane {
+        down: MatW,   // [hc_dim -> hc_lr]
+        up: MatW,     // [hc_lr -> hc_dim]
+        inject: DeviceBuf, // f32 [hc_dim][n_hc]
+    }
+
+    /// qwen4exp per-layer-embedding mixer (blk.1): key/value over the
+    /// gathered n-gram rows, three grouped-norm gammas, dilated
+    /// depthwise conv (kernel 4, dilation ple_ngram = 3).
+    struct Q4ePleW {
+        key: MatW,    // [n_embd -> hc_dim]
+        value: MatW,  // [n_embd -> n_embd]
+        norm_key: DeviceBuf,
+        norm_query: DeviceBuf,
+        norm_conv: DeviceBuf,
+        conv: DeviceBuf, // f32 [hc_dim][kern]
     }
 
     /// Full-attention layer (every full_attn_interval-th): the q
@@ -1022,6 +1048,9 @@ mod real {
         pub gguf: Gguf,
         token_embd: DeviceBuf,
         output_norm: DeviceBuf,
+        /// qwen4exp final hyper-connection mixer (down, up): the model
+        /// has no output_norm tensor - output_norm holds its gamma.
+        hc_head: Option<(MatW, MatW)>,
         /// K3 AttnRes: the score vector for the final mix before the head
         output_res_score: Option<DeviceBuf>,
         output: DeviceBuf,
@@ -3082,6 +3111,14 @@ mod real {
             } else {
                 upload(&file, &gguf, "output_norm.weight")?
             };
+            let hc_head = if shape.qwen4exp {
+                Some((
+                    MatW::load(&file, &gguf, "output_hc_down.weight")?,
+                    MatW::load(&file, &gguf, "output_hc_up.weight")?,
+                ))
+            } else {
+                None
+            };
             // K3 mixes the banked AttnRes checkpoints one last time before
             // the head; absent on every other family.
             let output_res_score = if gguf.tensor("output_res_score.weight").is_some() {
@@ -4553,6 +4590,30 @@ mod real {
                             } else {
                                 DeviceBuf::alloc(4)?
                             },
+                            hc: if shape.qwen4exp {
+                                let lane = |k: &str| -> Result<Q4eHcLane> {
+                                    Ok(Q4eHcLane {
+                                        down: MatW::load(&file, &gguf, &t(&format!("hc_{k}_down.weight")))?,
+                                        up: MatW::load(&file, &gguf, &t(&format!("hc_{k}_up.weight")))?,
+                                        inject: upload_as_f32(&file, &gguf, &t(&format!("hc_{k}_inject.weight")))?,
+                                    })
+                                };
+                                Some(Box::new([lane("attn")?, lane("ffn")?]))
+                            } else {
+                                None
+                            },
+                            ple: if shape.qwen4exp && gguf.tensor(&t("ple_key.weight")).is_some() {
+                                Some(Box::new(Q4ePleW {
+                                    key: MatW::load(&file, &gguf, &t("ple_key.weight"))?,
+                                    value: MatW::load(&file, &gguf, &t("ple_value.weight"))?,
+                                    norm_key: upload(&file, &gguf, &t("ple_norm_key.weight"))?,
+                                    norm_query: upload(&file, &gguf, &t("ple_norm_query.weight"))?,
+                                    norm_conv: upload(&file, &gguf, &t("ple_norm_conv.weight"))?,
+                                    conv: upload_as_f32(&file, &gguf, &t("ple_conv1d.weight"))?,
+                                }))
+                            } else {
+                                None
+                            },
                         }))
                     }
                 };
@@ -4903,6 +4964,7 @@ mod real {
                 gguf,
                 token_embd,
                 output_norm,
+                hc_head,
                 output_res_score,
                 output,
                 layers,
