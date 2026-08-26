@@ -151,6 +151,12 @@ mod real {
         pub ssm_v_heads: u32,
         pub ssm_inner: u32,
         pub full_attn_interval: u32,
+        // qwen4exp (zero/false elsewhere): hyper-connections + PLE
+        pub qwen4exp: bool,
+        // (stream_mult() on the impl: n_hc residual copies when qwen4exp)
+        pub hc_low_rank: u32,
+        /// per-layer n-gram input width (embedding_length_per_layer_input)
+        pub ple_dim: u32,
         /// SwiGLU clamp for routed AND shared experts (10.0 on V4;
         /// the per-layer metadata array is constant per model)
         pub clamp_exp: f32,
@@ -232,6 +238,12 @@ mod real {
         /// Resolve a parsed gguf header into a Shape. Public so config
         /// parsing for a new architecture can be checked against the real
         /// file (see examples/k3-shape.rs) before its weights exist.
+        /// Residual-stream width multiplier: qwen4exp carries n_hc
+        /// hyper-connection copies; every other family carries one.
+        pub fn stream_mult(&self) -> u32 {
+            if self.qwen4exp { self.n_hc } else { 1 }
+        }
+
         pub fn from_gguf(g: &Gguf) -> Result<Shape> {
             let u = |k: &str| -> Result<u32> {
                 Ok(g.arch_meta(k).and_then(Value::as_u64).ok_or_else(|| meta_err(k))? as u32)
@@ -280,10 +292,15 @@ mod real {
                 Some("qwen35") => Family::Qwen35,
                 // Kimi-K3 2.8T: hybrid KDA/MLA + AttnRes + latent MoE
                 Some("kimi-k3") => Family::K3,
+                // Qwen3.8-Flash-Next 180B-A6B (task: qwen4exp port notes):
+                // qwen35moe skeleton + hyper-connections + PLE n-gram
+                // embeddings + QSA indexer; GDN output gate is sigmoid
+                Some("qwen4exp") => Family::Qwen35,
                 other => return Err(format!("unsupported architecture {other:?}").into()),
             };
             let inkling = g.architecture() == Some("inkling");
             let qwen35_dense = g.architecture() == Some("qwen35");
+            let qwen4exp = g.architecture() == Some("qwen4exp");
             let n_layer = u("block_count")?;
             // deepseek4 ships its MTP block as a SEPARATE gguf: the main
             // file's nextn_predict_layers=1 does not shrink block_count
@@ -421,6 +438,9 @@ mod real {
                 ssm_v_heads: 0,
                 ssm_inner: 0,
                 full_attn_interval: 0,
+                qwen4exp: false,
+                hc_low_rank: 0,
+                ple_dim: 0,
                 kda_head_dim: 0,
                 kda_gate_lb: 0.0,
                 n_expert_latent: 0,
@@ -485,6 +505,15 @@ mod real {
                 s.ssm_v_heads = u("ssm.time_step_rank").unwrap_or(32);
                 s.ssm_inner = u("ssm.inner_size").unwrap_or(4096);
                 s.full_attn_interval = u("full_attention_interval").unwrap_or(4);
+                if qwen4exp {
+                    s.qwen4exp = true;
+                    s.n_hc = u("hyper_connection.count")?;
+                    s.hc_low_rank = u("hyper_connection.low_rank")?;
+                    s.ple_dim = u("embedding_length_per_layer_input")?;
+                    s.n_idx_head = u("attention.indexer.head_count").unwrap_or(0);
+                    s.n_idx_dim = u("attention.indexer.key_length").unwrap_or(0);
+                    s.n_idx_topk = u("attention.indexer.top_k").unwrap_or(0);
+                }
             }
             if family == Family::K3 {
                 // MLA half: identical shape to the deepseek2/GLM lineage,
@@ -861,6 +890,32 @@ mod real {
         gdn: Option<Qwen35Gdn>,
         /// shared-expert scalar gate weight, f32 [n_embd -> 1]
         shexp_gate: DeviceBuf,
+        /// qwen4exp hyper-connection lanes (attn, ffn); None elsewhere.
+        /// The lane NORM gammas live in LayerW.attn_norm / ffn_norm.
+        hc: Option<Box<[Q4eHcLane; 2]>>,
+        /// qwen4exp PLE mixer, on ple.layers only (blk.1)
+        ple: Option<Box<Q4ePleW>>,
+    }
+
+    /// One qwen4exp hyper-connection lane: read = grouped-rms (gamma in
+    /// LayerW) -> silu(down/hc) -> sigmoid(up) gate -> mean collapse;
+    /// write = 2*sigmoid(inject/hc)-scaled scatter.
+    struct Q4eHcLane {
+        down: MatW,   // [hc_dim -> hc_lr]
+        up: MatW,     // [hc_lr -> hc_dim]
+        inject: DeviceBuf, // f32 [hc_dim][n_hc]
+    }
+
+    /// qwen4exp per-layer-embedding mixer (blk.1): key/value over the
+    /// gathered n-gram rows, three grouped-norm gammas, dilated
+    /// depthwise conv (kernel 4, dilation ple_ngram = 3).
+    struct Q4ePleW {
+        key: MatW,    // [n_embd -> hc_dim]
+        value: MatW,  // [n_embd -> n_embd]
+        norm_key: DeviceBuf,
+        norm_query: DeviceBuf,
+        norm_conv: DeviceBuf,
+        conv: DeviceBuf, // f32 [hc_dim][kern]
     }
 
     /// Full-attention layer (every full_attn_interval-th): the q
@@ -1006,6 +1061,12 @@ mod real {
         pub gguf: Gguf,
         token_embd: DeviceBuf,
         output_norm: DeviceBuf,
+        /// qwen4exp final hyper-connection mixer (down, up): the model
+        /// has no output_norm tensor - output_norm holds its gamma.
+        hc_head: Option<(MatW, MatW)>,
+        /// qwen4exp n-gram table: host-side row gather from the (26.8
+        /// GiB) per_layer_token_embd tensor, never uploaded.
+        pub(crate) ple: Option<PleTable>,
         /// K3 AttnRes: the score vector for the final mix before the head
         output_res_score: Option<DeviceBuf>,
         output: DeviceBuf,
@@ -2475,7 +2536,7 @@ mod real {
     /// top of values already coarsened to 2-6 bits), so one-time host
     /// conversion beats porting five dense matmul variants. Experts are
     /// untouched (they stream from disk and have native kernels).
-    mod requant {
+    pub(crate) mod requant {
         pub fn f16_to_f32(h: u16) -> f32 {
             let s = ((h >> 15) & 1) as u32;
             let e = ((h >> 10) & 0x1f) as u32;
@@ -2650,6 +2711,27 @@ mod real {
     /// same space the merged Gguf's tensor offsets live in).
     pub struct VFile {
         files: Vec<(u64, File)>,
+    }
+
+    /// qwen4exp PLE: everything the host-side n-gram row gather needs.
+    /// Hash (reference set_input): mixed = ctx0*m0 ^ ctx1*m1 [^ ctx2*m2],
+    /// head h = (n-2)*heads_per_ngram + g reads row mixed % sizes[h] +
+    /// offs[h]. EOS pads/cuts the context window.
+    pub(crate) struct PleTable {
+        pub file: VFile,
+        /// absolute byte offset of row 0 (data_offset + tensor offset)
+        pub base: u64,
+        pub row_bytes: u64,
+        #[allow(dead_code)]
+        pub ty: TensorType,
+        pub dim: u32,      // 160 = embedding_length_per_layer_input
+        pub heads: u32,    // 16 = (ngram-1)*heads_per_ngram
+        pub ngram: u32,    // 3
+        pub per_gram: u32, // 8
+        pub eos: u32,
+        pub mults: Vec<u64>,
+        pub offs: Vec<u64>,
+        pub sizes: Vec<u64>,
     }
 
     impl VFile {
@@ -3198,7 +3280,62 @@ mod real {
                     DeviceBuf::from_bytes(&bytes)?
                 }
             };
-            let output_norm = upload(&file, &gguf, "output_norm.weight")?;
+            let output_norm = if shape.qwen4exp {
+                // no output_norm tensor: the final hyper-connection mixer
+                // is the output norm (output_hc_{norm,down,up})
+                upload(&file, &gguf, "output_hc_norm.weight")?
+            } else {
+                upload(&file, &gguf, "output_norm.weight")?
+            };
+            let hc_head = if shape.qwen4exp {
+                Some((
+                    MatW::load(&file, &gguf, "output_hc_down.weight")?,
+                    MatW::load(&file, &gguf, "output_hc_up.weight")?,
+                ))
+            } else {
+                None
+            };
+            let ple = if shape.qwen4exp {
+                let t = gguf
+                    .tensor("per_layer_token_embd.weight")
+                    .ok_or_else(|| meta_err("per_layer_token_embd.weight"))?
+                    .clone();
+                let (blk, bytes) = t
+                    .ty
+                    .block_layout()
+                    .ok_or_else(|| meta_err("per_layer_token_embd: unknown type layout"))?;
+                let mu = |k: &str| -> Result<u64> {
+                    gguf.arch_meta(k)
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| meta_err(k))
+                };
+                let arr = |k: &str| -> Result<Vec<u64>> {
+                    match gguf.arch_meta(k) {
+                        Some(Value::Array(a)) => {
+                            Ok(a.iter().map(|v| v.as_u64().unwrap_or(0)).collect())
+                        }
+                        _ => Err(meta_err(k)),
+                    }
+                };
+                let ngram = mu("ple.ngram_size")? as u32;
+                let per_gram = mu("ple.heads_per_ngram")? as u32;
+                Some(PleTable {
+                    file: VFile::open(&shards)?,
+                    base: gguf.data_offset + t.offset,
+                    row_bytes: (t.dims[0] / blk) * bytes,
+                    ty: t.ty,
+                    dim: t.dims[0] as u32,
+                    heads: (ngram - 1) * per_gram,
+                    ngram,
+                    per_gram,
+                    eos: mu("ple.eos_token_id")? as u32,
+                    mults: arr("ple.layer_multipliers")?,
+                    offs: arr("ple.head_offsets")?,
+                    sizes: arr("ple.head_vocab_sizes")?,
+                })
+            } else {
+                None
+            };
             // K3 mixes the banked AttnRes checkpoints one last time before
             // the head; absent on every other family.
             let output_res_score = if gguf.tensor("output_res_score.weight").is_some() {
@@ -4670,6 +4807,30 @@ mod real {
                             } else {
                                 DeviceBuf::alloc(4)?
                             },
+                            hc: if shape.qwen4exp {
+                                let lane = |k: &str| -> Result<Q4eHcLane> {
+                                    Ok(Q4eHcLane {
+                                        down: MatW::load(&file, &gguf, &t(&format!("hc_{k}_down.weight")))?,
+                                        up: MatW::load(&file, &gguf, &t(&format!("hc_{k}_up.weight")))?,
+                                        inject: upload_as_f32(&file, &gguf, &t(&format!("hc_{k}_inject.weight")))?,
+                                    })
+                                };
+                                Some(Box::new([lane("attn")?, lane("ffn")?]))
+                            } else {
+                                None
+                            },
+                            ple: if shape.qwen4exp && gguf.tensor(&t("ple_key.weight")).is_some() {
+                                Some(Box::new(Q4ePleW {
+                                    key: MatW::load(&file, &gguf, &t("ple_key.weight"))?,
+                                    value: MatW::load(&file, &gguf, &t("ple_value.weight"))?,
+                                    norm_key: upload(&file, &gguf, &t("ple_norm_key.weight"))?,
+                                    norm_query: upload(&file, &gguf, &t("ple_norm_query.weight"))?,
+                                    norm_conv: upload(&file, &gguf, &t("ple_norm_conv.weight"))?,
+                                    conv: upload_as_f32(&file, &gguf, &t("ple_conv1d.weight"))?,
+                                }))
+                            } else {
+                                None
+                            },
                         }))
                     }
                 };
@@ -4770,7 +4931,11 @@ mod real {
                     None
                 };
                 Ok(LayerW {
-                    attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
+                    attn_norm: if shape.qwen4exp {
+                        upload(&file, &gguf, &t("hc_attn_norm.weight"))?
+                    } else {
+                        upload(&file, &gguf, &t("attn_norm.weight"))?
+                    },
                     attn,
                     attn_output,
                     // presence decided by the file, so an arch that grows
@@ -4786,7 +4951,9 @@ mod real {
                         None
                     },
                     // qwen35 calls the pre-FFN norm post_attention_norm
-                    ffn_norm: if gguf.tensor(&t("ffn_norm.weight")).is_some() {
+                    ffn_norm: if shape.qwen4exp {
+                        upload(&file, &gguf, &t("hc_ffn_norm.weight"))?
+                    } else if gguf.tensor(&t("ffn_norm.weight")).is_some() {
                         upload(&file, &gguf, &t("ffn_norm.weight"))?
                     } else {
                         upload(&file, &gguf, &t("post_attention_norm.weight"))?
@@ -5014,6 +5181,8 @@ mod real {
                 gguf,
                 token_embd,
                 output_norm,
+                hc_head,
+                ple,
                 output_res_score,
                 output,
                 layers,
@@ -7034,8 +7203,8 @@ mod real {
                 spec_rows,
                 tok: DeviceBuf::alloc(mb as usize * 4)?,
                 // spec verify reads depth+1 trailing rows (MTP or n-gram)
-                last_row: f32s((spec_rows) * s.n_embd)?,
-                cur: f32s(mb * s.n_embd)?,
+                last_row: f32s((spec_rows) * s.n_embd * s.stream_mult())?,
+                cur: f32s(mb * s.n_embd * s.stream_mult())?,
                 normed: f32s(mb * s.n_embd)?,
                 q,
                 k: kbuf,
@@ -7548,7 +7717,7 @@ mod real {
         /// draft-feature drift after a reuse costs accept rate only,
         /// never output correctness (the target model verifies).
         pub fn spec_safe_prefix_cache(&self) -> bool {
-            self.shape.family == Family::Qwen35
+            self.shape.family == Family::Qwen35 && !self.shape.qwen4exp
         }
 
         pub fn recurrent_state(&self) -> bool {
