@@ -137,6 +137,10 @@ __device__ __forceinline__ static float pulsar_glu(float g, float u, uint32_t op
         u = fminf(fmaxf(u, -10.0f), 10.0f);
         return g / (1.0f + expf(-g)) * u;
     }
+    if (op == 5u) {
+        /* qwen4exp GDN output gate: plain sigmoid, no clamp */
+        return u / (1.0f + expf(-g));
+    }
     if (op == 4u) {
         const float b1 = 4.0f, b2 = 25.0f;
         const float a = b1 * tanhf(g / b1) / (1.0f + expf(-g));
@@ -7561,6 +7565,7 @@ extern "C" int pulsar_mla_selftest(void) {
 #include "dsv4_kernels.inc"
 #include "qwen35_kernels.inc"
 #include "k3_kernels.inc"
+#include "qwen4exp_kernels.inc"
 
 /* ---- bf16 staging for TP hops -------------------------------------
  * Consumer GeForce cards have no P2P, so every tensor-parallel hop is
