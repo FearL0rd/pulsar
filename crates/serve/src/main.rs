@@ -624,24 +624,31 @@ fn run() -> engine::Result {
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("");
-                    // A split model lives in its own directory, so the
-                    // listing has to look one level down - and when the
-                    // CURRENT model is one of those, one level up as well,
-                    // or switching back to a top-level model is impossible.
-                    let base = dir
-                        .parent()
-                        .filter(|p| has_gguf(p))
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| dir.clone());
+                    // A split model lives in its own directory (often a
+                    // quant subdir of a model dir), so root the listing at
+                    // models_base and scan two levels deep - otherwise a
+                    // nested split model lists only itself and the webui
+                    // hides the selector entirely.
+                    let base = models_base(&dir);
+                    let subdirs: Vec<std::path::PathBuf> = std::fs::read_dir(&base)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| p.is_dir())
+                        .collect();
                     let mut scan = vec![base.clone()];
-                    scan.extend(
-                        std::fs::read_dir(&base)
-                            .into_iter()
-                            .flatten()
-                            .flatten()
-                            .map(|e| e.path())
-                            .filter(|p| p.is_dir()),
-                    );
+                    for d in &subdirs {
+                        scan.push(d.clone());
+                        scan.extend(
+                            std::fs::read_dir(d)
+                                .into_iter()
+                                .flatten()
+                                .flatten()
+                                .map(|e| e.path())
+                                .filter(|p| p.is_dir()),
+                        );
+                    }
                     let cur_rel = std::path::Path::new(&model_path)
                         .strip_prefix(&base)
                         .map(|p| p.to_string_lossy().into_owned())
@@ -657,6 +664,8 @@ fn run() -> engine::Result {
                                 || name.contains("draft")
                                 || name.ends_with("-F16.gguf")
                                 || name.ends_with("-BF16.gguf")
+                                || name.starts_with("ggml-vocab-")
+                                || name.starts_with("mmproj-")
                             {
                                 continue;
                             }
@@ -698,14 +707,11 @@ fn run() -> engine::Result {
                         .parent()
                         .map(|p| p.to_path_buf())
                         .unwrap_or_default();
-                    // ids may carry one directory component (split models
-                    // live in their own folder); resolve against the same
-                    // base the listing used, and refuse traversal.
-                    let base = dir
-                        .parent()
-                        .filter(|p| has_gguf(p))
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| dir.clone());
+                    // ids may carry up to two directory components (a
+                    // split model in a quant subdir of a model dir);
+                    // resolve against the same base the listing used, and
+                    // refuse traversal.
+                    let base = models_base(&dir);
                     let target = base.join(name);
                     // Path::join with an ABSOLUTE name discards the base
                     // entirely, so the component checks alone would let
@@ -723,7 +729,7 @@ fn run() -> engine::Result {
                         && !std::path::Path::new(name).is_absolute()
                         && !name.contains("..")
                         && !name.contains('\\')
-                        && name.matches('/').count() <= 1
+                        && name.matches('/').count() <= 2
                         && name.ends_with(".gguf")
                         && target.is_file()
                         && contained();
@@ -1135,6 +1141,34 @@ fn cpu_name() -> String {
 /// (host/port/ctx). Same PID/systemd unit; the new image reloads the model.
 /// Only returns (with an error) if exec fails. The model path is validated by
 /// True when `d` directly contains at least one .gguf.
+/// Directory the model listing/switching is rooted at. Climbs up to
+/// two parents from the current model's directory, accepting a parent
+/// when it holds ggufs directly or in an immediate subdirectory. Two
+/// climbs cover the nested split layout (models-root/model-dir/quant-
+/// dir/shards); the depth-1 acceptance test keeps the climb from
+/// drifting past the models root (its parent has no ggufs within one
+/// level).
+fn models_base(dir: &std::path::Path) -> std::path::PathBuf {
+    let within1 = |p: &std::path::Path| {
+        has_gguf(p)
+            || std::fs::read_dir(p)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|q| q.is_dir())
+                .any(|q| has_gguf(&q))
+    };
+    let mut base = dir.to_path_buf();
+    for _ in 0..2 {
+        match base.parent() {
+            Some(p) if within1(p) => base = p.to_path_buf(),
+            _ => break,
+        }
+    }
+    base
+}
+
 fn has_gguf(d: &std::path::Path) -> bool {
     std::fs::read_dir(d)
         .into_iter()
