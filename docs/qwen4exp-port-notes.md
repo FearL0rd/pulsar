@@ -61,7 +61,30 @@ attention arm honors PULSAR_KV (same fix shape as 58bc312).
   (Qwen/Qwen3.8-Flash-Next) or PULSAR_NGRAM as stopgap.
 - Vision: out of scope (pulsar is text-only today).
 
-## Plan: new `Family::Qwen4Exp`, kernels shared with Qwen35
+## Status 2026-08-26: phases 1-2 SHIPPED, model serves in pulsar
+
+- Load: 4-shard split, 2.0s, full tensor census (only the 48 indexer
+  tensors unread - phase 4). Rides Family::Qwen35 behind shape.qwen4exp
+  (the qwen35_dense precedent), NOT a new family.
+- Forward: wide 4-stream residual in st.cur (Shape::stream_mult),
+  q4e_pre_lane/q4e_stream_scatter replace the norm/residual sites,
+  PLE host gather (q4e_chunk_rows: n-gram hash + IQ4_NL row dequant
+  from the mmapped table) + gated value/conv injection on blk.1,
+  GDN gate act_op 5, head = final HC mixer.
+- Parity: teacher-forced the oracle's greedy continuation - its token
+  is pulsar's rank-1 at every position except two sub-0.6-logit
+  near-ties, margins flat with depth. Greedy "The capital of France
+  is" -> " Paris. The capital of Germany is Berlin." check.sh PASS.
+- Serve: `llm-switch pulsar-flashnext` -> pulsar-serve on :8603, webui
+  + /v1, jinja chat template, reasoning parsed. ctx capped 8192 (dense
+  attention approximates above 2051 cached tokens until QSA lands;
+  ~3 percent position divergence at 8192 per the reference PR).
+- Prefix cache OFF for qwen4exp (PLE conv ring + n-gram history are
+  not in the rewind checkpoints yet) - spec_safe_prefix_cache gates.
+- First-cut speed, single card + tiers, no tuning: ~7.6 tok/s decode.
+  The llama.cpp fork's 21 tok/s (3 GPUs of experts) is the phase-3 bar.
+
+## Plan (original): new `Family::Qwen4Exp`, kernels shared with Qwen35
 
 K3 is the precedent: own family + graph, GDN chunk/decode kernels
 reused (the mma v2 stack applies as-is; sigmoid gate is a kernel flag
